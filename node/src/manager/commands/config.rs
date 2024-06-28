@@ -20,6 +20,10 @@ use graph_store_postgres::{BlockStore, DeploymentPlacer};
 
 use crate::{config::Config, network_setup::Networks};
 
+/// Compare the NetIdentifier of all defined adapters with the existing
+/// identifiers on the ChainStore. If a ChainStore doesn't exist it will be show
+/// as an error. It's intended to be run again an environment that has already
+/// been setup by graph-node.
 pub async fn providers(networks: &Networks, store: Arc<BlockStore>) -> Result<(), Error> {
     println!("Checking providers");
     for (chain_id, ids) in networks.all_chain_identifiers().await.into_iter() {
@@ -27,7 +31,7 @@ pub async fn providers(networks: &Networks, store: Arc<BlockStore>) -> Result<()
             .into_iter()
             .map(|(provider, id)| {
                 id.map_err(IdentValidatorError::from)
-                    .and_then(|ref id| store.check_ident(chain_id, id).map(|_| provider))
+                    .and_then(|id| store.check_ident(chain_id, &id).map(|_| (provider, id)))
             })
             .partition_result();
         let errs = errs
@@ -37,11 +41,13 @@ pub async fn providers(networks: &Networks, store: Arc<BlockStore>) -> Result<()
 
         if errs.is_empty() {
             println!("chain_id: {}: status: OK", chain_id);
-        } else {
-            println!("chain_id: {}: status: NOK", chain_id);
-            println!("errors: {:?}", errs)
+            continue;
         }
+
+        println!("chain_id: {}: status: NOK", chain_id);
+        println!("errors: {:?}", errs);
     }
+
     Ok(())
 }
 
