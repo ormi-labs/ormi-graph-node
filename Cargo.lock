@@ -1639,7 +1639,7 @@ dependencies = [
  "prost-types 0.12.6",
  "rand",
  "regex",
- "reqwest 0.11.23",
+ "reqwest 0.12.5",
  "semver",
  "serde",
  "serde_derive",
@@ -2287,7 +2287,7 @@ dependencies = [
  "httpdate",
  "itoa",
  "pin-project-lite",
- "socket2 0.5.5",
+ "socket2 0.4.9",
  "tokio",
  "tower-service 0.3.1",
  "tracing",
@@ -4032,7 +4032,6 @@ dependencies = [
  "js-sys",
  "log",
  "mime",
- "mime_guess",
  "native-tls",
  "once_cell",
  "percent-encoding",
@@ -4043,12 +4042,10 @@ dependencies = [
  "system-configuration",
  "tokio",
  "tokio-native-tls",
- "tokio-util 0.7.11",
  "tower-service 0.3.1",
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
- "wasm-streams 0.3.0",
  "web-sys",
  "winreg 0.50.0",
 ]
@@ -4077,6 +4074,7 @@ dependencies = [
  "js-sys",
  "log",
  "mime",
+ "mime_guess",
  "native-tls",
  "once_cell",
  "percent-encoding",
@@ -4099,7 +4097,7 @@ dependencies = [
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
- "wasm-streams 0.4.0",
+ "wasm-streams",
  "web-sys",
  "winreg 0.52.0",
 ]
@@ -5895,19 +5893,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8bca81f5279342b38b17d9acbf007a46ddeb73144e2bd5f0a21bfa9fc5d4ab3e"
 dependencies = [
  "parity-wasm",
-]
-
-[[package]]
-name = "wasm-streams"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b4609d447824375f43e1ffbc051b50ad8f4b3ae8219680c94452ea05eb240ac7"
-dependencies = [
- "futures-util",
- "js-sys",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "web-sys",
 ]
 
 [[package]]
