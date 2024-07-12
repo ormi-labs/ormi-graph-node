@@ -2,6 +2,11 @@
 name: Build Graph Node Image
 on:
   workflow_dispatch:
+    inputs:
+      prod:
+        required: false
+        type: boolean
+        description: 'Tmp'
   push:
     branches:
       - 'user/apehota/build-docker-image'
