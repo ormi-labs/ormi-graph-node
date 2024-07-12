@@ -21,7 +21,7 @@ permissions:
 
 jobs:
   build_image:
-    runs-on: self-hosted
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
         with:
