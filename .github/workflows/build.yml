@@ -33,7 +33,7 @@ jobs:
           ref: ${{ env.BRANCH }}
       - uses: ./.github/actions/build-docker-image
         with:
-          image_tag: ${{ env.IMAGE_TAG || env.BRANCH }}
+          image_tag: ${{ env.IMAGE_TAG || "test-v1" }}
           github_sha: ${{ github.sha }}
           github_repo: ${{ github.repository }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
