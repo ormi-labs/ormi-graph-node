@@ -1,0 +1,27 @@
+---
+name: Build Graph Node Image
+
+env:
+  DOCKER_IMAGE: graph-node
+  DOCKER_BUILDKIT: "1"
+  BRANCH: ${{ github.ref_name }}
+
+permissions:
+  id-token: write
+  contents: write
+  packages: write
+
+jobs:
+  build_image:
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.BRANCH }}
+      - uses: ./.github/actions/build-docker-image
+        with:
+          github_ref: ${{ env.BRANCH }}
+          github_sha: ${{ github.sha }}
+          github_repo: ${{ github.repository }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          dockerfile: "docker/Dockerfile"

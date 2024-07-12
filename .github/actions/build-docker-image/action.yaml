@@ -1,0 +1,54 @@
+name: "Build a Docker Image"
+description: "Build and push a docker image to the GitHub registry"
+
+inputs:
+  github_repo:
+    description: "GitHub repository"
+    required: true
+  github_ref:
+    description: "GitHub ref"
+    required: true
+  github_sha:
+    description: "GitHub sha"
+    required: true
+  dockerfile:
+    description: "Dockerfile name used to build service"
+    required: true
+    default: "Dockerfile"
+  ssh_key:
+    description: "SSH github deploy key"
+    required: false
+  github_token:
+    description: "GitHub token"
+    required: false
+
+runs:
+  using: "composite"
+  steps:
+    - name: Login to GitHub registry
+      shell: bash
+      id: login-ghcr
+      run: echo "${{ inputs.github_token }}" | docker login ghcr.io -u $ --password-stdin
+
+    - name: Set outputs
+      id: set-out
+      shell: bash
+      run: |
+        IMAGE_ID=ghcr.io/${{ inputs.github_repo }}
+        IMAGE_TAG=${{ inputs.github_ref }}
+
+        echo "GITHUB_SHA=$(echo GITHUB_SHA)" >> $GITHUB_OUTPUT
+        echo "IMAGE_TAG=$(echo $IMAGE_TAG)" >> $GITHUB_OUTPUT
+        echo "IMAGE_ID=$(echo $IMAGE_ID)" >> $GITHUB_OUTPUT
+        echo $IMAGE_TAG
+        echo $IMAGE_ID
+
+    - name: Build docker image
+      shell: bash
+      env:
+        IMAGE_ID: ${{ steps.set-out.outputs.IMAGE_ID }}
+        IMAGE_TAG: ${{ steps.set-out.outputs.IMAGE_TAG }}
+      run: |
+        export DOCKER_BUILDKIT=1
+        docker build --load -t $IMAGE_ID/${{ inputs.service_name }}:$IMAGE_TAG -f ${{ inputs.dockerfile }} --label "runnumber=${GITHUB_RUN_ID}" .
+        docker push $IMAGE_ID/${{ inputs.service_name }}:$IMAGE_TAG
