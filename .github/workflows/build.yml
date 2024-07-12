@@ -7,7 +7,6 @@ env:
   BRANCH: ${{ github.ref_name }}
 
 permissions:
-  id-token: write
   contents: write
   packages: write
 
