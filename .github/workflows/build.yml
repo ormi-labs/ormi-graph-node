@@ -1,19 +1,24 @@
 
 name: Build Graph Node Image
 on:
-  workflow_dispatch:
-    inputs:
-      prod:
-        required: false
-        type: boolean
-        description: 'Tmp'
   push:
     branches:
-      - 'user/apehota/build-docker-image'
+      # Push events to every branch adhering SemVer like v1.0.0-alpha.1
+      # https://docs.github.com/en/actions/using-workflows/workflow-syntax-for-github-actions#patterns-to-match-branches-and-tags
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-**'
+      - user/apehota/build-docker-image
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        required: true
+        type: string
+        description: 'Image tag'
 
 env:
   DOCKER_BUILDKIT: "1"
   BRANCH: ${{ github.ref_name }}
+  IMAGE_TAG: ${{ github.event.inputs.image_tag }}
 
 permissions:
   contents: write
@@ -28,7 +33,7 @@ jobs:
           ref: ${{ env.BRANCH }}
       - uses: ./.github/actions/build-docker-image
         with:
-          github_ref: ${{ env.BRANCH }}
+          image_tag: ${{ env.IMAGE_TAG || env.BRANCH }}
           github_sha: ${{ github.sha }}
           github_repo: ${{ github.repository }}
           github_token: ${{ secrets.GITHUB_TOKEN }}

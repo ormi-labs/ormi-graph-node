@@ -5,8 +5,8 @@ inputs:
   github_repo:
     description: "GitHub repository"
     required: true
-  github_ref:
-    description: "GitHub ref"
+  image_tag:
+    description: "Image tag"
     required: true
   github_sha:
     description: "GitHub sha"
@@ -32,8 +32,7 @@ runs:
       shell: bash
       run: |
         IMAGE_ID=ghcr.io/${{ inputs.github_repo }}
-        # IMAGE_TAG=${{ inputs.github_ref }}
-        IMAGE_TAG=test
+        IMAGE_TAG=${{ inputs.image_tag }}
 
         echo "GITHUB_SHA=$(echo GITHUB_SHA)" >> $GITHUB_OUTPUT
         echo "IMAGE_TAG=$(echo $IMAGE_TAG)" >> $GITHUB_OUTPUT
