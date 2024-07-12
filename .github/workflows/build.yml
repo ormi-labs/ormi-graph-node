@@ -1,6 +1,10 @@
 
 name: Build Graph Node Image
-on: workflow_dispatch
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'user/apehota/build-docker-image'
 
 env:
   DOCKER_BUILDKIT: "1"
