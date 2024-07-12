@@ -2,7 +2,6 @@
 name: Build Graph Node Image
 
 env:
-  DOCKER_IMAGE: graph-node
   DOCKER_BUILDKIT: "1"
   BRANCH: ${{ github.ref_name }}
 
