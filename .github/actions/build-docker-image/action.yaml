@@ -15,9 +15,6 @@ inputs:
     description: "Dockerfile name used to build service"
     required: true
     default: "Dockerfile"
-  ssh_key:
-    description: "SSH github deploy key"
-    required: false
   github_token:
     description: "GitHub token"
     required: false
@@ -50,5 +47,5 @@ runs:
         IMAGE_TAG: ${{ steps.set-out.outputs.IMAGE_TAG }}
       run: |
         export DOCKER_BUILDKIT=1
-        docker build --load -t $IMAGE_ID/${{ inputs.service_name }}:$IMAGE_TAG -f ${{ inputs.dockerfile }} --label "runnumber=${GITHUB_RUN_ID}" .
-        docker push $IMAGE_ID/${{ inputs.service_name }}:$IMAGE_TAG
+        docker build --load -t $IMAGE_ID:$IMAGE_TAG -f ${{ inputs.dockerfile }} --label "runnumber=${GITHUB_RUN_ID}" .
+        docker push $IMAGE_ID:$IMAGE_TAG
