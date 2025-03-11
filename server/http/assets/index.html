@@ -11,7 +11,7 @@
     <link
       rel="icon"
       type="image/png"
-      href="https://storage.googleapis.com/graph-web/favicon.png"
+      href="https://i.imgur.com/9diuS4N.png"
       crossorigin="anonymous"
     />
   </head>
@@ -21,19 +21,18 @@
     <script type="module" crossorigin>
       import { renderYogaGraphiQL } from "https://cdn.jsdelivr.net/npm/@graphql-yoga/graphiql@4.2.0/+esm";
 
-      const endpoint = window.location.pathname.substring(
-        0,
-        window.location.pathname.length - "/graphql".length
-      );
+      const endpoint = window.location.pathname.endsWith('/graphql')
+        ? window.location.pathname.substring(0, window.location.pathname.length - "/graphql".length)
+        : window.location.pathname;
 
       renderYogaGraphiQL(root, {
         endpoint,
         title: "The GraphiQL",
         logo: React.createElement("img", {
-          src: "https://storage.googleapis.com/graph-web/favicon.png",
+          src: "",
           crossOrigin: "anonymous",
           style: {
-            height: "42px",
+            height: "0px",
           },
         }),
       });
