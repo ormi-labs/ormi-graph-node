@@ -1651,11 +1651,21 @@ impl DeploymentStore {
                             .await?;
                     }
 
-                    // Rewind the subgraph so that entity versions that are
-                    // clamped in the future (beyond `block`) become valid for
-                    // all blocks after `block`. `revert_block` gets rid of
-                    // everything including the block passed to it. We want to
-                    // preserve `block` and therefore revert `block+1`
+                    // CopyEntityBatchQuery now reverts entity versions
+                    // during copying, making this rewind redundant for new
+                    // copies. We keep it for backward compatibility: a copy
+                    // that was started before this change and is resumed
+                    // after upgrading will have already-copied rows that
+                    // weren't reverted during copy. For data that was
+                    // already reverted during copy, this is a no-op. This
+                    // code can be removed once a release with this change
+                    // has been out for a while and we are sure that there
+                    // are no more copies in progress that started before
+                    // the change
+                    //
+                    // `revert_block` gets rid of everything including the
+                    // block passed to it. We want to preserve `block` and
+                    // therefore revert `block+1`
                     let start = Instant::now();
                     let block_to_revert: BlockNumber = block
                         .number

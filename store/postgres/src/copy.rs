@@ -178,7 +178,14 @@ impl CopyState {
         dst: Arc<Layout>,
         target_block: BlockPtr,
     ) -> Result<CopyState, StoreError> {
-        let tables = TableState::load(conn, primary, src.as_ref(), dst.as_ref()).await?;
+        let tables = TableState::load(
+            conn,
+            primary,
+            src.as_ref(),
+            dst.as_ref(),
+            target_block.number,
+        )
+        .await?;
         let (finished, mut unfinished): (Vec<_>, Vec<_>) =
             tables.into_iter().partition(|table| table.finished());
         unfinished.sort_by_key(|table| table.dst.object.to_string());
@@ -329,6 +336,7 @@ struct TableState {
     dst_site: Arc<Site>,
     batcher: VidBatcher,
     duration_ms: i64,
+    target_block: BlockNumber,
 }
 
 impl TableState {
@@ -351,6 +359,7 @@ impl TableState {
             dst_site,
             batcher,
             duration_ms: 0,
+            target_block: target_block.number,
         })
     }
 
@@ -363,6 +372,7 @@ impl TableState {
         primary: Primary,
         src_layout: &Layout,
         dst_layout: &Layout,
+        target_block: BlockNumber,
     ) -> Result<Vec<TableState>, StoreError> {
         use copy_table_state as cts;
 
@@ -429,6 +439,7 @@ impl TableState {
                 dst_site: dst_layout.site.clone(),
                 batcher,
                 duration_ms,
+                target_block,
             };
             states.push(state);
         }
@@ -503,15 +514,20 @@ impl TableState {
     }
 
     async fn copy_batch(&mut self, conn: &mut AsyncPgConnection) -> Result<Status, StoreError> {
-        let (duration, count) = self
+        let (duration, count): (_, Option<i32>) = self
             .batcher
-            .step(async |start, end| {
-                let count =
-                    rq::CopyEntityBatchQuery::new(self.dst.as_ref(), &self.src, start, end)?
-                        .count_current()
-                        .get_result::<i64>(conn)
-                        .await
-                        .optional()?;
+            .step(async |start: i64, end: i64| {
+                let count = rq::CopyEntityBatchQuery::new(
+                    self.dst.as_ref(),
+                    &self.src,
+                    start,
+                    end,
+                    self.target_block,
+                )?
+                .count_current()
+                .get_result::<i64>(conn)
+                .await
+                .optional()?;
                 Ok(count.unwrap_or(0) as i32)
             })
             .await?;
