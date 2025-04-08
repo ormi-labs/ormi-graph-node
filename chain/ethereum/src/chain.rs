@@ -3,18 +3,21 @@ use anyhow::{Context, Error};
 use graph::blockchain::client::ChainClient;
 use graph::blockchain::firehose_block_ingestor::{FirehoseBlockIngestor, Transforms};
 use graph::blockchain::{
-    BlockIngestor, BlockTime, BlockchainKind, ChainIdentifier, TriggersAdapterSelector,
+    BlockIngestor, BlockTime, BlockchainKind, ChainIdentifier, ExtendedBlockPtr,
+    TriggerFilterWrapper, TriggersAdapterSelector,
 };
-use graph::components::adapter::ChainId;
-use graph::components::store::DeploymentCursorTracker;
+use graph::components::network_provider::ChainName;
+use graph::components::store::{DeploymentCursorTracker, SourceableStore};
 use graph::data::subgraph::UnifiedMappingApiVersion;
 use graph::firehose::{FirehoseEndpoint, ForkStep};
 use graph::futures03::compat::Future01CompatExt;
+use graph::futures03::TryStreamExt;
 use graph::prelude::{
-    BlockHash, ComponentLoggerConfig, ElasticComponentLoggerConfig, EthereumBlock,
+    retry, BlockHash, ComponentLoggerConfig, ElasticComponentLoggerConfig, EthereumBlock,
     EthereumCallCache, LightEthereumBlock, LightEthereumBlockExt, MetricsRegistry,
 };
 use graph::schema::InputSchema;
+use graph::slog::{debug, error, trace, warn};
 use graph::substreams::Clock;
 use graph::{
     blockchain::{
@@ -36,7 +39,8 @@ use graph::{
     },
 };
 use prost::Message;
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
+use std::future::Future;
 use std::iter::FromIterator;
 use std::sync::Arc;
 use std::time::Duration;
@@ -61,6 +65,7 @@ use crate::{BufferedCallCache, NodeCapabilities};
 use crate::{EthereumAdapter, RuntimeAdapter};
 use graph::blockchain::block_stream::{
     BlockStream, BlockStreamBuilder, BlockStreamError, BlockStreamMapper, FirehoseCursor,
+    TriggersAdapterWrapper,
 };
 
 /// Celo Mainnet: 42220, Testnet Alfajores: 44787, Testnet Baklava: 62320
@@ -121,24 +126,51 @@ impl BlockStreamBuilder<Chain> for EthereumStreamBuilder {
         unimplemented!()
     }
 
+    async fn build_subgraph_block_stream(
+        &self,
+        chain: &Chain,
+        deployment: DeploymentLocator,
+        start_blocks: Vec<BlockNumber>,
+        source_subgraph_stores: Vec<Arc<dyn SourceableStore>>,
+        subgraph_current_block: Option<BlockPtr>,
+        filter: Arc<TriggerFilterWrapper<Chain>>,
+        unified_api_version: UnifiedMappingApiVersion,
+    ) -> Result<Box<dyn BlockStream<Chain>>> {
+        self.build_polling(
+            chain,
+            deployment,
+            start_blocks,
+            source_subgraph_stores,
+            subgraph_current_block,
+            filter,
+            unified_api_version,
+        )
+        .await
+    }
+
     async fn build_polling(
         &self,
         chain: &Chain,
         deployment: DeploymentLocator,
         start_blocks: Vec<BlockNumber>,
+        source_subgraph_stores: Vec<Arc<dyn SourceableStore>>,
         subgraph_current_block: Option<BlockPtr>,
-        filter: Arc<<Chain as Blockchain>::TriggerFilter>,
+        filter: Arc<TriggerFilterWrapper<Chain>>,
         unified_api_version: UnifiedMappingApiVersion,
     ) -> Result<Box<dyn BlockStream<Chain>>> {
-        let requirements = filter.node_capabilities();
-        let adapter = chain
-            .triggers_adapter(&deployment, &requirements, unified_api_version.clone())
-            .unwrap_or_else(|_| {
-                panic!(
-                    "no adapter for network {} with capabilities {}",
-                    chain.name, requirements
-                )
-            });
+        let requirements = filter.chain_filter.node_capabilities();
+        let is_using_subgraph_composition = !source_subgraph_stores.is_empty();
+        let adapter = TriggersAdapterWrapper::new(
+            chain
+                .triggers_adapter(&deployment, &requirements, unified_api_version.clone())
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "no adapter for network {} with capabilities {}",
+                        chain.name, requirements
+                    )
+                }),
+            source_subgraph_stores,
+        );
 
         let logger = chain
             .logger_factory
@@ -153,33 +185,45 @@ impl BlockStreamBuilder<Chain> for EthereumStreamBuilder {
         // This is ok because Celo blocks are always final. And we _need_ to do this because
         // some events appear only in eth_getLogs but not in transaction receipts.
         // See also ca0edc58-0ec5-4c89-a7dd-2241797f5e50.
-        let chain_id = match chain.chain_client().as_ref() {
+        let reorg_threshold = match chain.chain_client().as_ref() {
             ChainClient::Rpc(adapter) => {
-                adapter
+                let chain_id = adapter
                     .cheapest()
                     .await
                     .ok_or(anyhow!("unable to get eth adapter for chan_id call"))?
                     .chain_id()
-                    .await?
+                    .await?;
+
+                if CELO_CHAIN_IDS.contains(&chain_id) {
+                    0
+                } else {
+                    chain.reorg_threshold
+                }
             }
-            _ => panic!("expected rpc when using polling blockstream"),
+            _ if is_using_subgraph_composition => chain.reorg_threshold,
+            _ => panic!(
+                "expected rpc when using polling blockstream : {}",
+                is_using_subgraph_composition
+            ),
         };
-        let reorg_threshold = match CELO_CHAIN_IDS.contains(&chain_id) {
-            false => chain.reorg_threshold,
-            true => 0,
+
+        let max_block_range_size = if is_using_subgraph_composition {
+            ENV_VARS.max_block_range_size * 10
+        } else {
+            ENV_VARS.max_block_range_size
         };
 
         Ok(Box::new(PollingBlockStream::new(
             chain_store,
             chain_head_update_stream,
-            adapter,
+            Arc::new(adapter),
             chain.node_id.clone(),
             deployment.hash,
             filter,
             start_blocks,
             reorg_threshold,
             logger,
-            ENV_VARS.max_block_range_size,
+            max_block_range_size,
             ENV_VARS.target_triggers_per_block_range,
             unified_api_version,
             subgraph_current_block,
@@ -201,7 +245,7 @@ impl BlockRefetcher<Chain> for EthereumBlockRefetcher {
         logger: &Logger,
         cursor: FirehoseCursor,
     ) -> Result<BlockFinality, Error> {
-        let endpoint = chain.chain_client().firehose_endpoint().await?;
+        let endpoint: Arc<FirehoseEndpoint> = chain.chain_client().firehose_endpoint().await?;
         let block = endpoint.get_block::<codec::Block>(cursor, logger).await?;
         let ethereum_block: EthereumBlockWithCalls = (&block).try_into()?;
         Ok(BlockFinality::NonFinal(ethereum_block))
@@ -213,6 +257,7 @@ pub struct EthereumAdapterSelector {
     client: Arc<ChainClient<Chain>>,
     registry: Arc<MetricsRegistry>,
     chain_store: Arc<dyn ChainStore>,
+    eth_adapters: Arc<EthereumNetworkAdapters>,
 }
 
 impl EthereumAdapterSelector {
@@ -221,12 +266,14 @@ impl EthereumAdapterSelector {
         client: Arc<ChainClient<Chain>>,
         registry: Arc<MetricsRegistry>,
         chain_store: Arc<dyn ChainStore>,
+        eth_adapters: Arc<EthereumNetworkAdapters>,
     ) -> Self {
         Self {
             logger_factory,
             client,
             registry,
             chain_store,
+            eth_adapters,
         }
     }
 }
@@ -252,6 +299,7 @@ impl TriggersAdapterSelector<Chain> for EthereumAdapterSelector {
             chain_store: self.chain_store.cheap_clone(),
             unified_api_version,
             capabilities: *capabilities,
+            eth_adapters: self.eth_adapters.cheap_clone(),
         };
         Ok(Arc::new(adapter))
     }
@@ -288,7 +336,7 @@ impl RuntimeAdapterBuilder for EthereumRuntimeAdapterBuilder {
 
 pub struct Chain {
     logger_factory: LoggerFactory,
-    pub name: ChainId,
+    pub name: ChainName,
     node_id: NodeId,
     registry: Arc<MetricsRegistry>,
     client: Arc<ChainClient<Self>>,
@@ -315,7 +363,7 @@ impl Chain {
     /// Creates a new Ethereum [`Chain`].
     pub fn new(
         logger_factory: LoggerFactory,
-        name: ChainId,
+        name: ChainName,
         node_id: NodeId,
         registry: Arc<MetricsRegistry>,
         chain_store: Arc<dyn ChainStore>,
@@ -409,10 +457,27 @@ impl Blockchain for Chain {
         deployment: DeploymentLocator,
         store: impl DeploymentCursorTracker,
         start_blocks: Vec<BlockNumber>,
-        filter: Arc<Self::TriggerFilter>,
+        source_subgraph_stores: Vec<Arc<dyn SourceableStore>>,
+        filter: Arc<TriggerFilterWrapper<Self>>,
         unified_api_version: UnifiedMappingApiVersion,
     ) -> Result<Box<dyn BlockStream<Self>>, Error> {
         let current_ptr = store.block_ptr();
+
+        if !filter.subgraph_filter.is_empty() {
+            return self
+                .block_stream_builder
+                .build_subgraph_block_stream(
+                    self,
+                    deployment,
+                    start_blocks,
+                    source_subgraph_stores,
+                    current_ptr,
+                    filter,
+                    unified_api_version,
+                )
+                .await;
+        }
+
         match self.chain_client().as_ref() {
             ChainClient::Rpc(_) => {
                 self.block_stream_builder
@@ -420,6 +485,7 @@ impl Blockchain for Chain {
                         self,
                         deployment,
                         start_blocks,
+                        source_subgraph_stores,
                         current_ptr,
                         filter,
                         unified_api_version,
@@ -434,7 +500,7 @@ impl Blockchain for Chain {
                         store.firehose_cursor(),
                         start_blocks,
                         current_ptr,
-                        filter,
+                        filter.chain_filter.clone(),
                         unified_api_version,
                     )
                     .await
@@ -571,6 +637,8 @@ pub enum BlockFinality {
 
     // If a block may still be reorged, we need to work with more local data.
     NonFinal(EthereumBlockWithCalls),
+
+    Ptr(Arc<ExtendedBlockPtr>),
 }
 
 impl Default for BlockFinality {
@@ -584,6 +652,7 @@ impl BlockFinality {
         match self {
             BlockFinality::Final(block) => block,
             BlockFinality::NonFinal(block) => &block.ethereum_block.block,
+            BlockFinality::Ptr(_) => unreachable!("light_block called on HeaderOnly"),
         }
     }
 }
@@ -593,6 +662,7 @@ impl<'a> From<&'a BlockFinality> for BlockPtr {
         match block {
             BlockFinality::Final(b) => BlockPtr::from(&**b),
             BlockFinality::NonFinal(b) => BlockPtr::from(&b.ethereum_block),
+            BlockFinality::Ptr(b) => BlockPtr::new(b.hash.clone(), b.number),
         }
     }
 }
@@ -602,6 +672,7 @@ impl Block for BlockFinality {
         match self {
             BlockFinality::Final(block) => block.block_ptr(),
             BlockFinality::NonFinal(block) => block.ethereum_block.block.block_ptr(),
+            BlockFinality::Ptr(block) => BlockPtr::new(block.hash.clone(), block.number),
         }
     }
 
@@ -609,6 +680,9 @@ impl Block for BlockFinality {
         match self {
             BlockFinality::Final(block) => block.parent_ptr(),
             BlockFinality::NonFinal(block) => block.ethereum_block.block.parent_ptr(),
+            BlockFinality::Ptr(block) => {
+                Some(BlockPtr::new(block.parent_hash.clone(), block.number - 1))
+            }
         }
     }
 
@@ -641,16 +715,22 @@ impl Block for BlockFinality {
                 json::to_value(eth_block)
             }
             BlockFinality::NonFinal(block) => json::to_value(&block.ethereum_block),
+            BlockFinality::Ptr(_) => Ok(json::Value::Null),
         }
     }
 
     fn timestamp(&self) -> BlockTime {
-        let ts = match self {
-            BlockFinality::Final(block) => block.timestamp,
-            BlockFinality::NonFinal(block) => block.ethereum_block.block.timestamp,
-        };
-        let ts = i64::try_from(ts.as_u64()).unwrap();
-        BlockTime::since_epoch(ts, 0)
+        match self {
+            BlockFinality::Final(block) => {
+                let ts = i64::try_from(block.timestamp.as_u64()).unwrap();
+                BlockTime::since_epoch(ts, 0)
+            }
+            BlockFinality::NonFinal(block) => {
+                let ts = i64::try_from(block.ethereum_block.block.timestamp.as_u64()).unwrap();
+                BlockTime::since_epoch(ts, 0)
+            }
+            BlockFinality::Ptr(block) => block.timestamp,
+        }
     }
 }
 
@@ -663,6 +743,104 @@ pub struct TriggersAdapter {
     chain_client: Arc<ChainClient<Chain>>,
     capabilities: NodeCapabilities,
     unified_api_version: UnifiedMappingApiVersion,
+    eth_adapters: Arc<EthereumNetworkAdapters>,
+}
+
+/// Fetches blocks from the cache based on block numbers, excluding duplicates
+/// (i.e., multiple blocks for the same number), and identifying missing blocks that
+/// need to be fetched via RPC/Firehose. Returns a tuple of the found blocks and the missing block numbers.
+async fn fetch_unique_blocks_from_cache(
+    logger: &Logger,
+    chain_store: Arc<dyn ChainStore>,
+    block_numbers: BTreeSet<BlockNumber>,
+) -> (Vec<Arc<ExtendedBlockPtr>>, Vec<i32>) {
+    // Load blocks from the cache
+    let blocks_map = chain_store
+        .cheap_clone()
+        .block_ptrs_by_numbers(block_numbers.iter().map(|&b| b.into()).collect::<Vec<_>>())
+        .await
+        .map_err(|e| {
+            error!(logger, "Error accessing block cache {}", e);
+            e
+        })
+        .unwrap_or_default();
+
+    // Collect blocks and filter out ones with multiple entries
+    let blocks: Vec<Arc<ExtendedBlockPtr>> = blocks_map
+        .into_iter()
+        .filter_map(|(_, values)| {
+            if values.len() == 1 {
+                Some(Arc::new(values[0].clone()))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // Identify missing blocks
+    let missing_blocks: Vec<i32> = block_numbers
+        .into_iter()
+        .filter(|&number| !blocks.iter().any(|block| block.block_number() == number))
+        .collect();
+
+    if !missing_blocks.is_empty() {
+        debug!(
+            logger,
+            "Loading {} block(s) not in the block cache",
+            missing_blocks.len()
+        );
+        trace!(logger, "Missing blocks {:?}", missing_blocks.len());
+    }
+
+    (blocks, missing_blocks)
+}
+
+// This is used to load blocks from the RPC.
+async fn load_blocks_with_rpc(
+    logger: &Logger,
+    adapter: Arc<EthereumAdapter>,
+    chain_store: Arc<dyn ChainStore>,
+    block_numbers: BTreeSet<BlockNumber>,
+) -> Result<Vec<BlockFinality>> {
+    let logger_clone = logger.clone();
+    load_blocks(
+        logger,
+        chain_store,
+        block_numbers,
+        |missing_numbers| async move {
+            adapter
+                .load_block_ptrs_by_numbers_rpc(logger_clone, missing_numbers)
+                .try_collect()
+                .await
+        },
+    )
+    .await
+}
+
+/// Fetches blocks by their numbers, first attempting to load from cache.
+/// Missing blocks are retrieved from an external source, with all blocks sorted and converted to `BlockFinality` format.
+async fn load_blocks<F, Fut>(
+    logger: &Logger,
+    chain_store: Arc<dyn ChainStore>,
+    block_numbers: BTreeSet<BlockNumber>,
+    fetch_missing: F,
+) -> Result<Vec<BlockFinality>>
+where
+    F: FnOnce(Vec<BlockNumber>) -> Fut,
+    Fut: Future<Output = Result<Vec<Arc<ExtendedBlockPtr>>>>,
+{
+    // Fetch cached blocks and identify missing ones
+    let (mut cached_blocks, missing_block_numbers) =
+        fetch_unique_blocks_from_cache(logger, chain_store, block_numbers).await;
+
+    // Fetch missing blocks if any
+    if !missing_block_numbers.is_empty() {
+        let missing_blocks = fetch_missing(missing_block_numbers).await?;
+        cached_blocks.extend(missing_blocks);
+        cached_blocks.sort_by_key(|block| block.number);
+    }
+
+    Ok(cached_blocks.into_iter().map(BlockFinality::Ptr).collect())
 }
 
 #[async_trait]
@@ -687,6 +865,100 @@ impl TriggersAdapterTrait<Chain> for TriggersAdapter {
             self.unified_api_version.clone(),
         )
         .await
+    }
+
+    async fn load_block_ptrs_by_numbers(
+        &self,
+        logger: Logger,
+        block_numbers: BTreeSet<BlockNumber>,
+    ) -> Result<Vec<BlockFinality>> {
+        match &*self.chain_client {
+            ChainClient::Firehose(endpoints) => {
+                // If the force_rpc_for_block_ptrs flag is set, we will use the RPC to load the blocks
+                // even if the firehose is available. If no adapter is available, we will log an error.
+                // And then fallback to the firehose.
+                if ENV_VARS.force_rpc_for_block_ptrs {
+                    trace!(
+                        logger,
+                        "Loading blocks from RPC (force_rpc_for_block_ptrs is set)";
+                        "block_numbers" => format!("{:?}", block_numbers)
+                    );
+                    match self.eth_adapters.cheapest_with(&self.capabilities).await {
+                        Ok(adapter) => {
+                            match load_blocks_with_rpc(
+                                &logger,
+                                adapter,
+                                self.chain_store.clone(),
+                                block_numbers.clone(),
+                            )
+                            .await
+                            {
+                                Ok(blocks) => return Ok(blocks),
+                                Err(e) => {
+                                    warn!(logger, "Error loading blocks from RPC: {}", e);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!(logger, "Error getting cheapest adapter: {}", e);
+                        }
+                    }
+                }
+
+                trace!(
+                    logger,
+                    "Loading blocks from firehose";
+                    "block_numbers" => format!("{:?}", block_numbers)
+                );
+
+                let endpoint = endpoints.endpoint().await?;
+                let chain_store = self.chain_store.clone();
+                let logger_clone = logger.clone();
+
+                load_blocks(
+                    &logger,
+                    chain_store,
+                    block_numbers,
+                    |missing_numbers| async move {
+                        let blocks = endpoint
+                            .load_blocks_by_numbers::<codec::Block>(
+                                missing_numbers.iter().map(|&n| n as u64).collect(),
+                                &logger_clone,
+                            )
+                            .await?
+                            .into_iter()
+                            .map(|block| {
+                                Arc::new(ExtendedBlockPtr {
+                                    hash: block.hash(),
+                                    number: block.number(),
+                                    parent_hash: block.parent_hash().unwrap_or_default(),
+                                    timestamp: block.timestamp(),
+                                })
+                            })
+                            .collect::<Vec<_>>();
+                        Ok(blocks)
+                    },
+                )
+                .await
+            }
+
+            ChainClient::Rpc(eth_adapters) => {
+                trace!(
+                    logger,
+                    "Loading blocks from RPC";
+                    "block_numbers" => format!("{:?}", block_numbers)
+                );
+
+                let adapter = eth_adapters.cheapest_with(&self.capabilities).await?;
+                load_blocks_with_rpc(&logger, adapter, self.chain_store.clone(), block_numbers)
+                    .await
+            }
+        }
+    }
+
+    async fn chain_head_ptr(&self) -> Result<Option<BlockPtr>, Error> {
+        let chain_store = self.chain_store.clone();
+        chain_store.chain_head_ptr().await
     }
 
     async fn triggers_in_block(
@@ -737,17 +1009,32 @@ impl TriggersAdapterTrait<Chain> for TriggersAdapter {
                 triggers.append(&mut parse_block_triggers(&filter.block, full_block));
                 Ok(BlockWithTriggers::new(block, triggers, logger))
             }
+            BlockFinality::Ptr(_) => unreachable!("triggers_in_block called on HeaderOnly"),
         }
     }
 
     async fn is_on_main_chain(&self, ptr: BlockPtr) -> Result<bool, Error> {
-        self.chain_client
-            .rpc()?
-            .cheapest()
-            .await
-            .ok_or(anyhow!("unable to get adapter for is_on_main_chain"))?
-            .is_on_main_chain(&self.logger, ptr.clone())
-            .await
+        match &*self.chain_client {
+            ChainClient::Firehose(endpoints) => {
+                let endpoint = endpoints.endpoint().await?;
+                let block = endpoint
+                    .get_block_by_number_with_retry::<codec::Block>(ptr.number as u64, &self.logger)
+                    .await
+                    .context(format!(
+                        "Failed to fetch block {} from firehose",
+                        ptr.number
+                    ))?;
+                Ok(block.hash() == ptr.hash)
+            }
+            ChainClient::Rpc(adapter) => {
+                let adapter = adapter
+                    .cheapest()
+                    .await
+                    .ok_or_else(|| anyhow!("unable to get adapter for is_on_main_chain"))?;
+
+                adapter.is_on_main_chain(&self.logger, ptr).await
+            }
+        }
     }
 
     async fn ancestor_block(
@@ -777,10 +1064,44 @@ impl TriggersAdapterTrait<Chain> for TriggersAdapter {
         use graph::prelude::LightEthereumBlockExt;
 
         let block = match self.chain_client.as_ref() {
-            ChainClient::Firehose(_) => Some(BlockPtr {
-                hash: BlockHash::from(vec![0xff; 32]),
-                number: block.number.saturating_sub(1),
-            }),
+            ChainClient::Firehose(endpoints) => {
+                let chain_store = self.chain_store.cheap_clone();
+                // First try to get the block from the store
+                if let Ok(blocks) = chain_store.blocks(vec![block.hash.clone()]).await {
+                    if let Some(block) = blocks.first() {
+                        if let Ok(block) = json::from_value::<LightEthereumBlock>(block.clone()) {
+                            return Ok(block.parent_ptr());
+                        }
+                    }
+                }
+
+                // If not in store, fetch from Firehose
+                let endpoint = endpoints.endpoint().await?;
+                let logger = self.logger.clone();
+                let retry_log_message =
+                    format!("get_block_by_ptr for block {} with firehose", block);
+                let block = block.clone();
+
+                retry(retry_log_message, &logger)
+                    .limit(ENV_VARS.request_retries)
+                    .timeout_secs(ENV_VARS.json_rpc_timeout.as_secs())
+                    .run(move || {
+                        let endpoint = endpoint.cheap_clone();
+                        let logger = logger.cheap_clone();
+                        let block = block.clone();
+                        async move {
+                            endpoint
+                                .get_block_by_ptr::<codec::Block>(&block, &logger)
+                                .await
+                                .context(format!(
+                                    "Failed to fetch block by ptr {} from firehose",
+                                    block
+                                ))
+                        }
+                    })
+                    .await?
+                    .parent_ptr()
+            }
             ChainClient::Rpc(adapters) => {
                 let blocks = adapters
                     .cheapest_with(&self.capabilities)
@@ -943,5 +1264,139 @@ impl FirehoseMapperTrait<Chain> for FirehoseMapper {
 
         self.block_ptr_for_number(logger, endpoint, final_block_number)
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use graph::blockchain::mock::MockChainStore;
+    use graph::{slog, tokio};
+
+    use super::*;
+    use std::sync::Arc;
+
+    // Helper function to create test blocks
+    fn create_test_block(number: BlockNumber, hash: &str) -> ExtendedBlockPtr {
+        let hash = BlockHash(hash.as_bytes().to_vec().into_boxed_slice());
+        let ptr = BlockPtr::new(hash.clone(), number);
+        ExtendedBlockPtr {
+            hash,
+            number,
+            parent_hash: BlockHash(vec![0; 32].into_boxed_slice()),
+            timestamp: BlockTime::for_test(&ptr),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fetch_unique_blocks_single_block() {
+        let logger = Logger::root(slog::Discard, o!());
+        let mut chain_store = MockChainStore::default();
+
+        // Add a single block
+        let block = create_test_block(1, "block1");
+        chain_store.blocks.insert(1, vec![block.clone()]);
+
+        let block_numbers: BTreeSet<_> = vec![1].into_iter().collect();
+
+        let (blocks, missing) =
+            fetch_unique_blocks_from_cache(&logger, Arc::new(chain_store), block_numbers).await;
+
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].number, 1);
+        assert!(missing.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_fetch_unique_blocks_duplicate_blocks() {
+        let logger = Logger::root(slog::Discard, o!());
+        let mut chain_store = MockChainStore::default();
+
+        // Add multiple blocks for the same number
+        let block1 = create_test_block(1, "block1a");
+        let block2 = create_test_block(1, "block1b");
+        chain_store
+            .blocks
+            .insert(1, vec![block1.clone(), block2.clone()]);
+
+        let block_numbers: BTreeSet<_> = vec![1].into_iter().collect();
+
+        let (blocks, missing) =
+            fetch_unique_blocks_from_cache(&logger, Arc::new(chain_store), block_numbers).await;
+
+        // Should filter out the duplicate block
+        assert!(blocks.is_empty());
+        assert_eq!(missing, vec![1]);
+        assert_eq!(missing[0], 1);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_unique_blocks_missing_blocks() {
+        let logger = Logger::root(slog::Discard, o!());
+        let mut chain_store = MockChainStore::default();
+
+        // Add block number 1 but not 2
+        let block = create_test_block(1, "block1");
+        chain_store.blocks.insert(1, vec![block.clone()]);
+
+        let block_numbers: BTreeSet<_> = vec![1, 2].into_iter().collect();
+
+        let (blocks, missing) =
+            fetch_unique_blocks_from_cache(&logger, Arc::new(chain_store), block_numbers).await;
+
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].number, 1);
+        assert_eq!(missing, vec![2]);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_unique_blocks_multiple_valid_blocks() {
+        let logger = Logger::root(slog::Discard, o!());
+        let mut chain_store = MockChainStore::default();
+
+        // Add multiple valid blocks
+        let block1 = create_test_block(1, "block1");
+        let block2 = create_test_block(2, "block2");
+        chain_store.blocks.insert(1, vec![block1.clone()]);
+        chain_store.blocks.insert(2, vec![block2.clone()]);
+
+        let block_numbers: BTreeSet<_> = vec![1, 2].into_iter().collect();
+
+        let (blocks, missing) =
+            fetch_unique_blocks_from_cache(&logger, Arc::new(chain_store), block_numbers).await;
+
+        assert_eq!(blocks.len(), 2);
+        assert!(blocks.iter().any(|b| b.number == 1));
+        assert!(blocks.iter().any(|b| b.number == 2));
+        assert!(missing.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_fetch_unique_blocks_mixed_scenario() {
+        let logger = Logger::root(slog::Discard, o!());
+        let mut chain_store = MockChainStore::default();
+
+        // Add a mix of scenarios:
+        // - Block 1: Single valid block
+        // - Block 2: Multiple blocks (duplicate)
+        // - Block 3: Missing
+        let block1 = create_test_block(1, "block1");
+        let block2a = create_test_block(2, "block2a");
+        let block2b = create_test_block(2, "block2b");
+
+        chain_store.blocks.insert(1, vec![block1.clone()]);
+        chain_store
+            .blocks
+            .insert(2, vec![block2a.clone(), block2b.clone()]);
+
+        let block_numbers: BTreeSet<_> = vec![1, 2, 3].into_iter().collect();
+
+        let (blocks, missing) =
+            fetch_unique_blocks_from_cache(&logger, Arc::new(chain_store), block_numbers).await;
+
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].number, 1);
+        assert_eq!(missing.len(), 2);
+        assert!(missing.contains(&2));
+        assert!(missing.contains(&3));
     }
 }

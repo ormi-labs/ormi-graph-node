@@ -33,6 +33,7 @@ pub struct Atom(AtomInt);
 
 /// An atom and the underlying pool. A `FatAtom` can be used in place of a
 /// `String` or `Word`
+#[allow(dead_code)]
 pub struct FatAtom {
     pool: Arc<AtomPool>,
     atom: Atom,
@@ -304,6 +305,45 @@ impl<V> Object<V> {
 
     pub fn atoms(&self) -> AtomIter<'_, V> {
         AtomIter::new(self)
+    }
+}
+
+impl<V: PartialEq> Object<V> {
+    fn len_ignore_atom(&self, atom: &Atom) -> usize {
+        // Because of tombstones and the ignored atom, we can't just return `self.entries.len()`.
+        self.entries
+            .iter()
+            .filter(|entry| entry.key != TOMBSTONE_KEY && entry.key != *atom)
+            .count()
+    }
+
+    /// Check for equality while ignoring one particular element
+    pub fn eq_ignore_key(&self, other: &Self, ignore_key: &str) -> bool {
+        let ignore = self.pool.lookup(ignore_key);
+        let len1 = if let Some(to_ignore) = ignore {
+            self.len_ignore_atom(&to_ignore)
+        } else {
+            self.len()
+        };
+        let len2 = if let Some(to_ignore) = other.pool.lookup(ignore_key) {
+            other.len_ignore_atom(&to_ignore)
+        } else {
+            other.len()
+        };
+        if len1 != len2 {
+            return false;
+        }
+
+        if self.same_pool(other) {
+            self.entries
+                .iter()
+                .filter(|e| e.key != TOMBSTONE_KEY && ignore.map_or(true, |ig| e.key != ig))
+                .all(|Entry { key, value }| other.get_by_atom(key).map_or(false, |o| o == value))
+        } else {
+            self.iter()
+                .filter(|(key, _)| *key != ignore_key)
+                .all(|(key, value)| other.get(key).map_or(false, |o| o == value))
+        }
     }
 }
 

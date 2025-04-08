@@ -16,8 +16,6 @@ pub mod log;
 /// `CheapClone` trait.
 pub mod cheap_clone;
 
-pub mod ipfs_client;
-
 pub mod data_source;
 
 pub mod blockchain;
@@ -37,6 +35,8 @@ pub mod schema;
 /// Helpers for parsing environment variables.
 pub mod env;
 
+pub mod ipfs;
+
 /// Wrapper for spawning tasks that abort on panic, which is our default.
 mod task_spawn;
 pub use task_spawn::{
@@ -49,6 +49,7 @@ pub use futures01;
 pub use futures03;
 pub use graph_derive as derive;
 pub use http;
+pub use http0;
 pub use http_body_util;
 pub use hyper;
 pub use hyper_util;
@@ -112,12 +113,11 @@ pub mod prelude {
 
     pub use crate::blockchain::{BlockHash, BlockPtr};
 
-    pub use crate::components::adapter;
     pub use crate::components::ethereum::{
         EthereumBlock, EthereumBlockWithCalls, EthereumCall, LightEthereumBlock,
         LightEthereumBlockExt,
     };
-    pub use crate::components::graphql::{GraphQLMetrics, GraphQlRunner, SubscriptionResultFuture};
+    pub use crate::components::graphql::{GraphQLMetrics, GraphQlRunner};
     pub use crate::components::link_resolver::{
         IpfsResolver, JsonStreamValue, JsonValueStream, LinkResolver,
     };
@@ -125,10 +125,9 @@ pub mod prelude {
         stopwatch::StopwatchMetrics, subgraph::*, Collector, Counter, CounterVec, Gauge, GaugeVec,
         Histogram, HistogramOpts, HistogramVec, MetricsRegistry, Opts, PrometheusError, Registry,
     };
-    pub use crate::components::server::subscription::SubscriptionServer;
     pub use crate::components::store::{
-        write::EntityModification, AttributeNames, BlockNumber, CachedEthereumCall, ChainStore,
-        Child, ChildMultiplicity, EntityCache, EntityChange, EntityChangeOperation,
+        write::EntityModification, AssignmentChange, AssignmentOperation, AttributeNames,
+        BlockNumber, CachedEthereumCall, ChainStore, Child, ChildMultiplicity, EntityCache,
         EntityCollection, EntityFilter, EntityLink, EntityOperation, EntityOrder,
         EntityOrderByChild, EntityOrderByChildInfo, EntityQuery, EntityRange, EntityWindow,
         EthereumCallCache, ParentLink, PartialBlockPtr, PoolWaitStats, QueryStore,
@@ -153,18 +152,13 @@ pub mod prelude {
         Query, QueryError, QueryExecutionError, QueryResult, QueryTarget, QueryVariables,
     };
     pub use crate::data::store::scalar::{BigDecimal, BigInt, BigIntSign};
-    pub use crate::data::store::{
-        AssignmentEvent, Attribute, Entity, NodeId, SubscriptionFilter, Value, ValueType,
-    };
+    pub use crate::data::store::{AssignmentEvent, Attribute, Entity, NodeId, Value, ValueType};
     pub use crate::data::subgraph::schema::SubgraphDeploymentEntity;
     pub use crate::data::subgraph::{
         CreateSubgraphResult, DataSourceContext, DeploymentHash, DeploymentState, Link,
         SubgraphAssignmentProviderError, SubgraphManifest, SubgraphManifestResolveError,
         SubgraphManifestValidationError, SubgraphName, SubgraphRegistrarError,
         UnvalidatedSubgraphManifest,
-    };
-    pub use crate::data::subscription::{
-        QueryResultStream, Subscription, SubscriptionError, SubscriptionResult,
     };
     pub use crate::data_source::DataSourceTemplateInfo;
     pub use crate::ext::futures::{

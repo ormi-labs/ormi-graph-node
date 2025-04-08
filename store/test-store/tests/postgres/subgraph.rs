@@ -10,9 +10,8 @@ use graph::{
         schema::{DeploymentCreate, SubgraphError},
         DeploymentFeatures,
     },
+    prelude::AssignmentChange,
     prelude::BlockPtr,
-    prelude::EntityChange,
-    prelude::EntityChangeOperation,
     prelude::QueryStoreManager,
     prelude::StoreEvent,
     prelude::SubgraphManifest,
@@ -59,18 +58,12 @@ const SUBGRAPH_FEATURES_GQL: &str = "
     }
 ";
 
-fn assigned(deployment: &DeploymentLocator) -> EntityChange {
-    EntityChange::Assignment {
-        deployment: deployment.clone(),
-        operation: EntityChangeOperation::Set,
-    }
+fn assigned(deployment: &DeploymentLocator) -> AssignmentChange {
+    AssignmentChange::set(deployment.clone())
 }
 
-fn unassigned(deployment: &DeploymentLocator) -> EntityChange {
-    EntityChange::Assignment {
-        deployment: deployment.clone(),
-        operation: EntityChangeOperation::Removed,
-    }
+fn unassigned(deployment: &DeploymentLocator) -> AssignmentChange {
+    AssignmentChange::removed(deployment.clone())
 }
 
 fn get_version_info(store: &Store, subgraph_name: &str) -> VersionInfo {
@@ -163,14 +156,14 @@ fn create_subgraph() {
         store: &SubgraphStore,
         id: &str,
         mode: SubgraphVersionSwitchingMode,
-    ) -> (DeploymentLocator, HashSet<EntityChange>) {
+    ) -> (DeploymentLocator, HashSet<AssignmentChange>) {
         let name = SubgraphName::new(SUBGRAPH_NAME.to_string()).unwrap();
         let id = DeploymentHash::new(id.to_string()).unwrap();
         let schema = InputSchema::parse_latest(SUBGRAPH_GQL, id.clone()).unwrap();
 
         let manifest = SubgraphManifest::<graph_chain_ethereum::Chain> {
             id,
-            spec_version: Version::new(1, 0, 0),
+            spec_version: Version::new(1, 3, 0),
             features: Default::default(),
             description: None,
             repository: None,
@@ -203,20 +196,24 @@ fn create_subgraph() {
         (deployment, events)
     }
 
-    fn deploy_event(deployment: &DeploymentLocator) -> HashSet<EntityChange> {
+    fn deploy_event(deployment: &DeploymentLocator) -> HashSet<AssignmentChange> {
         let mut changes = HashSet::new();
         changes.insert(assigned(deployment));
         changes
     }
 
-    fn deployment_synced(store: &Arc<SubgraphStore>, deployment: &DeploymentLocator) {
+    fn deployment_synced(
+        store: &Arc<SubgraphStore>,
+        deployment: &DeploymentLocator,
+        block_ptr: BlockPtr,
+    ) {
         futures03::executor::block_on(store.cheap_clone().writable(
             LOGGER.clone(),
             deployment.id,
             Arc::new(Vec::new()),
         ))
         .expect("can get writable")
-        .deployment_synced()
+        .deployment_synced(block_ptr)
         .unwrap();
     }
 
@@ -259,7 +256,7 @@ fn create_subgraph() {
         assert!(pending.is_none());
 
         // Sync deployment
-        deployment_synced(&store, &deployment2);
+        deployment_synced(&store, &deployment2, GENESIS_PTR.clone());
 
         // Deploying again still overwrites current
         let (deployment3, events) = deploy(store.as_ref(), ID3, MODE);
@@ -319,7 +316,7 @@ fn create_subgraph() {
         assert!(pending.is_none());
 
         // Deploy when current is synced leaves current alone and adds pending
-        deployment_synced(&store, &deployment2);
+        deployment_synced(&store, &deployment2, GENESIS_PTR.clone());
         let (deployment3, events) = deploy(store.as_ref(), ID3, MODE);
         let expected = deploy_event(&deployment3);
         assert_eq!(expected, events);
@@ -354,7 +351,7 @@ fn create_subgraph() {
         assert_eq!(None, pending.as_deref());
 
         // Mark `ID3` as synced and deploy that again
-        deployment_synced(&store, &deployment3);
+        deployment_synced(&store, &deployment3, GENESIS_PTR.clone());
         let expected = HashSet::from([unassigned(&deployment2), assigned(&deployment3)]);
         let (deployment3_again, events) = deploy(store.as_ref(), ID3, MODE);
         assert_eq!(&deployment3, &deployment3_again);
@@ -543,13 +540,13 @@ fn subgraph_features() {
         } = get_subgraph_features(id.to_string()).unwrap();
 
         assert_eq!(NAME, subgraph_id.as_str());
-        assert_eq!("1.0.0", spec_version);
+        assert_eq!("1.3.0", spec_version);
         assert_eq!("1.0.0", api_version.unwrap());
         assert_eq!(NETWORK_NAME, network);
         assert_eq!(
             vec![
                 SubgraphFeature::NonFatalErrors.to_string(),
-                SubgraphFeature::FullTextSearch.to_string()
+                SubgraphFeature::FullTextSearch.to_string(),
             ],
             features
         );
@@ -699,10 +696,10 @@ fn fatal_vs_non_fatal() {
     run_test_sequentially(|store| async move {
         let deployment = setup().await;
         let query_store = store
-            .query_store(
-                QueryTarget::Deployment(deployment.hash.clone(), Default::default()),
-                false,
-            )
+            .query_store(QueryTarget::Deployment(
+                deployment.hash.clone(),
+                Default::default(),
+            ))
             .await
             .unwrap();
 
@@ -760,10 +757,10 @@ fn fail_unfail_deterministic_error() {
         let deployment = setup().await;
 
         let query_store = store
-            .query_store(
-                QueryTarget::Deployment(deployment.hash.clone(), Default::default()),
-                false,
-            )
+            .query_store(QueryTarget::Deployment(
+                deployment.hash.clone(),
+                Default::default(),
+            ))
             .await
             .unwrap();
 

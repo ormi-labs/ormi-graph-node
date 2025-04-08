@@ -2,7 +2,7 @@ use diesel::{ExpressionMethods, JoinOnDsl, OptionalExtension, QueryDsl, RunQuery
 use std::{collections::HashMap, sync::Arc, time::SystemTime};
 
 use graph::{
-    components::store::{BlockStore as _, DeploymentId},
+    components::store::{BlockStore as _, DeploymentId, DeploymentLocator},
     data::query::QueryTarget,
     prelude::{
         anyhow::{anyhow, bail, Error},
@@ -84,10 +84,9 @@ impl CopyState {
     }
 }
 
-pub async fn create(
+async fn create_inner(
     store: Arc<Store>,
-    primary: ConnectionPool,
-    src: DeploymentSearch,
+    src: &DeploymentLocator,
     shard: String,
     shards: Vec<String>,
     node: String,
@@ -104,12 +103,11 @@ pub async fn create(
     };
 
     let subgraph_store = store.subgraph_store();
-    let src = src.locate_unique(&primary)?;
     let query_store = store
-        .query_store(
-            QueryTarget::Deployment(src.hash.clone(), Default::default()),
-            true,
-        )
+        .query_store(QueryTarget::Deployment(
+            src.hash.clone(),
+            Default::default(),
+        ))
         .await?;
     let network = query_store.network_name();
 
@@ -152,6 +150,32 @@ pub async fn create(
 
     println!("created deployment {} as copy of {}", dst, src);
     Ok(())
+}
+
+pub async fn create(
+    store: Arc<Store>,
+    primary: ConnectionPool,
+    src: DeploymentSearch,
+    shard: String,
+    shards: Vec<String>,
+    node: String,
+    block_offset: u32,
+    activate: bool,
+    replace: bool,
+) -> Result<(), Error> {
+    let src = src.locate_unique(&primary)?;
+    create_inner(
+        store,
+        &src,
+        shard,
+        shards,
+        node,
+        block_offset,
+        activate,
+        replace,
+    )
+    .await
+    .map_err(|e| anyhow!("cannot copy {src}: {e}"))
 }
 
 pub fn activate(store: Arc<SubgraphStore>, deployment: String, shard: String) -> Result<(), Error> {
@@ -231,12 +255,10 @@ pub fn list(pools: HashMap<Shard, ConnectionPool>) -> Result<(), Error> {
 }
 
 pub fn status(pools: HashMap<Shard, ConnectionPool>, dst: &DeploymentSearch) -> Result<(), Error> {
+    const CHECK: &str = "✓";
+
     use catalog::active_copies as ac;
     use catalog::deployment_schemas as ds;
-
-    fn done(ts: &Option<UtcDateTime>) -> String {
-        ts.map(|_| "✓").unwrap_or(".").to_string()
-    }
 
     fn duration(start: &UtcDateTime, end: &Option<UtcDateTime>) -> String {
         let start = *start;
@@ -290,7 +312,7 @@ pub fn status(pools: HashMap<Shard, ConnectionPool>, dst: &DeploymentSearch) -> 
     };
 
     let progress = match &state.finished_at {
-        Some(_) => done(&state.finished_at),
+        Some(_) => CHECK.to_string(),
         None => {
             let target: i64 = tables.iter().map(|table| table.target_vid).sum();
             let next: i64 = tables.iter().map(|table| table.next_vid).sum();
@@ -339,13 +361,15 @@ pub fn status(pools: HashMap<Shard, ConnectionPool>, dst: &DeploymentSearch) -> 
     );
     println!("{:-<74}", "-");
     for table in tables {
-        let status = if table.next_vid > 0 && table.next_vid < table.target_vid {
-            ">".to_string()
-        } else if table.target_vid < 0 {
+        let status = match &table.finished_at {
+            // table finished
+            Some(_) => CHECK,
             // empty source table
-            "✓".to_string()
-        } else {
-            done(&table.finished_at)
+            None if table.target_vid < 0 => CHECK,
+            // copying in progress
+            None if table.duration_ms > 0 => ">",
+            // not started
+            None => ".",
         };
         println!(
             "{} {:<28} | {:>8} | {:>8} | {:>8} | {:>8}",

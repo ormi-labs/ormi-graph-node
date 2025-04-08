@@ -123,7 +123,7 @@ impl Display for Expr {
             Expr::Column(s) => write!(f, "{s}")?,
             Expr::Prefix(s, _) => write!(f, "{s}")?,
             Expr::Vid => write!(f, "vid")?,
-            Expr::Block => write!(f, "block")?,
+            Expr::Block => write!(f, "{BLOCK_COLUMN}")?,
             Expr::BlockRange => write!(f, "block_range")?,
             Expr::BlockRangeLower => write!(f, "lower(block_range)")?,
             Expr::BlockRangeUpper => write!(f, "upper(block_range)")?,
@@ -211,8 +211,8 @@ impl Expr {
 
     fn to_sql(&self) -> String {
         match self {
-            Expr::Column(name) => name.to_string(),
-            Expr::Prefix(name, kind) => kind.to_sql(name),
+            Expr::Column(name) => format!("\"{}\"", name),
+            Expr::Prefix(name, kind) => kind.to_sql(&format!("\"{}\"", name)),
             Expr::Vid => VID_COLUMN.to_string(),
             Expr::Block => BLOCK_COLUMN.to_string(),
             Expr::BlockRange => BLOCK_RANGE_COLUMN.to_string(),
@@ -440,7 +440,7 @@ impl CreateIndex {
         }
     }
 
-    fn with_nsp(&self, nsp2: String) -> Result<Self, Error> {
+    pub fn with_nsp(&self, nsp2: String) -> Result<Self, Error> {
         let s = self.clone();
         match s {
             CreateIndex::Unknown { defn: _ } => Err(anyhow!("Failed to parse the index")),
@@ -488,11 +488,28 @@ impl CreateIndex {
                             && columns[1] == Expr::BlockRange
                     }
                     Method::Brin => false,
-                    Method::BTree | Method::Gin => {
+                    Method::Gin => {
+                        // 'using gin(<attr>)'
                         columns.len() == 1
                             && columns[0].is_attribute()
                             && cond.is_none()
                             && with.is_none()
+                    }
+                    Method::BTree => {
+                        match columns.len() {
+                            1 => {
+                                // 'using btree(<attr>)'
+                                columns[0].is_attribute() && cond.is_none() && with.is_none()
+                            }
+                            2 => {
+                                // 'using btree(<attr>, block$)'
+                                columns[0].is_attribute()
+                                    && columns[1] == Expr::Block
+                                    && cond.is_none()
+                                    && with.is_none()
+                            }
+                            _ => false,
+                        }
                     }
                     Method::Unknown(_) => false,
                 }
@@ -537,6 +554,7 @@ impl CreateIndex {
                         None,
                     ),
                     dummy(false, BTree, &[Expr::BlockRangeUpper], Some(Cond::Closed)),
+                    dummy(false, BTree, &[Expr::Block], None),
                 ]
             };
         }
@@ -630,7 +648,7 @@ impl CreateIndex {
     }
 
     pub fn fields_exist_in_dest<'a>(&self, dest_table: &'a Table) -> bool {
-        fn column_exists<'a>(it: &mut impl Iterator<Item = &'a str>, column_name: &String) -> bool {
+        fn column_exists<'a>(it: &mut impl Iterator<Item = &'a str>, column_name: &str) -> bool {
             it.any(|c| *c == *column_name)
         }
 
@@ -667,7 +685,7 @@ impl CreateIndex {
                         }
                         Expr::Vid => (),
                         Expr::Block => {
-                            if !column_exists(cols, &"block".to_string()) {
+                            if !dest_table.immutable {
                                 return false;
                             }
                         }
@@ -734,6 +752,16 @@ pub struct IndexList {
     pub(crate) indexes: HashMap<String, Vec<CreateIndex>>,
 }
 
+pub fn load_indexes_from_table(
+    conn: &mut PgConnection,
+    table: &Arc<Table>,
+    schema_name: &str,
+) -> Result<Vec<CreateIndex>, StoreError> {
+    let table_name = table.name.as_str();
+    let indexes = catalog::indexes_for_table(conn, schema_name, table_name)?;
+    Ok(indexes.into_iter().map(CreateIndex::parse).collect())
+}
+
 impl IndexList {
     pub fn load(
         conn: &mut PgConnection,
@@ -746,10 +774,8 @@ impl IndexList {
         let schema_name = site.namespace.clone();
         let layout = store.layout(conn, site)?;
         for (_, table) in &layout.tables {
-            let table_name = table.name.as_str();
-            let indexes = catalog::indexes_for_table(conn, schema_name.as_str(), table_name)?;
-            let collect: Vec<CreateIndex> = indexes.into_iter().map(CreateIndex::parse).collect();
-            list.indexes.insert(table_name.to_string(), collect);
+            let indexes = load_indexes_from_table(conn, table, schema_name.as_str())?;
+            list.indexes.insert(table.name.to_string(), indexes);
         }
         Ok(list)
     }
@@ -760,7 +786,8 @@ impl IndexList {
         table_name: &String,
         dest_table: &Table,
         postponed: bool,
-        concurrent_if_not_exist: bool,
+        concurrent: bool,
+        if_not_exists: bool,
     ) -> Result<Vec<(Option<String>, String)>, Error> {
         let mut arr = vec![];
         if let Some(vec) = self.indexes.get(table_name) {
@@ -768,7 +795,7 @@ impl IndexList {
                 // First we check if the fields do exist in the destination subgraph.
                 // In case of grafting that is not given.
                 if ci.fields_exist_in_dest(dest_table)
-                    // Then we check if the index is one of the default indexes not based on 
+                    // Then we check if the index is one of the default indexes not based on
                     // the attributes. Those will be created anyway and we should skip them.
                     && !ci.is_default_non_attr_index()
                     // Then ID based indexes in the immutable tables are also created initially
@@ -781,7 +808,7 @@ impl IndexList {
                 {
                     if let Ok(sql) = ci
                         .with_nsp(namespace.to_string())?
-                        .to_sql(concurrent_if_not_exist, concurrent_if_not_exist)
+                        .to_sql(concurrent, if_not_exists)
                     {
                         arr.push((ci.name(), sql))
                     }
@@ -805,7 +832,7 @@ impl IndexList {
         let namespace = &layout.catalog.site.namespace;
         for table in layout.tables.values() {
             for (ind_name, create_query) in
-                self.indexes_for_table(namespace, &table.name.to_string(), table, true, true)?
+                self.indexes_for_table(namespace, &table.name.to_string(), table, true, true, true)?
             {
                 if let Some(index_name) = ind_name {
                     let table_name = table.name.clone();
@@ -942,14 +969,14 @@ fn parse() {
         let exp = CreateIndex::from(exp);
         assert_eq!(exp, act);
 
-        let defn = defn.replace('\"', "").to_ascii_lowercase();
+        let defn = defn.to_ascii_lowercase();
         assert_eq!(defn, act.to_sql(false, false).unwrap());
     }
 
     use TestCond::*;
     use TestExpr::*;
 
-    let sql = "create index attr_1_0_token_id on sgd44.token using btree (id)";
+    let sql = "create index attr_1_0_token_id on sgd44.token using btree (\"id\")";
     let exp = Parsed {
         unique: false,
         name: "attr_1_0_token_id",
@@ -962,7 +989,7 @@ fn parse() {
     parse_one(sql, exp);
 
     let sql =
-        "create index attr_1_1_token_symbol on sgd44.token using btree (\"left\"(symbol, 256))";
+        "create index attr_1_1_token_symbol on sgd44.token using btree (left(\"symbol\", 256))";
     let exp = Parsed {
         unique: false,
         name: "attr_1_1_token_symbol",
@@ -974,7 +1001,8 @@ fn parse() {
     };
     parse_one(sql, exp);
 
-    let sql = "create index attr_1_5_token_trade_volume on sgd44.token using btree (trade_volume)";
+    let sql =
+        "create index attr_1_5_token_trade_volume on sgd44.token using btree (\"trade_volume\")";
     let exp = Parsed {
         unique: false,
         name: "attr_1_5_token_trade_volume",
@@ -1022,7 +1050,8 @@ fn parse() {
     };
     parse_one(sql, exp);
 
-    let sql = "create index token_id_block_range_excl on sgd44.token using gist (id, block_range)";
+    let sql =
+        "create index token_id_block_range_excl on sgd44.token using gist (\"id\", block_range)";
     let exp = Parsed {
         unique: false,
         name: "token_id_block_range_excl",
@@ -1034,7 +1063,7 @@ fn parse() {
     };
     parse_one(sql, exp);
 
-    let sql="create index attr_1_11_pool_owner on sgd411585.pool using btree (\"substring\"(owner, 1, 64))";
+    let sql="create index attr_1_11_pool_owner on sgd411585.pool using btree (substring(\"owner\", 1, 64))";
     let exp = Parsed {
         unique: false,
         name: "attr_1_11_pool_owner",
@@ -1047,7 +1076,7 @@ fn parse() {
     parse_one(sql, exp);
 
     let sql =
-        "create index attr_1_20_pool_vault_id on sgd411585.pool using gist (vault_id, block_range)";
+        "create index attr_1_20_pool_vault_id on sgd411585.pool using gist (\"vault_id\", block_range)";
     let exp = Parsed {
         unique: false,
         name: "attr_1_20_pool_vault_id",
@@ -1059,7 +1088,8 @@ fn parse() {
     };
     parse_one(sql, exp);
 
-    let sql = "create index attr_1_22_pool_tokens_list on sgd411585.pool using gin (tokens_list)";
+    let sql =
+        "create index attr_1_22_pool_tokens_list on sgd411585.pool using gin (\"tokens_list\")";
     let exp = Parsed {
         unique: false,
         name: "attr_1_22_pool_tokens_list",
@@ -1071,7 +1101,7 @@ fn parse() {
     };
     parse_one(sql, exp);
 
-    let sql = "create index manual_partial_pool_total_liquidity on sgd411585.pool using btree (total_liquidity) where (coalesce(upper(block_range), 2147483647) > 15635000)";
+    let sql = "create index manual_partial_pool_total_liquidity on sgd411585.pool using btree (\"total_liquidity\") where (coalesce(upper(block_range), 2147483647) > 15635000)";
     let exp = Parsed {
         unique: false,
         name: "manual_partial_pool_total_liquidity",
@@ -1083,7 +1113,7 @@ fn parse() {
     };
     parse_one(sql, exp);
 
-    let sql = "create index manual_swap_pool_timestamp_id on sgd217942.swap using btree (pool, \"timestamp\", id)";
+    let sql = "create index manual_swap_pool_timestamp_id on sgd217942.swap using btree (\"pool\", \"timestamp\", \"id\")";
     let exp = Parsed {
         unique: false,
         name: "manual_swap_pool_timestamp_id",
@@ -1095,7 +1125,7 @@ fn parse() {
     };
     parse_one(sql, exp);
 
-    let sql = "CREATE INDEX brin_scy ON sgd314614.scy USING brin (\"block$\", vid)";
+    let sql = "CREATE INDEX brin_scy ON sgd314614.scy USING brin (block$, vid)";
     let exp = Parsed {
         unique: false,
         name: "brin_scy",
@@ -1107,8 +1137,7 @@ fn parse() {
     };
     parse_one(sql, exp);
 
-    let sql =
-        "CREATE INDEX brin_scy ON sgd314614.scy USING brin (\"block$\", vid) where (amount > 0)";
+    let sql = "CREATE INDEX brin_scy ON sgd314614.scy USING brin (block$, vid) where (amount > 0)";
     let exp = Parsed {
         unique: false,
         name: "brin_scy",
@@ -1121,7 +1150,7 @@ fn parse() {
     parse_one(sql, exp);
 
     let sql =
-        "CREATE INDEX manual_token_random_cond ON sgd44.token USING btree (decimals) WHERE (decimals > (5)::numeric)";
+        "CREATE INDEX manual_token_random_cond ON sgd44.token USING btree (\"decimals\") WHERE (decimals > (5)::numeric)";
     let exp = Parsed {
         unique: false,
         name: "manual_token_random_cond",

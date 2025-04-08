@@ -398,6 +398,16 @@ pub fn drop_foreign_schema(conn: &mut PgConnection, src: &Site) -> Result<(), St
     Ok(())
 }
 
+pub fn foreign_tables(conn: &mut PgConnection, nsp: &str) -> Result<Vec<String>, StoreError> {
+    use foreign_tables as ft;
+
+    ft::table
+        .filter(ft::foreign_table_schema.eq(nsp))
+        .select(ft::foreign_table_name)
+        .get_results::<String>(conn)
+        .map_err(StoreError::from)
+}
+
 /// Drop the schema `nsp` and all its contents if it exists, and create it
 /// again so that `nsp` is an empty schema
 pub fn recreate_schema(conn: &mut PgConnection, nsp: &str) -> Result<(), StoreError> {
@@ -621,6 +631,58 @@ pub fn create_foreign_table(
             "failed to generate 'create foreign table' query for {}.{}",
             dst_nsp,
             table_name
+        )
+    })?;
+    Ok(query)
+}
+
+/// Create a SQL statement unioning imported tables from all shards,
+/// something like
+///
+/// ```sql
+/// create view "dst_nsp"."src_table" as
+/// select 'shard1' as shard, "col1", "col2" from "shard_shard1_subgraphs"."table_name"
+/// union all
+/// ...
+/// ````
+///
+/// The list `shard_nsps` consists of pairs `(name, namespace)` where `name`
+/// is the name of the shard and `namespace` is the namespace where the
+/// `src_table` is mapped
+pub fn create_cross_shard_view(
+    conn: &mut PgConnection,
+    src_nsp: &str,
+    src_table: &str,
+    dst_nsp: &str,
+    shard_nsps: &[(&str, String)],
+) -> Result<String, StoreError> {
+    fn build_query(
+        columns: &[table_schema::Column],
+        table_name: &str,
+        dst_nsp: &str,
+        shard_nsps: &[(&str, String)],
+    ) -> Result<String, std::fmt::Error> {
+        let mut query = String::new();
+        write!(query, "create view \"{}\".\"{}\" as ", dst_nsp, table_name)?;
+        for (idx, (name, nsp)) in shard_nsps.into_iter().enumerate() {
+            if idx > 0 {
+                write!(query, " union all ")?;
+            }
+            write!(query, "select '{name}' as shard")?;
+            for column in columns {
+                write!(query, ", \"{}\"", column.column_name)?;
+            }
+            writeln!(query, " from \"{}\".\"{}\"", nsp, table_name)?;
+        }
+        Ok(query)
+    }
+
+    let columns = table_schema::columns(conn, src_nsp, src_table)?;
+    let query = build_query(&columns, src_table, dst_nsp, shard_nsps).map_err(|_| {
+        anyhow!(
+            "failed to generate 'create foreign table' query for {}.{}",
+            dst_nsp,
+            src_table
         )
     })?;
     Ok(query)
@@ -911,4 +973,32 @@ fn has_minmax_multi_ops(conn: &mut PgConnection) -> Result<bool, StoreError> {
     }
 
     Ok(sql_query(QUERY).get_result::<Ops>(conn)?.has_ops)
+}
+
+pub(crate) fn histogram_bounds(
+    conn: &mut PgConnection,
+    namespace: &Namespace,
+    table: &SqlName,
+    column: &str,
+) -> Result<Vec<i64>, StoreError> {
+    const QUERY: &str = "select histogram_bounds::text::int8[] bounds \
+                           from pg_stats \
+                          where schemaname = $1 \
+                            and tablename = $2 \
+                            and attname = $3";
+
+    #[derive(Queryable, QueryableByName)]
+    struct Bounds {
+        #[diesel(sql_type = Array<BigInt>)]
+        bounds: Vec<i64>,
+    }
+
+    sql_query(QUERY)
+        .bind::<Text, _>(namespace.as_str())
+        .bind::<Text, _>(table.as_str())
+        .bind::<Text, _>(column)
+        .get_result::<Bounds>(conn)
+        .optional()
+        .map(|bounds| bounds.map(|b| b.bounds).unwrap_or_default())
+        .map_err(StoreError::from)
 }

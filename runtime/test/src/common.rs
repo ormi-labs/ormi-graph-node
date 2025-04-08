@@ -1,15 +1,16 @@
 use ethabi::Contract;
 use graph::blockchain::BlockTime;
 use graph::components::store::DeploymentLocator;
+use graph::components::subgraph::SharedProofOfIndexing;
 use graph::data::subgraph::*;
 use graph::data_source;
+use graph::data_source::common::MappingABI;
 use graph::env::EnvVars;
-use graph::ipfs_client::IpfsClient;
+use graph::ipfs::IpfsRpcClient;
+use graph::ipfs::ServerAddress;
 use graph::log;
 use graph::prelude::*;
-use graph_chain_ethereum::{
-    Chain, DataSource, DataSourceTemplate, Mapping, MappingABI, TemplateSource,
-};
+use graph_chain_ethereum::{Chain, DataSource, DataSourceTemplate, Mapping, TemplateSource};
 use graph_runtime_wasm::host_exports::DataSourceDetails;
 use graph_runtime_wasm::{HostExports, MappingContext};
 use semver::Version;
@@ -64,12 +65,14 @@ fn mock_host_exports(
         Arc::new(templates.iter().map(|t| t.into()).collect()),
     );
 
+    let client = IpfsRpcClient::new_unchecked(ServerAddress::local_rpc_api(), &LOGGER).unwrap();
+
     HostExports::new(
         subgraph_id,
         network,
         ds_details,
-        Arc::new(graph::prelude::IpfsResolver::new(
-            vec![IpfsClient::localhost()],
+        Arc::new(IpfsResolver::new(
+            Arc::new(client),
             Arc::new(EnvVars::default()),
         )),
         ens_lookup,
@@ -125,7 +128,7 @@ pub fn mock_context(
             .unwrap(),
             Default::default(),
         ),
-        proof_of_indexing: None,
+        proof_of_indexing: SharedProofOfIndexing::ignored(),
         host_fns: Arc::new(Vec::new()),
         debug_fork: None,
         mapping_logger: Logger::root(slog::Discard, o!()),

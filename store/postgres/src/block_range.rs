@@ -50,7 +50,7 @@ lazy_static! {
 
 /// The range of blocks for which an entity is valid. We need this struct
 /// to bind ranges into Diesel queries.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Copy)]
 pub struct BlockRange(Bound<BlockNumber>, Bound<BlockNumber>);
 
 pub(crate) fn first_block_in_range(
@@ -132,6 +132,87 @@ impl<'a> QueryFragment<Pg> for BlockRangeUpperBoundClause<'a> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum BoundSide {
+    Lower,
+    Upper,
+}
+
+/// Helper for generating SQL fragments for selecting entities in a specific block range
+#[derive(Debug, Clone, Copy)]
+pub enum EntityBlockRange {
+    Mutable((BlockRange, BoundSide)),
+    Immutable(BlockRange),
+}
+
+impl EntityBlockRange {
+    pub fn new(
+        immutable: bool,
+        block_range: std::ops::Range<BlockNumber>,
+        bound_side: BoundSide,
+    ) -> Self {
+        let start: Bound<BlockNumber> = Bound::Included(block_range.start);
+        let end: Bound<BlockNumber> = Bound::Excluded(block_range.end);
+        let block_range: BlockRange = BlockRange(start, end);
+        if immutable {
+            Self::Immutable(block_range)
+        } else {
+            Self::Mutable((block_range, bound_side))
+        }
+    }
+
+    /// Outputs SQL that matches only rows whose entities would trigger a change
+    /// event (Create, Modify, Delete) in a given interval of blocks. Otherwise said
+    /// a block_range border is contained in an interval of blocks. For instance
+    /// one of the following:
+    /// lower(block_range) >= $1 and lower(block_range) <= $2
+    /// upper(block_range) >= $1 and upper(block_range) <= $2
+    /// block$ >= $1 and block$ <= $2
+    pub fn contains<'b>(&'b self, out: &mut AstPass<'_, 'b, Pg>) -> QueryResult<()> {
+        out.unsafe_to_cache_prepared();
+        let block_range = match self {
+            EntityBlockRange::Mutable((br, _)) => br,
+            EntityBlockRange::Immutable(br) => br,
+        };
+        let BlockRange(start, finish) = block_range;
+
+        self.compare_column(out);
+        out.push_sql(">= ");
+        match start {
+            Bound::Included(block) => out.push_bind_param::<Integer, _>(block)?,
+            Bound::Excluded(block) => {
+                out.push_bind_param::<Integer, _>(block)?;
+                out.push_sql("+1");
+            }
+            Bound::Unbounded => unimplemented!(),
+        };
+        out.push_sql(" and");
+        self.compare_column(out);
+        out.push_sql("<= ");
+        match finish {
+            Bound::Included(block) => {
+                out.push_bind_param::<Integer, _>(block)?;
+                out.push_sql("+1");
+            }
+            Bound::Excluded(block) => out.push_bind_param::<Integer, _>(block)?,
+            Bound::Unbounded => unimplemented!(),
+        };
+        Ok(())
+    }
+
+    pub fn compare_column(&self, out: &mut AstPass<Pg>) {
+        match self {
+            EntityBlockRange::Mutable((_, BoundSide::Lower)) => {
+                out.push_sql(" lower(block_range) ")
+            }
+            EntityBlockRange::Mutable((_, BoundSide::Upper)) => {
+                out.push_sql(" upper(block_range) ")
+            }
+            EntityBlockRange::Immutable(_) => out.push_sql(" block$ "),
+        }
+    }
+}
+
 /// Helper for generating various SQL fragments for handling the block range
 /// of entity versions
 #[allow(unused)]
@@ -163,13 +244,6 @@ impl<'a> BlockRangeColumn<'a> {
                 table_prefix,
                 block,
             }
-        }
-    }
-
-    pub fn block(&self) -> BlockNumber {
-        match self {
-            BlockRangeColumn::Mutable { block, .. } => *block,
-            BlockRangeColumn::Immutable { block, .. } => *block,
         }
     }
 }
@@ -227,13 +301,6 @@ impl<'a> BlockRangeColumn<'a> {
         }
     }
 
-    pub fn column_name(&self) -> &str {
-        match self {
-            BlockRangeColumn::Mutable { .. } => BLOCK_RANGE_COLUMN,
-            BlockRangeColumn::Immutable { .. } => BLOCK_COLUMN,
-        }
-    }
-
     /// Output the qualified name of the block range column
     pub fn name(&self, out: &mut AstPass<Pg>) {
         match self {
@@ -277,14 +344,6 @@ impl<'a> BlockRangeColumn<'a> {
             BlockRangeColumn::Immutable { .. } => {
                 unreachable!("immutable entities can not be updated or deleted")
             }
-        }
-    }
-
-    /// Output the name of the block range column without the table prefix
-    pub(crate) fn bare_name(&self, out: &mut AstPass<Pg>) {
-        match self {
-            BlockRangeColumn::Mutable { .. } => out.push_sql(BLOCK_RANGE_COLUMN),
-            BlockRangeColumn::Immutable { .. } => out.push_sql(BLOCK_COLUMN),
         }
     }
 

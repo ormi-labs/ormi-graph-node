@@ -33,7 +33,7 @@ use web3::types::Address;
 
 use crate::{
     bail,
-    blockchain::{BlockPtr, Blockchain, DataSource as _},
+    blockchain::{BlockPtr, Blockchain},
     components::{
         link_resolver::LinkResolver,
         store::{StoreError, SubgraphStore},
@@ -139,6 +139,10 @@ impl DeploymentHash {
         Link {
             link: format!("/ipfs/{}", self),
         }
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        self.0.as_bytes().to_vec()
     }
 }
 
@@ -344,7 +348,7 @@ pub enum SubgraphManifestValidationError {
     MultipleEthereumNetworks,
     #[error("subgraph must have at least one Ethereum network data source")]
     EthereumNetworkRequired,
-    #[error("the specified block must exist on the Ethereum network")]
+    #[error("the specified block {0} must exist on the Ethereum network")]
     BlockNotFound(String),
     #[error("schema validation failed: {0:?}")]
     SchemaValidationError(Vec<SchemaValidationError>),
@@ -366,7 +370,7 @@ pub enum SubgraphManifestResolveError {
     NonUtf8,
     #[error("subgraph is not valid YAML")]
     InvalidFormat,
-    #[error("resolve error: {0}")]
+    #[error("resolve error: {0:#}")]
     ResolveError(#[from] anyhow::Error),
 }
 
@@ -500,13 +504,7 @@ impl Graft {
             // The graft point must be at least `reorg_threshold` blocks
             // behind the subgraph head so that a reorg can not affect the
             // data that we copy for grafting
-            //
-            // This is pretty nasty: we have tests in the subgraph runner
-            // tests that graft onto the subgraph head directly. We
-            // therefore skip this check in debug builds and only turn it on
-            // in release builds
-            #[cfg(not(debug_assertions))]
-            (Some(ptr), true) if self.block + ENV_VARS.reorg_threshold >= ptr.number => Err(GraftBaseInvalid(format!(
+            (Some(ptr), true) if self.block + ENV_VARS.reorg_threshold > ptr.number => Err(GraftBaseInvalid(format!(
                 "failed to graft onto `{}` at block {} since it's only at block {} which is within the reorg threshold of {} blocks",
                 self.base, self.block, ptr.number, ENV_VARS.reorg_threshold
             ))),
@@ -579,7 +577,7 @@ pub struct BaseSubgraphManifest<C, S, D, T> {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IndexerHints {
-    prune: Option<Prune>,
+    pub prune: Option<Prune>,
 }
 
 impl IndexerHints {
@@ -674,6 +672,73 @@ pub type SubgraphManifest<C> =
 pub struct UnvalidatedSubgraphManifest<C: Blockchain>(SubgraphManifest<C>);
 
 impl<C: Blockchain> UnvalidatedSubgraphManifest<C> {
+    fn validate_subgraph_datasources(
+        data_sources: &[DataSource<C>],
+        spec_version: &Version,
+    ) -> Vec<SubgraphManifestValidationError> {
+        let mut errors = Vec::new();
+
+        // Check spec version support for subgraph datasources
+        if *spec_version < SPEC_VERSION_1_3_0 {
+            if data_sources
+                .iter()
+                .any(|ds| matches!(ds, DataSource::Subgraph(_)))
+            {
+                errors.push(SubgraphManifestValidationError::DataSourceValidation(
+                    "subgraph".to_string(),
+                    anyhow!(
+                        "Subgraph datasources are not supported prior to spec version {}",
+                        SPEC_VERSION_1_3_0
+                    ),
+                ));
+                return errors;
+            }
+        }
+
+        let subgraph_ds_count = data_sources
+            .iter()
+            .filter(|ds| matches!(ds, DataSource::Subgraph(_)))
+            .count();
+
+        if subgraph_ds_count > 5 {
+            errors.push(SubgraphManifestValidationError::DataSourceValidation(
+                "subgraph".to_string(),
+                anyhow!("Cannot have more than 5 subgraph datasources"),
+            ));
+        }
+
+        let has_subgraph_ds = subgraph_ds_count > 0;
+        let has_onchain_ds = data_sources
+            .iter()
+            .any(|d| matches!(d, DataSource::Onchain(_)));
+
+        if has_subgraph_ds && has_onchain_ds {
+            errors.push(SubgraphManifestValidationError::DataSourceValidation(
+                "subgraph".to_string(),
+                anyhow!("Subgraph datasources cannot be used alongside onchain datasources"),
+            ));
+        }
+
+        // Check for duplicate source subgraphs
+        let mut seen_sources = std::collections::HashSet::new();
+        for ds in data_sources.iter() {
+            if let DataSource::Subgraph(ds) = ds {
+                let source_id = ds.source.address();
+                if !seen_sources.insert(source_id.clone()) {
+                    errors.push(SubgraphManifestValidationError::DataSourceValidation(
+                        "subgraph".to_string(),
+                        anyhow!(
+                            "Multiple subgraph datasources cannot use the same source subgraph {}",
+                            source_id
+                        ),
+                    ));
+                }
+            }
+        }
+
+        errors
+    }
+
     /// Entry point for resolving a subgraph definition.
     /// Right now the only supported links are of the form:
     /// `/ipfs/QmUmg7BZC1YP1ca66rRtWKxpXp77WgVHrnv263JtDuvs2k`
@@ -719,7 +784,7 @@ impl<C: Blockchain> UnvalidatedSubgraphManifest<C> {
             .0
             .data_sources
             .iter()
-            .filter_map(|d| Some(d.as_onchain()?.network()?.to_string()))
+            .filter_map(|d| Some(d.network()?.to_string()))
             .collect::<Vec<String>>();
         networks.sort();
         networks.dedup();
@@ -744,6 +809,12 @@ impl<C: Blockchain> UnvalidatedSubgraphManifest<C> {
             }
         }
 
+        // Validate subgraph datasource constraints
+        errors.extend(Self::validate_subgraph_datasources(
+            &self.0.data_sources,
+            &self.0.spec_version,
+        ));
+
         match errors.is_empty() {
             true => Ok(self.0),
             false => Err(errors),
@@ -765,11 +836,9 @@ impl<C: Blockchain> SubgraphManifest<C> {
         max_spec_version: semver::Version,
     ) -> Result<Self, SubgraphManifestResolveError> {
         let unresolved = UnresolvedSubgraphManifest::parse(id, raw)?;
-
         let resolved = unresolved
             .resolve(resolver, logger, max_spec_version)
             .await?;
-
         Ok(resolved)
     }
 
@@ -777,14 +846,14 @@ impl<C: Blockchain> SubgraphManifest<C> {
         // Assume the manifest has been validated, ensuring network names are homogenous
         self.data_sources
             .iter()
-            .find_map(|d| Some(d.as_onchain()?.network()?.to_string()))
+            .find_map(|d| Some(d.network()?.to_string()))
             .expect("Validated manifest does not have a network defined on any datasource")
     }
 
     pub fn start_blocks(&self) -> Vec<BlockNumber> {
         self.data_sources
             .iter()
-            .filter_map(|d| Some(d.as_onchain()?.start_block()))
+            .filter_map(|d| d.start_block())
             .collect()
     }
 
@@ -1007,6 +1076,17 @@ impl<C: Blockchain> UnresolvedSubgraphManifest<C> {
                 "`indexerHints` are not supported prior to {}",
                 SPEC_VERSION_1_0_0
             );
+        }
+
+        // Validate subgraph datasource constraints
+        if let Some(error) = UnvalidatedSubgraphManifest::<C>::validate_subgraph_datasources(
+            &data_sources,
+            &spec_version,
+        )
+        .into_iter()
+        .next()
+        {
+            return Err(anyhow::Error::from(error).into());
         }
 
         // Check the min_spec_version of each data source against the spec version of the subgraph

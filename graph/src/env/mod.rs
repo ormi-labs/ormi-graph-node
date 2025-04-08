@@ -212,14 +212,52 @@ pub struct EnvVars {
     /// Set the maximum grpc decode size(in MB) for firehose BlockIngestor connections.
     /// Defaults to 25MB
     pub firehose_grpc_max_decode_size_mb: usize,
+    /// Defined whether or not graph-node should refuse to perform genesis validation
+    /// before using an adapter. Disabled by default for the moment, will be enabled
+    /// on the next release. Disabling validation means the recorded genesis will be 0x00
+    /// if no genesis hash can be retrieved from an adapter. If enabled, the adapter is
+    /// ignored if unable to produce a genesis hash or produces a different an unexpected hash.
+    pub genesis_validation_enabled: bool,
+    /// How long do we wait for a response from the provider before considering that it is unavailable.
+    /// Default is 30s.
+    pub genesis_validation_timeout: Duration,
+
+    /// Sets the token that is used to authenticate graphman GraphQL queries.
+    ///
+    /// If not specified, the graphman server will not start.
+    pub graphman_server_auth_token: Option<String>,
+
+    /// By default, all providers are required to support extended block details,
+    /// as this is the safest option for a graph-node operator.
+    ///
+    /// Providers that do not support extended block details for enabled chains
+    /// are considered invalid and will not be used.
+    ///
+    /// To disable checks for one or more chains, simply specify their names
+    /// in this configuration option.
+    ///
+    /// Defaults to an empty list, which means that this feature is enabled for all chains;
+    pub firehose_disable_extended_blocks_for_chains: Vec<String>,
+
+    pub block_write_capacity: usize,
+
+    /// Set by the environment variable `GRAPH_FIREHOSE_FETCH_BLOCK_RETRY_LIMIT`.
+    /// The default value is 10.
+    pub firehose_block_fetch_retry_limit: usize,
+    /// Set by the environment variable `GRAPH_FIREHOSE_FETCH_BLOCK_TIMEOUT_SECS`.
+    /// The default value is 60 seconds.
+    pub firehose_block_fetch_timeout: u64,
+    /// Set by the environment variable `GRAPH_FIREHOSE_BLOCK_BATCH_SIZE`.
+    /// The default value is 10.
+    pub firehose_block_batch_size: usize,
 }
 
 impl EnvVars {
-    pub fn from_env() -> Result<Self, envconfig::Error> {
+    pub fn from_env() -> Result<Self, anyhow::Error> {
         let inner = Inner::init_from_env()?;
         let graphql = InnerGraphQl::init_from_env()?.into();
         let mapping_handlers = InnerMappingHandlers::init_from_env()?.into();
-        let store = InnerStore::init_from_env()?.into();
+        let store = InnerStore::init_from_env()?.try_into()?;
 
         // The default reorganization (reorg) threshold is set to 250.
         // For testing purposes, we need to set this threshold to 0 because:
@@ -294,6 +332,17 @@ impl EnvVars {
             dips_metrics_object_store_url: inner.dips_metrics_object_store_url,
             section_map: inner.section_map,
             firehose_grpc_max_decode_size_mb: inner.firehose_grpc_max_decode_size_mb,
+            genesis_validation_enabled: inner.genesis_validation_enabled.0,
+            genesis_validation_timeout: Duration::from_secs(inner.genesis_validation_timeout),
+            graphman_server_auth_token: inner.graphman_server_auth_token,
+            firehose_disable_extended_blocks_for_chains:
+                Self::firehose_disable_extended_blocks_for_chains(
+                    inner.firehose_disable_extended_blocks_for_chains,
+                ),
+            block_write_capacity: inner.block_write_capacity.0,
+            firehose_block_fetch_retry_limit: inner.firehose_block_fetch_retry_limit,
+            firehose_block_fetch_timeout: inner.firehose_block_fetch_timeout,
+            firehose_block_batch_size: inner.firehose_block_fetch_batch_size,
         })
     }
 
@@ -317,6 +366,14 @@ impl EnvVars {
 
     pub fn log_gql_cache_timing(&self) -> bool {
         self.log_query_timing_contains("cache") && self.log_gql_timing()
+    }
+
+    fn firehose_disable_extended_blocks_for_chains(s: Option<String>) -> Vec<String> {
+        s.unwrap_or_default()
+            .split(",")
+            .map(|x| x.trim().to_string())
+            .filter(|x| !x.is_empty())
+            .collect()
     }
 }
 
@@ -346,7 +403,7 @@ struct Inner {
         default = "false"
     )]
     allow_non_deterministic_fulltext_search: EnvVarBoolean,
-    #[envconfig(from = "GRAPH_MAX_SPEC_VERSION", default = "1.2.0")]
+    #[envconfig(from = "GRAPH_MAX_SPEC_VERSION", default = "1.3.0")]
     max_spec_version: Version,
     #[envconfig(from = "GRAPH_LOAD_WINDOW_SIZE", default = "300")]
     load_window_size_in_secs: u64,
@@ -439,6 +496,22 @@ struct Inner {
     section_map: Option<String>,
     #[envconfig(from = "GRAPH_NODE_FIREHOSE_MAX_DECODE_SIZE", default = "25")]
     firehose_grpc_max_decode_size_mb: usize,
+    #[envconfig(from = "GRAPH_NODE_GENESIS_VALIDATION_ENABLED", default = "false")]
+    genesis_validation_enabled: EnvVarBoolean,
+    #[envconfig(from = "GRAPH_NODE_GENESIS_VALIDATION_TIMEOUT_SECONDS", default = "30")]
+    genesis_validation_timeout: u64,
+    #[envconfig(from = "GRAPHMAN_SERVER_AUTH_TOKEN")]
+    graphman_server_auth_token: Option<String>,
+    #[envconfig(from = "GRAPH_NODE_FIREHOSE_DISABLE_EXTENDED_BLOCKS_FOR_CHAINS")]
+    firehose_disable_extended_blocks_for_chains: Option<String>,
+    #[envconfig(from = "GRAPH_NODE_BLOCK_WRITE_CAPACITY", default = "4_000_000_000")]
+    block_write_capacity: NoUnderscores<usize>,
+    #[envconfig(from = "GRAPH_FIREHOSE_FETCH_BLOCK_RETRY_LIMIT", default = "10")]
+    firehose_block_fetch_retry_limit: usize,
+    #[envconfig(from = "GRAPH_FIREHOSE_FETCH_BLOCK_TIMEOUT_SECS", default = "60")]
+    firehose_block_fetch_timeout: u64,
+    #[envconfig(from = "GRAPH_FIREHOSE_FETCH_BLOCK_BATCH_SIZE", default = "10")]
+    firehose_block_fetch_batch_size: usize,
 }
 
 #[derive(Clone, Debug)]

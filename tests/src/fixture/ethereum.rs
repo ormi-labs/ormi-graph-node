@@ -6,12 +6,15 @@ use super::{
     test_ptr, CommonChainConfig, MutexBlockStreamBuilder, NoopAdapterSelector,
     NoopRuntimeAdapterBuilder, StaticBlockRefetcher, StaticStreamBuilder, Stores, TestChain,
 };
+use graph::blockchain::block_stream::{EntityOperationKind, EntitySourceOperation};
 use graph::blockchain::client::ChainClient;
-use graph::blockchain::{BlockPtr, TriggersAdapterSelector};
+use graph::blockchain::{BlockPtr, Trigger, TriggersAdapterSelector};
 use graph::cheap_clone::CheapClone;
+use graph::data_source::subgraph;
 use graph::prelude::ethabi::ethereum_types::H256;
 use graph::prelude::web3::types::{Address, Log, Transaction, H160};
-use graph::prelude::{ethabi, tiny_keccak, LightEthereumBlock, ENV_VARS};
+use graph::prelude::{ethabi, tiny_keccak, DeploymentHash, Entity, LightEthereumBlock, ENV_VARS};
+use graph::schema::EntityType;
 use graph::{blockchain::block_stream::BlockWithTriggers, prelude::ethabi::ethereum_types::U64};
 use graph_chain_ethereum::network::EthereumNetworkAdapters;
 use graph_chain_ethereum::trigger::LogRef;
@@ -81,7 +84,10 @@ pub fn genesis() -> BlockWithTriggers<graph_chain_ethereum::Chain> {
             number: Some(U64::from(ptr.number)),
             ..Default::default()
         })),
-        trigger_data: vec![EthereumTrigger::Block(ptr, EthereumBlockTriggerType::End)],
+        trigger_data: vec![Trigger::Chain(EthereumTrigger::Block(
+            ptr,
+            EthereumBlockTriggerType::End,
+        ))],
     }
 }
 
@@ -128,7 +134,10 @@ pub fn empty_block(parent_ptr: BlockPtr, ptr: BlockPtr) -> BlockWithTriggers<Cha
             transactions,
             ..Default::default()
         })),
-        trigger_data: vec![EthereumTrigger::Block(ptr, EthereumBlockTriggerType::End)],
+        trigger_data: vec![Trigger::Chain(EthereumTrigger::Block(
+            ptr,
+            EthereumBlockTriggerType::End,
+        ))],
     }
 }
 
@@ -148,12 +157,70 @@ pub fn push_test_log(block: &mut BlockWithTriggers<Chain>, payload: impl Into<St
     });
     block
         .trigger_data
-        .push(EthereumTrigger::Log(LogRef::FullLog(log, None)))
+        .push(Trigger::Chain(EthereumTrigger::Log(LogRef::FullLog(
+            log, None,
+        ))))
+}
+
+pub fn push_test_subgraph_trigger(
+    block: &mut BlockWithTriggers<Chain>,
+    source: DeploymentHash,
+    entity: Entity,
+    entity_type: EntityType,
+    entity_op: EntityOperationKind,
+    vid: i64,
+    source_idx: u32,
+) {
+    let entity = EntitySourceOperation {
+        entity: entity,
+        entity_type: entity_type,
+        entity_op: entity_op,
+        vid,
+    };
+
+    block
+        .trigger_data
+        .push(Trigger::Subgraph(subgraph::TriggerData {
+            source,
+            entity,
+            source_idx,
+        }));
+}
+
+pub fn push_test_command(
+    block: &mut BlockWithTriggers<Chain>,
+    test_command: impl Into<String>,
+    data: impl Into<String>,
+) {
+    let log = Arc::new(Log {
+        address: Address::zero(),
+        topics: vec![tiny_keccak::keccak256(b"TestEvent(string,string)").into()],
+        data: ethabi::encode(&[
+            ethabi::Token::String(test_command.into()),
+            ethabi::Token::String(data.into()),
+        ])
+        .into(),
+        block_hash: Some(H256::from_slice(block.ptr().hash.as_slice())),
+        block_number: Some(block.ptr().number.into()),
+        transaction_hash: Some(H256::from_low_u64_be(0)),
+        transaction_index: Some(0.into()),
+        log_index: Some(0.into()),
+        transaction_log_index: Some(0.into()),
+        log_type: None,
+        removed: None,
+    });
+    block
+        .trigger_data
+        .push(Trigger::Chain(EthereumTrigger::Log(LogRef::FullLog(
+            log, None,
+        ))))
 }
 
 pub fn push_test_polling_trigger(block: &mut BlockWithTriggers<Chain>) {
-    block.trigger_data.push(EthereumTrigger::Block(
-        block.ptr(),
-        EthereumBlockTriggerType::End,
-    ))
+    block
+        .trigger_data
+        .push(Trigger::Chain(EthereumTrigger::Block(
+            block.ptr(),
+            EthereumBlockTriggerType::End,
+        )))
 }

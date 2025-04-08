@@ -18,15 +18,16 @@ mod types;
 use crate::{
     cheap_clone::CheapClone,
     components::{
-        adapter::ChainId,
         metrics::subgraph::SubgraphInstanceMetrics,
-        store::{DeploymentCursorTracker, DeploymentLocator, StoredDynamicDataSource},
+        store::{
+            DeploymentCursorTracker, DeploymentLocator, SourceableStore, StoredDynamicDataSource,
+        },
         subgraph::{HostMetrics, InstanceDSTemplateInfo, MappingError},
         trigger_processor::RunnableTriggers,
     },
     data::subgraph::{UnifiedMappingApiVersion, MIN_SPEC_VERSION},
-    data_source::{self, DataSourceTemplateInfo},
-    prelude::DataSourceContext,
+    data_source::{self, subgraph, DataSourceTemplateInfo},
+    prelude::{DataSourceContext, DeploymentHash},
     runtime::{gas::GasCounter, AscHeap, HostExportError},
 };
 use crate::{
@@ -52,17 +53,18 @@ pub use block_stream::{ChainHeadUpdateListener, ChainHeadUpdateStream, TriggersA
 pub use builder::{BasicBlockchainBuilder, BlockchainBuilder};
 pub use empty_node_capabilities::EmptyNodeCapabilities;
 pub use noop_runtime_adapter::NoopRuntimeAdapter;
-pub use types::{BlockHash, BlockPtr, BlockTime, ChainIdentifier};
+pub use types::{BlockHash, BlockPtr, BlockTime, ChainIdentifier, ExtendedBlockPtr};
 
 use self::{
     block_stream::{BlockStream, FirehoseCursor},
     client::ChainClient,
 };
+use crate::components::network_provider::ChainName;
 
 #[async_trait]
 pub trait BlockIngestor: 'static + Send + Sync {
     async fn run(self: Box<Self>);
-    fn network_name(&self) -> ChainId;
+    fn network_name(&self) -> ChainName;
     fn kind(&self) -> BlockchainKind;
 }
 
@@ -189,7 +191,8 @@ pub trait Blockchain: Debug + Sized + Send + Sync + Unpin + 'static {
         deployment: DeploymentLocator,
         store: impl DeploymentCursorTracker,
         start_blocks: Vec<BlockNumber>,
-        filter: Arc<Self::TriggerFilter>,
+        source_subgraph_stores: Vec<Arc<dyn SourceableStore>>,
+        filter: Arc<TriggerFilterWrapper<Self>>,
         unified_api_version: UnifiedMappingApiVersion,
     ) -> Result<Box<dyn BlockStream<Self>>, Error>;
 
@@ -244,6 +247,43 @@ pub enum IngestorError {
 impl From<web3::Error> for IngestorError {
     fn from(e: web3::Error) -> Self {
         IngestorError::Unknown(anyhow::anyhow!(e))
+    }
+}
+
+/// The `TriggerFilterWrapper` is a higher-level wrapper around the chain-specific `TriggerFilter`,
+/// enabling subgraph-based trigger filtering for subgraph datasources. This abstraction is necessary
+/// because subgraph filtering operates at a higher level than chain-based filtering. By using this wrapper,
+/// we reduce code duplication, allowing subgraph-based filtering to be implemented once, instead of
+/// duplicating it across different chains.
+#[derive(Debug)]
+pub struct TriggerFilterWrapper<C: Blockchain> {
+    pub chain_filter: Arc<C::TriggerFilter>,
+    pub subgraph_filter: Vec<SubgraphFilter>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SubgraphFilter {
+    pub subgraph: DeploymentHash,
+    pub start_block: BlockNumber,
+    pub entities: Vec<String>,
+    pub manifest_idx: u32,
+}
+
+impl<C: Blockchain> TriggerFilterWrapper<C> {
+    pub fn new(filter: C::TriggerFilter, subgraph_filter: Vec<SubgraphFilter>) -> Self {
+        Self {
+            chain_filter: Arc::new(filter),
+            subgraph_filter,
+        }
+    }
+}
+
+impl<C: Blockchain> Clone for TriggerFilterWrapper<C> {
+    fn clone(&self) -> Self {
+        Self {
+            chain_filter: self.chain_filter.cheap_clone(),
+            subgraph_filter: self.subgraph_filter.clone(),
+        }
     }
 }
 
@@ -370,6 +410,75 @@ pub trait UnresolvedDataSource<C: Blockchain>:
     ) -> Result<C::DataSource, anyhow::Error>;
 }
 
+#[derive(Debug)]
+pub enum Trigger<C: Blockchain> {
+    Chain(C::TriggerData),
+    Subgraph(subgraph::TriggerData),
+}
+
+impl<C: Blockchain> Trigger<C> {
+    pub fn as_chain(&self) -> Option<&C::TriggerData> {
+        match self {
+            Trigger::Chain(data) => Some(data),
+            _ => None,
+        }
+    }
+
+    pub fn as_subgraph(&self) -> Option<&subgraph::TriggerData> {
+        match self {
+            Trigger::Subgraph(data) => Some(data),
+            _ => None,
+        }
+    }
+}
+
+impl<C: Blockchain> Eq for Trigger<C> where C::TriggerData: Eq {}
+
+impl<C: Blockchain> PartialEq for Trigger<C>
+where
+    C::TriggerData: PartialEq,
+{
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Trigger::Chain(data1), Trigger::Chain(data2)) => data1 == data2,
+            (Trigger::Subgraph(a), Trigger::Subgraph(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl<C: Blockchain> Clone for Trigger<C>
+where
+    C::TriggerData: Clone,
+{
+    fn clone(&self) -> Self {
+        match self {
+            Trigger::Chain(data) => Trigger::Chain(data.clone()),
+            Trigger::Subgraph(data) => Trigger::Subgraph(data.clone()),
+        }
+    }
+}
+
+impl<C: Blockchain> Ord for Trigger<C>
+where
+    C::TriggerData: Ord,
+{
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        match (self, other) {
+            (Trigger::Chain(data1), Trigger::Chain(data2)) => data1.cmp(data2),
+            (Trigger::Subgraph(_), Trigger::Chain(_)) => std::cmp::Ordering::Greater,
+            (Trigger::Chain(_), Trigger::Subgraph(_)) => std::cmp::Ordering::Less,
+            (Trigger::Subgraph(t1), Trigger::Subgraph(t2)) => t1.cmp(t2),
+        }
+    }
+}
+
+impl<C: Blockchain> PartialOrd for Trigger<C> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 pub trait TriggerData {
     /// If there is an error when processing this trigger, this will called to add relevant context.
     /// For example an useful return is: `"block #<N> (<hash>), transaction <tx_hash>".
@@ -436,7 +545,7 @@ pub struct HostFn {
 }
 
 pub trait RuntimeAdapter<C: Blockchain>: Send + Sync {
-    fn host_fns(&self, ds: &C::DataSource) -> Result<Vec<HostFn>, Error>;
+    fn host_fns(&self, ds: &data_source::DataSource<C>) -> Result<Vec<HostFn>, Error>;
 }
 
 pub trait NodeCapabilities<C: Blockchain> {
@@ -456,12 +565,7 @@ pub enum BlockchainKind {
     /// NEAR chains (Mainnet, Testnet) or chains that are compatible
     Near,
 
-    /// Cosmos chains
-    Cosmos,
-
     Substreams,
-
-    Starknet,
 }
 
 impl fmt::Display for BlockchainKind {
@@ -470,9 +574,7 @@ impl fmt::Display for BlockchainKind {
             BlockchainKind::Arweave => "arweave",
             BlockchainKind::Ethereum => "ethereum",
             BlockchainKind::Near => "near",
-            BlockchainKind::Cosmos => "cosmos",
             BlockchainKind::Substreams => "substreams",
-            BlockchainKind::Starknet => "starknet",
         };
         write!(f, "{}", value)
     }
@@ -486,9 +588,8 @@ impl FromStr for BlockchainKind {
             "arweave" => Ok(BlockchainKind::Arweave),
             "ethereum" => Ok(BlockchainKind::Ethereum),
             "near" => Ok(BlockchainKind::Near),
-            "cosmos" => Ok(BlockchainKind::Cosmos),
             "substreams" => Ok(BlockchainKind::Substreams),
-            "starknet" => Ok(BlockchainKind::Starknet),
+            "subgraph" => Ok(BlockchainKind::Ethereum), // TODO(krishna): We should detect the blockchain kind from the source subgraph
             _ => Err(anyhow!("unknown blockchain kind {}", s)),
         }
     }
@@ -516,7 +617,7 @@ impl BlockchainKind {
 
 /// A collection of blockchains, keyed by `BlockchainKind` and network.
 #[derive(Default, Debug, Clone)]
-pub struct BlockchainMap(HashMap<(BlockchainKind, ChainId), Arc<dyn Any + Send + Sync>>);
+pub struct BlockchainMap(HashMap<(BlockchainKind, ChainName), Arc<dyn Any + Send + Sync>>);
 
 impl BlockchainMap {
     pub fn new() -> Self {
@@ -525,11 +626,11 @@ impl BlockchainMap {
 
     pub fn iter(
         &self,
-    ) -> impl Iterator<Item = (&(BlockchainKind, ChainId), &Arc<dyn Any + Sync + Send>)> {
+    ) -> impl Iterator<Item = (&(BlockchainKind, ChainName), &Arc<dyn Any + Sync + Send>)> {
         self.0.iter()
     }
 
-    pub fn insert<C: Blockchain>(&mut self, network: ChainId, chain: Arc<C>) {
+    pub fn insert<C: Blockchain>(&mut self, network: ChainName, chain: Arc<C>) {
         self.0.insert((C::KIND, network), chain);
     }
 
@@ -551,7 +652,7 @@ impl BlockchainMap {
             .collect::<Result<Vec<Arc<C>>, Error>>()
     }
 
-    pub fn get<C: Blockchain>(&self, network: ChainId) -> Result<Arc<C>, Error> {
+    pub fn get<C: Blockchain>(&self, network: ChainName) -> Result<Arc<C>, Error> {
         self.0
             .get(&(C::KIND, network.clone()))
             .with_context(|| format!("no network {} found on chain {}", network, C::KIND))?

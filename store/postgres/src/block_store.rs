@@ -6,9 +6,11 @@ use std::{
 
 use anyhow::anyhow;
 use diesel::{
+    query_dsl::methods::FilterDsl as _,
     r2d2::{ConnectionManager, PooledConnection},
-    sql_query, PgConnection, RunQueryDsl,
+    sql_query, ExpressionMethods as _, PgConnection, RunQueryDsl,
 };
+use graph::components::network_provider::ChainName;
 use graph::{
     blockchain::ChainIdentifier,
     components::store::{BlockStore as BlockStoreTrait, QueryPermit},
@@ -30,6 +32,10 @@ use self::primary::Chain;
 
 #[cfg(debug_assertions)]
 pub const FAKE_NETWORK_SHARED: &str = "fake_network_shared";
+
+// Highest version of the database that the executable supports.
+// To be incremented on each breaking change to the database.
+const SUPPORTED_DB_VERSION: i64 = 3;
 
 /// The status of a chain: whether we can only read from the chain, or
 /// whether it is ok to ingest from it, too
@@ -161,6 +167,17 @@ pub mod primary {
     ) -> Result<(), StoreError> {
         update(chains::table.filter(chains::name.eq(name)))
             .set(chains::name.eq(new_name))
+            .execute(conn)?;
+        Ok(())
+    }
+
+    pub fn update_chain_genesis_hash(
+        conn: &mut PooledConnection<ConnectionManager<PgConnection>>,
+        name: &str,
+        hash: BlockHash,
+    ) -> Result<(), StoreError> {
+        update(chains::table.filter(chains::name.eq(name)))
+            .set(chains::genesis_block_hash.eq(hash.hash_hex()))
             .execute(conn)?;
         Ok(())
     }
@@ -302,11 +319,7 @@ impl BlockStore {
     }
 
     pub(crate) async fn query_permit_primary(&self) -> QueryPermit {
-        self.mirror
-            .primary()
-            .query_permit()
-            .await
-            .expect("the primary is never disabled")
+        self.mirror.primary().query_permit().await
     }
 
     pub fn allocate_chain(
@@ -518,6 +531,40 @@ impl BlockStore {
                 .set(dbv::version.eq(3))
                 .execute(&mut conn)?;
         };
+        if version < SUPPORTED_DB_VERSION {
+            // Bump it to make sure that all executables are working with the same DB format
+            diesel::update(dbv::table)
+                .set(dbv::version.eq(SUPPORTED_DB_VERSION))
+                .execute(&mut conn)?;
+        };
+        if version > SUPPORTED_DB_VERSION {
+            panic!(
+                "The executable is too old and doesn't support the database version: {}",
+                version
+            )
+        }
+        Ok(())
+    }
+
+    /// Updates the chains table of the primary shard. This table is replicated to other shards and
+    /// has to be refreshed afterwards for the update to be reflected.
+    pub fn set_chain_identifier(
+        &self,
+        chain_id: ChainName,
+        ident: &ChainIdentifier,
+    ) -> Result<(), StoreError> {
+        use primary::chains as c;
+
+        let primary_pool = self.pools.get(&*PRIMARY_SHARD).unwrap();
+        let mut conn = primary_pool.get()?;
+
+        diesel::update(c::table.filter(c::name.eq(chain_id.as_str())))
+            .set((
+                c::genesis_block_hash.eq(ident.genesis_block_hash.hash_hex()),
+                c::net_version.eq(&ident.net_version),
+            ))
+            .execute(&mut conn)?;
+
         Ok(())
     }
 }

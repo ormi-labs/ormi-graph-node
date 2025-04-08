@@ -523,23 +523,6 @@ impl<S: Store> IndexNodeResolver<S> {
                 )
                 .await?
             }
-            BlockchainKind::Cosmos => {
-                let unvalidated_subgraph_manifest =
-                    UnvalidatedSubgraphManifest::<graph_chain_cosmos::Chain>::resolve(
-                        deployment_hash.clone(),
-                        raw_yaml,
-                        &self.link_resolver,
-                        &self.logger,
-                        max_spec_version,
-                    )
-                    .await?;
-
-                Self::validate_and_extract_features(
-                    &self.store.subgraph_store(),
-                    unvalidated_subgraph_manifest,
-                )
-                .await?
-            }
             BlockchainKind::Near => {
                 let unvalidated_subgraph_manifest =
                     UnvalidatedSubgraphManifest::<graph_chain_near::Chain>::resolve(
@@ -591,23 +574,6 @@ impl<S: Store> IndexNodeResolver<S> {
                 )
                 .await?
             }
-            BlockchainKind::Starknet => {
-                let unvalidated_subgraph_manifest =
-                    UnvalidatedSubgraphManifest::<graph_chain_starknet::Chain>::resolve(
-                        deployment_hash.clone(),
-                        raw_yaml,
-                        &self.link_resolver,
-                        &self.logger,
-                        max_spec_version,
-                    )
-                    .await?;
-
-                Self::validate_and_extract_features(
-                    &self.store.subgraph_store(),
-                    unvalidated_subgraph_manifest,
-                )
-                .await?
-            }
         };
 
         Ok(result)
@@ -627,7 +593,24 @@ impl<S: Store> IndexNodeResolver<S> {
 
         let subgraph_store = self.store.subgraph_store();
         let features = match subgraph_store.subgraph_features(&deployment_hash).await? {
-            Some(features) => features,
+            Some(features) => {
+                let mut deployment_features = features.clone();
+                let features = &mut deployment_features.features;
+
+                if deployment_features.has_declared_calls {
+                    features.push("declaredEthCalls".to_string());
+                }
+                if deployment_features.has_aggregations {
+                    features.push("aggregations".to_string());
+                }
+                if !deployment_features.immutable_entities.is_empty() {
+                    features.push("immutableEntities".to_string());
+                }
+                if deployment_features.has_bytes_as_ids {
+                    features.push("bytesAsIds".to_string());
+                }
+                deployment_features
+            }
             None => self.get_features_from_ipfs(&deployment_hash).await?,
         };
 
@@ -698,9 +681,7 @@ impl<S: Store> IndexNodeResolver<S> {
         // so this seems like the next best thing.
         try_resolve_for_chain!(graph_chain_ethereum::Chain);
         try_resolve_for_chain!(graph_chain_arweave::Chain);
-        try_resolve_for_chain!(graph_chain_cosmos::Chain);
         try_resolve_for_chain!(graph_chain_near::Chain);
-        try_resolve_for_chain!(graph_chain_starknet::Chain);
 
         // If you're adding support for a new chain and this `match` clause just
         // gave you a compiler error, then this message is for you! You need to
@@ -711,9 +692,7 @@ impl<S: Store> IndexNodeResolver<S> {
             BlockchainKind::Substreams
             | BlockchainKind::Arweave
             | BlockchainKind::Ethereum
-            | BlockchainKind::Cosmos
-            | BlockchainKind::Near
-            | BlockchainKind::Starknet => (),
+            | BlockchainKind::Near => (),
         }
 
         // The given network does not exist.
@@ -798,8 +777,8 @@ fn entity_changes_to_graphql(entity_changes: Vec<EntityOperation>) -> r::Value {
 impl<S: Store> Resolver for IndexNodeResolver<S> {
     const CACHEABLE: bool = false;
 
-    async fn query_permit(&self) -> Result<QueryPermit, QueryExecutionError> {
-        self.store.query_permit().await.map_err(Into::into)
+    async fn query_permit(&self) -> QueryPermit {
+        self.store.query_permit().await
     }
 
     fn prefetch(

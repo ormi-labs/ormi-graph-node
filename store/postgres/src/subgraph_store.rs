@@ -44,7 +44,7 @@ use crate::{
         index::{IndexList, Method},
         Layout,
     },
-    writable::WritableStore,
+    writable::{SourceableStore, WritableStore},
     NotificationSender,
 };
 use crate::{
@@ -267,6 +267,50 @@ impl SubgraphStore {
 
     pub fn for_site(&self, site: &Site) -> Result<&Arc<DeploymentStore>, StoreError> {
         self.inner.for_site(site)
+    }
+
+    async fn get_or_create_writable_store(
+        self: Arc<Self>,
+        logger: Logger,
+        deployment: graph::components::store::DeploymentId,
+        manifest_idx_and_name: Arc<Vec<(u32, String)>>,
+    ) -> Result<Arc<WritableStore>, StoreError> {
+        let deployment = deployment.into();
+        // We cache writables to make sure calls to this method are
+        // idempotent and there is ever only one `WritableStore` for any
+        // deployment
+        if let Some(writable) = self.writables.lock().unwrap().get(&deployment) {
+            // A poisoned writable will not write anything anymore; we
+            // discard it and create a new one that is properly initialized
+            // according to the state in the database.
+            if !writable.poisoned() {
+                return Ok(writable.cheap_clone());
+            }
+        }
+
+        // Ideally the lower level functions would be asyncified.
+        let this = self.clone();
+        let site = graph::spawn_blocking_allow_panic(move || -> Result<_, StoreError> {
+            this.find_site(deployment)
+        })
+        .await
+        .unwrap()?; // Propagate panics, there shouldn't be any.
+
+        let writable = Arc::new(
+            WritableStore::new(
+                self.as_ref().clone(),
+                logger,
+                site,
+                manifest_idx_and_name,
+                self.registry.clone(),
+            )
+            .await?,
+        );
+        self.writables
+            .lock()
+            .unwrap()
+            .insert(deployment, writable.cheap_clone());
+        Ok(writable)
     }
 }
 
@@ -579,7 +623,12 @@ impl SubgraphStoreInner {
 
         let index_def = if let Some(graft) = &graft_base.clone() {
             if let Some(site) = self.sites.get(graft) {
-                Some(deployment_store.load_indexes(site)?)
+                let store = self
+                    .stores
+                    .get(&site.shard)
+                    .ok_or_else(|| StoreError::UnknownShard(site.shard.to_string()))?;
+
+                Some(store.load_indexes(site)?)
             } else {
                 None
             }
@@ -650,12 +699,6 @@ impl SubgraphStoreInner {
             )));
         }
         let deployment = src_store.load_deployment(src.clone())?;
-        if deployment.failed {
-            return Err(StoreError::Unknown(anyhow!(
-                "can not copy deployment {} because it has failed",
-                src_loc
-            )));
-        }
         let index_def = src_store.load_indexes(src.clone())?;
 
         // Transmogrify the deployment into a new one
@@ -762,7 +805,6 @@ impl SubgraphStoreInner {
     pub(crate) fn replica_for_query(
         &self,
         target: QueryTarget,
-        for_subscription: bool,
     ) -> Result<(Arc<DeploymentStore>, Arc<Site>, ReplicaId), StoreError> {
         let id = match target {
             QueryTarget::Name(name, _) => self.mirror.current_deployment_for_subgraph(&name)?,
@@ -770,7 +812,7 @@ impl SubgraphStoreInner {
         };
 
         let (store, site) = self.store(&id)?;
-        let replica = store.replica_for_query(for_subscription)?;
+        let replica = store.replica_for_query()?;
 
         Ok((store.clone(), site, replica))
     }
@@ -997,14 +1039,12 @@ impl SubgraphStoreInner {
 
     pub fn rewind(&self, id: DeploymentHash, block_ptr_to: BlockPtr) -> Result<(), StoreError> {
         let (store, site) = self.store(&id)?;
-        let event = store.rewind(site, block_ptr_to)?;
-        self.send_store_event(&event)
+        store.rewind(site, block_ptr_to)
     }
 
     pub fn truncate(&self, id: DeploymentHash, block_ptr_to: BlockPtr) -> Result<(), StoreError> {
         let (store, site) = self.store(&id)?;
-        let event = store.truncate(site, block_ptr_to)?;
-        self.send_store_event(&event)
+        store.truncate(site, block_ptr_to)
     }
 
     pub(crate) async fn get_proof_of_indexing(
@@ -1483,42 +1523,25 @@ impl SubgraphStoreTrait for SubgraphStore {
         deployment: graph::components::store::DeploymentId,
         manifest_idx_and_name: Arc<Vec<(u32, String)>>,
     ) -> Result<Arc<dyn store::WritableStore>, StoreError> {
+        self.get_or_create_writable_store(logger, deployment, manifest_idx_and_name)
+            .await
+            .map(|store| store as Arc<dyn store::WritableStore>)
+    }
+
+    async fn sourceable(
+        self: Arc<Self>,
+        deployment: graph::components::store::DeploymentId,
+    ) -> Result<Arc<dyn store::SourceableStore>, StoreError> {
         let deployment = deployment.into();
-        // We cache writables to make sure calls to this method are
-        // idempotent and there is ever only one `WritableStore` for any
-        // deployment
-        if let Some(writable) = self.writables.lock().unwrap().get(&deployment) {
-            // A poisoned writable will not write anything anymore; we
-            // discard it and create a new one that is properly initialized
-            // according to the state in the database.
-            if !writable.poisoned() {
-                return Ok(writable.cheap_clone());
-            }
-        }
+        let site = self.find_site(deployment)?;
+        let store = self.for_site(&site)?;
+        let input_schema = self.input_schema(&site.deployment)?;
 
-        // Ideally the lower level functions would be asyncified.
-        let this = self.clone();
-        let site = graph::spawn_blocking_allow_panic(move || -> Result<_, StoreError> {
-            this.find_site(deployment)
-        })
-        .await
-        .unwrap()?; // Propagate panics, there shouldn't be any.
-
-        let writable = Arc::new(
-            WritableStore::new(
-                self.as_ref().clone(),
-                logger,
-                site,
-                manifest_idx_and_name,
-                self.registry.clone(),
-            )
-            .await?,
-        );
-        self.writables
-            .lock()
-            .unwrap()
-            .insert(deployment, writable.cheap_clone());
-        Ok(writable)
+        Ok(Arc::new(SourceableStore::new(
+            site,
+            store.clone(),
+            input_schema,
+        )))
     }
 
     async fn stop_subgraph(&self, loc: &DeploymentLocator) -> Result<(), StoreError> {

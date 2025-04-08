@@ -3,11 +3,13 @@ use crate::subgraph::error::BlockProcessingError;
 use crate::subgraph::inputs::IndexingInputs;
 use crate::subgraph::state::IndexingState;
 use crate::subgraph::stream::new_block_stream;
-use atomic_refcell::AtomicRefCell;
 use graph::blockchain::block_stream::{
     BlockStreamError, BlockStreamEvent, BlockWithTriggers, FirehoseCursor,
 };
-use graph::blockchain::{Block, BlockTime, Blockchain, DataSource as _, TriggerFilter as _};
+use graph::blockchain::{
+    Block, BlockTime, Blockchain, DataSource as _, SubgraphFilter, Trigger, TriggerFilter as _,
+    TriggerFilterWrapper,
+};
 use graph::components::store::{EmptyStore, GetScope, ReadStore, StoredDynamicDataSource};
 use graph::components::subgraph::InstanceDSTemplate;
 use graph::components::{
@@ -30,6 +32,7 @@ use graph::schema::EntityKey;
 use graph::util::{backoff::ExponentialBackoff, lfu_cache::LfuCache};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use std::vec;
 
 const MINUTE: Duration = Duration::from_secs(60);
 
@@ -50,6 +53,15 @@ where
     inputs: Arc<IndexingInputs<C>>,
     logger: Logger,
     pub metrics: RunnerMetrics,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SubgraphRunnerError {
+    #[error("subgraph runner terminated because a newer one was active")]
+    Duplicate,
+
+    #[error(transparent)]
+    Unknown(#[from] Error),
 }
 
 impl<C, T> SubgraphRunner<C, T>
@@ -109,14 +121,14 @@ where
 
     #[cfg(debug_assertions)]
     pub async fn run_for_test(self, break_on_restart: bool) -> Result<Self, Error> {
-        self.run_inner(break_on_restart).await
+        self.run_inner(break_on_restart).await.map_err(Into::into)
     }
 
     fn is_static_filters_enabled(&self) -> bool {
         self.inputs.static_filters || self.ctx.hosts_len() > ENV_VARS.static_filters_threshold
     }
 
-    fn build_filter(&self) -> C::TriggerFilter {
+    fn build_filter(&self) -> TriggerFilterWrapper<C> {
         let current_ptr = self.inputs.store.block_ptr();
         let static_filters = self.is_static_filters_enabled();
 
@@ -128,10 +140,31 @@ where
             None => true,
         };
 
+        let data_sources = self.ctx.static_data_sources();
+
+        let subgraph_filter = data_sources
+            .iter()
+            .filter_map(|ds| ds.as_subgraph())
+            .map(|ds| SubgraphFilter {
+                subgraph: ds.source.address(),
+                start_block: ds.source.start_block,
+                entities: ds
+                    .mapping
+                    .handlers
+                    .iter()
+                    .map(|handler| handler.entity.clone())
+                    .collect(),
+                manifest_idx: ds.manifest_idx,
+            })
+            .collect::<Vec<_>>();
+
         // if static_filters is not enabled we just stick to the filter based on all the data sources.
         if !static_filters {
-            return C::TriggerFilter::from_data_sources(
-                self.ctx.onchain_data_sources().filter(end_block_filter),
+            return TriggerFilterWrapper::new(
+                C::TriggerFilter::from_data_sources(
+                    self.ctx.onchain_data_sources().filter(end_block_filter),
+                ),
+                subgraph_filter,
             );
         }
 
@@ -158,19 +191,21 @@ where
 
         filter.extend_with_template(templates.iter().filter_map(|ds| ds.as_onchain()).cloned());
 
-        filter
+        TriggerFilterWrapper::new(filter, subgraph_filter)
     }
 
     #[cfg(debug_assertions)]
-    pub fn build_filter_for_test(&self) -> C::TriggerFilter {
+    pub fn build_filter_for_test(&self) -> TriggerFilterWrapper<C> {
         self.build_filter()
     }
 
-    pub async fn run(self) -> Result<(), Error> {
+    pub async fn run(self) -> Result<(), SubgraphRunnerError> {
         self.run_inner(false).await.map(|_| ())
     }
 
-    async fn run_inner(mut self, break_on_restart: bool) -> Result<Self, Error> {
+    async fn run_inner(mut self, break_on_restart: bool) -> Result<Self, SubgraphRunnerError> {
+        self.update_deployment_synced_metric();
+
         // If a subgraph failed for deterministic reasons, before start indexing, we first
         // revert the deployment head. It should lead to the same result since the error was
         // deterministic.
@@ -197,6 +232,17 @@ where
                     .unfail_deterministic_error(&current_ptr, &parent_ptr)
                     .await?;
             }
+
+            // Stop subgraph when we reach maximum endblock.
+            if let Some(max_end_block) = self.inputs.max_end_block {
+                if max_end_block <= current_ptr.block_number() {
+                    info!(self.logger, "Stopping subgraph as we reached maximum endBlock";
+                                "max_end_block" => max_end_block,
+                                "current_block" => current_ptr.block_number());
+                    self.inputs.store.flush().await?;
+                    return Ok(self);
+                }
+            }
         }
 
         loop {
@@ -209,7 +255,7 @@ where
 
             let mut block_stream = new_block_stream(
                 &self.inputs,
-                self.ctx.filter.as_ref().unwrap(), // Safe to unwrap as we just called `build_filter` in the previous line
+                self.ctx.filter.clone().unwrap(), // Safe to unwrap as we just called `build_filter` in the previous line
                 &self.metrics.subgraph,
             )
             .await?
@@ -224,6 +270,8 @@ where
 
             debug!(self.logger, "Starting block stream");
 
+            self.metrics.subgraph.deployment_status.running();
+
             // Process events from the stream as long as no restart is needed
             loop {
                 let event = {
@@ -235,7 +283,8 @@ where
                 // TODO: move cancel handle to the Context
                 // This will require some code refactor in how the BlockStream is created
                 let block_start = Instant::now();
-                match self
+
+                let action = self
                     .handle_stream_event(event, &block_stream_cancel_handle)
                     .await
                     .map(|res| {
@@ -243,7 +292,32 @@ where
                             .subgraph
                             .observe_block_processed(block_start.elapsed(), res.block_finished());
                         res
-                    })? {
+                    })?;
+
+                self.update_deployment_synced_metric();
+
+                // It is possible that the subgraph was unassigned, but the runner was in
+                // a retry delay state and did not observe the cancel signal.
+                if block_stream_cancel_handle.is_canceled() {
+                    // It is also possible that the runner was in a retry delay state while
+                    // the subgraph was reassigned and a new runner was started.
+                    if self.ctx.instances.contains(&self.inputs.deployment.id) {
+                        warn!(
+                            self.logger,
+                            "Terminating the subgraph runner because a newer one is active. \
+                             Possible reassignment detected while the runner was in a non-cancellable pending state",
+                        );
+                        return Err(SubgraphRunnerError::Duplicate);
+                    }
+
+                    warn!(
+                        self.logger,
+                        "Terminating the subgraph runner because subgraph was unassigned",
+                    );
+                    return Ok(self);
+                }
+
+                match action {
                     Action::Continue => continue,
                     Action::Stop => {
                         info!(self.logger, "Stopping subgraph");
@@ -292,14 +366,8 @@ where
         debug!(logger, "Start processing block";
                "triggers" => triggers.len());
 
-        let proof_of_indexing = if self.inputs.store.supports_proof_of_indexing().await? {
-            Some(Arc::new(AtomicRefCell::new(ProofOfIndexing::new(
-                block_ptr.number,
-                self.inputs.poi_version,
-            ))))
-        } else {
-            None
-        };
+        let proof_of_indexing =
+            SharedProofOfIndexing::new(block_ptr.number, self.inputs.poi_version);
 
         // Causality region for onchain triggers.
         let causality_region = PoICausalityRegion::from_network(&self.inputs.network);
@@ -323,7 +391,10 @@ where
             .match_and_decode_many(
                 &logger,
                 &block,
-                triggers.into_iter().map(TriggerData::Onchain),
+                triggers.into_iter().map(|t| match t {
+                    Trigger::Chain(t) => TriggerData::Onchain(t),
+                    Trigger::Subgraph(t) => TriggerData::Subgraph(t),
+                }),
                 hosts_filter,
                 &self.metrics.subgraph,
             )
@@ -421,9 +492,12 @@ where
                 let (data_sources, runtime_hosts) =
                     self.create_dynamic_data_sources(block_state.drain_created_data_sources())?;
 
-                let filter = C::TriggerFilter::from_data_sources(
-                    data_sources.iter().filter_map(DataSource::as_onchain),
-                );
+                let filter = &Arc::new(TriggerFilterWrapper::new(
+                    C::TriggerFilter::from_data_sources(
+                        data_sources.iter().filter_map(DataSource::as_onchain),
+                    ),
+                    vec![],
+                ));
 
                 let block: Arc<C::Block> = if self.inputs.chain.is_refetch_block_required() {
                     let cur = firehose_cursor.clone();
@@ -452,7 +526,7 @@ where
                 let block_with_triggers = self
                     .inputs
                     .triggers_adapter
-                    .triggers_in_block(&logger, block.as_ref().clone(), &filter)
+                    .triggers_in_block(&logger, block.as_ref().clone(), filter)
                     .await?;
 
                 let triggers = block_with_triggers.trigger_data;
@@ -482,7 +556,10 @@ where
                     .match_and_decode_many(
                         &logger,
                         &block,
-                        triggers.into_iter().map(TriggerData::Onchain),
+                        triggers.into_iter().map(|t| match t {
+                            Trigger::Chain(t) => TriggerData::Onchain(t),
+                            Trigger::Subgraph(_) => unreachable!(), // TODO(krishna): Re-evaulate this
+                        }),
                         |_| Box::new(runtime_hosts.iter().map(Arc::as_ref)),
                         &self.metrics.subgraph,
                     )
@@ -549,8 +626,7 @@ where
             return Err(BlockProcessingError::Canceled);
         }
 
-        if let Some(proof_of_indexing) = proof_of_indexing {
-            let proof_of_indexing = Arc::try_unwrap(proof_of_indexing).unwrap().into_inner();
+        if let Some(proof_of_indexing) = proof_of_indexing.into_inner() {
             update_proof_of_indexing(
                 proof_of_indexing,
                 block.timestamp(),
@@ -832,14 +908,26 @@ where
                     self.state.should_try_unfail_non_deterministic = false;
 
                     if let UnfailOutcome::Unfailed = outcome {
-                        self.metrics.stream.deployment_failed.set(0.0);
+                        self.metrics.subgraph.deployment_status.running();
                         self.state.backoff.reset();
                     }
                 }
 
-                if let Some(stop_block) = &self.inputs.stop_block {
-                    if block_ptr.number >= *stop_block {
-                        info!(self.logger, "stop block reached for subgraph");
+                if let Some(stop_block) = self.inputs.stop_block {
+                    if block_ptr.number >= stop_block {
+                        info!(self.logger, "Stop block reached for subgraph");
+                        return Ok(Action::Stop);
+                    }
+                }
+
+                if let Some(max_end_block) = self.inputs.max_end_block {
+                    if block_ptr.number >= max_end_block {
+                        info!(
+                            self.logger,
+                            "Stopping subgraph as maximum endBlock reached";
+                            "max_end_block" => max_end_block,
+                            "current_block" => block_ptr.number
+                        );
                         return Ok(Action::Stop);
                     }
                 }
@@ -853,7 +941,7 @@ where
 
             // Handle unexpected stream errors by marking the subgraph as failed.
             Err(e) => {
-                self.metrics.stream.deployment_failed.set(1.0);
+                self.metrics.subgraph.deployment_status.failed();
                 let last_good_block = self
                     .inputs
                     .store
@@ -999,15 +1087,18 @@ where
                     .stream
                     .stopwatch
                     .start_section(PROCESS_WASM_BLOCK_SECTION_NAME);
-                self.handle_process_wasm_block(
-                    block_ptr,
-                    block_time,
-                    data,
-                    handler,
-                    cursor,
-                    cancel_handle,
-                )
-                .await?
+                let res = self
+                    .handle_process_wasm_block(
+                        block_ptr.clone(),
+                        block_time,
+                        data,
+                        handler,
+                        cursor,
+                        cancel_handle,
+                    )
+                    .await;
+                let start = Instant::now();
+                self.handle_action(start, block_ptr, res).await?
             }
             Some(Ok(BlockStreamEvent::ProcessBlock(block, cursor))) => {
                 let _section = self
@@ -1061,7 +1152,7 @@ where
 
             // PoI ignores offchain events.
             // See also: poi-ignores-offchain
-            let proof_of_indexing = None;
+            let proof_of_indexing = SharedProofOfIndexing::ignored();
             let causality_region = "";
 
             let trigger = TriggerData::Offchain(trigger);
@@ -1136,6 +1227,13 @@ where
 
         Ok((mods, processed_data_sources, persisted_data_sources))
     }
+
+    fn update_deployment_synced_metric(&self) {
+        self.metrics
+            .subgraph
+            .deployment_synced
+            .record(self.inputs.store.is_deployment_synced());
+    }
 }
 
 #[derive(Debug)]
@@ -1165,7 +1263,7 @@ trait StreamEventHandler<C: Blockchain> {
         handler: String,
         cursor: FirehoseCursor,
         cancel_handle: &CancelHandle,
-    ) -> Result<Action, Error>;
+    ) -> Result<Action, BlockProcessingError>;
     async fn handle_process_block(
         &mut self,
         block: BlockWithTriggers<C>,
@@ -1199,7 +1297,7 @@ where
         handler: String,
         cursor: FirehoseCursor,
         cancel_handle: &CancelHandle,
-    ) -> Result<Action, Error> {
+    ) -> Result<Action, BlockProcessingError> {
         let logger = self.logger.new(o!(
                 "block_number" => format!("{:?}", block_ptr.number),
                 "block_hash" => format!("{}", block_ptr.hash)
@@ -1212,14 +1310,8 @@ where
             .deployment_head
             .set(block_ptr.number as f64);
 
-        let proof_of_indexing = if self.inputs.store.supports_proof_of_indexing().await? {
-            Some(Arc::new(AtomicRefCell::new(ProofOfIndexing::new(
-                block_ptr.number,
-                self.inputs.poi_version,
-            ))))
-        } else {
-            None
-        };
+        let proof_of_indexing =
+            SharedProofOfIndexing::new(block_ptr.number, self.inputs.poi_version);
 
         // Causality region for onchain triggers.
         let causality_region = PoICausalityRegion::from_network(&self.inputs.network);
@@ -1274,8 +1366,7 @@ where
             return Err(BlockProcessingError::Canceled.into());
         }
 
-        if let Some(proof_of_indexing) = proof_of_indexing {
-            let proof_of_indexing = Arc::try_unwrap(proof_of_indexing).unwrap().into_inner();
+        if let Some(proof_of_indexing) = proof_of_indexing.into_inner() {
             update_proof_of_indexing(
                 proof_of_indexing,
                 block_time,
@@ -1556,6 +1647,12 @@ where
     }
 }
 
+impl From<StoreError> for SubgraphRunnerError {
+    fn from(err: StoreError) -> Self {
+        Self::Unknown(err.into())
+    }
+}
+
 /// Transform the proof of indexing changes into entity updates that will be
 /// inserted when as_modifications is called.
 async fn update_proof_of_indexing(
@@ -1570,6 +1667,7 @@ async fn update_proof_of_indexing(
         key: EntityKey,
         digest: Bytes,
         block_time: BlockTime,
+        block: BlockNumber,
     ) -> Result<(), Error> {
         let digest_name = entity_cache.schema.poi_digest();
         let mut data = vec![
@@ -1584,11 +1682,12 @@ async fn update_proof_of_indexing(
             data.push((entity_cache.schema.poi_block_time(), block_time));
         }
         let poi = entity_cache.make_entity(data)?;
-        entity_cache.set(key, poi)
+        entity_cache.set(key, poi, block, None)
     }
 
     let _section_guard = stopwatch.start_section("update_proof_of_indexing");
 
+    let block_number = proof_of_indexing.get_block();
     let mut proof_of_indexing = proof_of_indexing.take();
 
     for (causality_region, stream) in proof_of_indexing.drain() {
@@ -1624,6 +1723,7 @@ async fn update_proof_of_indexing(
             entity_key,
             updated_proof_of_indexing,
             block_time,
+            block_number,
         )?;
     }
 

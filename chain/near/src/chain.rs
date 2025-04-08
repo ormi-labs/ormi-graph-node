@@ -4,11 +4,11 @@ use graph::blockchain::firehose_block_ingestor::FirehoseBlockIngestor;
 use graph::blockchain::substreams_block_stream::SubstreamsBlockStream;
 use graph::blockchain::{
     BasicBlockchainBuilder, BlockIngestor, BlockchainBuilder, BlockchainKind, NoopDecoderHook,
-    NoopRuntimeAdapter,
+    NoopRuntimeAdapter, Trigger, TriggerFilterWrapper,
 };
 use graph::cheap_clone::CheapClone;
-use graph::components::adapter::ChainId;
-use graph::components::store::DeploymentCursorTracker;
+use graph::components::network_provider::ChainName;
+use graph::components::store::{DeploymentCursorTracker, SourceableStore};
 use graph::data::subgraph::UnifiedMappingApiVersion;
 use graph::env::EnvVars;
 use graph::firehose::FirehoseEndpoint;
@@ -32,10 +32,12 @@ use graph::{
     prelude::{async_trait, o, BlockNumber, ChainStore, Error, Logger, LoggerFactory},
 };
 use prost::Message;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use crate::adapter::TriggerFilter;
 use crate::codec::substreams_triggers::BlockAndReceipts;
+use crate::codec::Block;
 use crate::data_source::{DataSourceTemplate, UnresolvedDataSourceTemplate};
 use crate::trigger::{self, NearTrigger};
 use crate::{
@@ -108,7 +110,6 @@ impl BlockStreamBuilder<Chain> for NearStreamBuilder {
             chain.metrics_registry.clone(),
         )))
     }
-
     async fn build_firehose(
         &self,
         chain: &Chain,
@@ -151,8 +152,9 @@ impl BlockStreamBuilder<Chain> for NearStreamBuilder {
         _chain: &Chain,
         _deployment: DeploymentLocator,
         _start_blocks: Vec<BlockNumber>,
+        _source_subgraph_stores: Vec<Arc<dyn SourceableStore>>,
         _subgraph_current_block: Option<BlockPtr>,
-        _filter: Arc<<Chain as Blockchain>::TriggerFilter>,
+        _filter: Arc<TriggerFilterWrapper<Chain>>,
         _unified_api_version: UnifiedMappingApiVersion,
     ) -> Result<Box<dyn BlockStream<Chain>>> {
         todo!()
@@ -161,7 +163,7 @@ impl BlockStreamBuilder<Chain> for NearStreamBuilder {
 
 pub struct Chain {
     logger_factory: LoggerFactory,
-    name: ChainId,
+    name: ChainName,
     client: Arc<ChainClient<Self>>,
     chain_store: Arc<dyn ChainStore>,
     metrics_registry: Arc<MetricsRegistry>,
@@ -230,7 +232,8 @@ impl Blockchain for Chain {
         deployment: DeploymentLocator,
         store: impl DeploymentCursorTracker,
         start_blocks: Vec<BlockNumber>,
-        filter: Arc<Self::TriggerFilter>,
+        _source_subgraph_stores: Vec<Arc<dyn SourceableStore>>,
+        filter: Arc<TriggerFilterWrapper<Self>>,
         unified_api_version: UnifiedMappingApiVersion,
     ) -> Result<Box<dyn BlockStream<Self>>, Error> {
         if self.prefer_substreams {
@@ -242,7 +245,7 @@ impl Blockchain for Chain {
                     deployment,
                     store.firehose_cursor(),
                     store.block_ptr(),
-                    filter,
+                    filter.chain_filter.clone(),
                 )
                 .await;
         }
@@ -254,7 +257,7 @@ impl Blockchain for Chain {
                 store.firehose_cursor(),
                 start_blocks,
                 store.block_ptr(),
-                filter,
+                filter.chain_filter.clone(),
                 unified_api_version,
             )
             .await
@@ -320,6 +323,18 @@ impl TriggersAdapterTrait<Chain> for TriggersAdapter {
         _filter: &TriggerFilter,
     ) -> Result<(Vec<BlockWithTriggers<Chain>>, BlockNumber), Error> {
         panic!("Should never be called since not used by FirehoseBlockStream")
+    }
+
+    async fn load_block_ptrs_by_numbers(
+        &self,
+        _logger: Logger,
+        _block_numbers: BTreeSet<BlockNumber>,
+    ) -> Result<Vec<Block>> {
+        unimplemented!()
+    }
+
+    async fn chain_head_ptr(&self) -> Result<Option<BlockPtr>, Error> {
+        unimplemented!()
     }
 
     async fn triggers_in_block(
@@ -462,11 +477,13 @@ impl BlockStreamMapper<Chain> for FirehoseMapper {
             .into_iter()
             .zip(receipt.into_iter())
             .map(|(outcome, receipt)| {
-                NearTrigger::Receipt(Arc::new(trigger::ReceiptWithOutcome {
-                    outcome,
-                    receipt,
-                    block: arc_block.clone(),
-                }))
+                Trigger::Chain(NearTrigger::Receipt(Arc::new(
+                    trigger::ReceiptWithOutcome {
+                        outcome,
+                        receipt,
+                        block: arc_block.clone(),
+                    },
+                )))
             })
             .collect();
 
@@ -973,8 +990,8 @@ mod test {
             .trigger_data
             .clone()
             .into_iter()
-            .filter_map(|x| match x {
-                crate::trigger::NearTrigger::Block(b) => b.header.clone().map(|x| x.height),
+            .filter_map(|x| match x.as_chain() {
+                Some(crate::trigger::NearTrigger::Block(b)) => b.header.clone().map(|x| x.height),
                 _ => None,
             })
             .collect()

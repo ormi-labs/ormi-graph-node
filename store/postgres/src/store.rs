@@ -70,7 +70,6 @@ impl QueryStoreManager for Store {
     async fn query_store(
         &self,
         target: graph::data::query::QueryTarget,
-        for_subscription: bool,
     ) -> Result<
         Arc<dyn graph::prelude::QueryStore + Send + Sync>,
         graph::prelude::QueryExecutionError,
@@ -80,7 +79,7 @@ impl QueryStoreManager for Store {
         let target = target.clone();
         let (store, site, replica) = graph::spawn_blocking_allow_panic(move || {
             store
-                .replica_for_query(target.clone(), for_subscription)
+                .replica_for_query(target.clone())
                 .map_err(|e| e.into())
         })
         .await
@@ -168,8 +167,8 @@ impl StatusStore for Store {
             .await
     }
 
-    async fn query_permit(&self) -> Result<QueryPermit, StoreError> {
+    async fn query_permit(&self) -> QueryPermit {
         // Status queries go to the primary shard.
-        Ok(self.block_store.query_permit_primary().await)
+        self.block_store.query_permit_primary().await
     }
 }

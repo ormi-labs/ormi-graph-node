@@ -116,12 +116,18 @@ impl Table {
             Ok(cols)
         }
 
+        let vid_type = if self.object.has_vid_seq() {
+            "bigint"
+        } else {
+            "bigserial"
+        };
+
         if self.immutable {
             writeln!(
                 out,
                 "
     create table {qname} (
-        {vid}                  bigserial primary key,
+        {vid}                  {vid_type} primary key,
         {block}                int not null,\n\
         {cols},
         unique({id})
@@ -129,6 +135,7 @@ impl Table {
                 qname = self.qualified_name,
                 cols = columns_ddl(self)?,
                 vid = VID_COLUMN,
+                vid_type = vid_type,
                 block = BLOCK_COLUMN,
                 id = self.primary_key().name
             )
@@ -137,13 +144,14 @@ impl Table {
                 out,
                 r#"
     create table {qname} (
-        {vid}                  bigserial primary key,
+        {vid}                  {vid_type} primary key,
         {block_range}          int4range not null,
         {cols}
     );"#,
                 qname = self.qualified_name,
                 cols = columns_ddl(self)?,
                 vid = VID_COLUMN,
+                vid_type = vid_type,
                 block_range = BLOCK_RANGE_COLUMN
             )?;
 
@@ -261,7 +269,11 @@ impl Table {
         (method, index_expr)
     }
 
-    pub(crate) fn create_postponed_indexes(&self, skip_colums: Vec<String>) -> Vec<String> {
+    pub(crate) fn create_postponed_indexes(
+        &self,
+        skip_colums: Vec<String>,
+        concurrently: bool,
+    ) -> Vec<String> {
         let mut indexing_queries = vec![];
         let columns = self.columns_to_index();
 
@@ -273,8 +285,9 @@ impl Table {
                 && column.name.as_str() != "id"
                 && !skip_colums.contains(&column.name.to_string())
             {
+                let conc = if concurrently { "concurrently " } else { "" };
                 let sql = format!(
-                    "create index concurrently if not exists attr_{table_index}_{column_index}_{table_name}_{column_name}\n    on {qname} using {method}({index_expr});\n",
+                    "create index {conc}if not exists attr_{table_index}_{column_index}_{table_name}_{column_name}\n    on {qname} using {method}({index_expr});\n",
                     table_index = self.position,
                     table_name = self.name,
                     column_name = column.name,
@@ -396,9 +409,10 @@ impl Table {
             let arr = index_def
                 .unwrap()
                 .indexes_for_table(
-                    &catalog.site.namespace,
+                    &self.nsp,
                     &self.name.to_string(),
                     &self,
+                    false,
                     false,
                     false,
                 )

@@ -7,9 +7,9 @@ use graph::{
             BlockStream, BlockStreamBuilder as BlockStreamBuilderTrait, FirehoseCursor,
         },
         substreams_block_stream::SubstreamsBlockStream,
-        Blockchain,
+        Blockchain, TriggerFilterWrapper,
     },
-    components::store::DeploymentLocator,
+    components::store::{DeploymentLocator, SourceableStore},
     data::subgraph::UnifiedMappingApiVersion,
     prelude::{async_trait, BlockNumber, BlockPtr},
     schema::InputSchema,
@@ -104,8 +104,9 @@ impl BlockStreamBuilderTrait<Chain> for BlockStreamBuilder {
         _chain: &Chain,
         _deployment: DeploymentLocator,
         _start_blocks: Vec<BlockNumber>,
+        _source_subgraph_stores: Vec<Arc<dyn SourceableStore>>,
         _subgraph_current_block: Option<BlockPtr>,
-        _filter: Arc<TriggerFilter>,
+        _filter: Arc<TriggerFilterWrapper<Chain>>,
         _unified_api_version: UnifiedMappingApiVersion,
     ) -> Result<Box<dyn BlockStream<Chain>>> {
         unimplemented!("polling block stream is not support for substreams")

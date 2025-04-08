@@ -4,7 +4,7 @@
 use crate::{advisory_lock, detail::GraphNodeVersion, primary::DeploymentId};
 use diesel::{
     connection::SimpleConnection,
-    dsl::{count, delete, insert_into, select, sql, update},
+    dsl::{count, delete, insert_into, now, select, sql, update},
     sql_types::{Bool, Integer},
 };
 use diesel::{expression::SqlLiteral, pg::PgConnection, sql_types::Numeric};
@@ -13,9 +13,13 @@ use diesel::{
     sql_query,
     sql_types::{Nullable, Text},
 };
+use graph::semver::Version;
 use graph::{
-    blockchain::block_stream::FirehoseCursor, data::subgraph::schema::SubgraphError, env::ENV_VARS,
+    blockchain::block_stream::FirehoseCursor,
+    data::subgraph::schema::SubgraphError,
+    env::ENV_VARS,
     schema::EntityType,
+    slog::{debug, Logger},
 };
 use graph::{
     data::store::scalar::ToPrimitive,
@@ -132,7 +136,8 @@ table! {
         deployment -> Text,
         failed -> Bool,
         health -> crate::deployment::SubgraphHealthMapping,
-        synced -> Bool,
+        synced_at -> Nullable<Timestamptz>,
+        synced_at_block_number -> Nullable<Int4>,
         fatal_error -> Nullable<Text>,
         non_fatal_errors -> Array<Text>,
         earliest_block_number -> Integer,
@@ -301,11 +306,13 @@ pub fn debug_fork(
 
 pub fn schema(conn: &mut PgConnection, site: &Site) -> Result<(InputSchema, bool), StoreError> {
     use subgraph_manifest as sm;
-    let (s, use_bytea_prefix) = sm::table
-        .select((sm::schema, sm::use_bytea_prefix))
+    let (s, spec_ver, use_bytea_prefix) = sm::table
+        .select((sm::schema, sm::spec_version, sm::use_bytea_prefix))
         .filter(sm::id.eq(site.id))
-        .first::<(String, bool)>(conn)?;
-    InputSchema::parse_latest(s.as_str(), site.deployment.clone())
+        .first::<(String, String, bool)>(conn)?;
+    let spec_version =
+        Version::parse(spec_ver.as_str()).map_err(|err| StoreError::Unknown(err.into()))?;
+    InputSchema::parse(&spec_version, s.as_str(), site.deployment.clone())
         .map_err(StoreError::Unknown)
         .map(|schema| (schema, use_bytea_prefix))
 }
@@ -731,15 +738,22 @@ pub fn state(conn: &mut PgConnection, id: DeploymentHash) -> Result<DeploymentSt
 }
 
 /// Mark the deployment `id` as synced
-pub fn set_synced(conn: &mut PgConnection, id: &DeploymentHash) -> Result<(), StoreError> {
+pub fn set_synced(
+    conn: &mut PgConnection,
+    id: &DeploymentHash,
+    block_ptr: BlockPtr,
+) -> Result<(), StoreError> {
     use subgraph_deployment as d;
 
     update(
         d::table
             .filter(d::deployment.eq(id.as_str()))
-            .filter(d::synced.eq(false)),
+            .filter(d::synced_at.is_null()),
     )
-    .set(d::synced.eq(true))
+    .set((
+        d::synced_at.eq(now),
+        d::synced_at_block_number.eq(block_ptr.number),
+    ))
     .execute(conn)?;
     Ok(())
 }
@@ -762,7 +776,7 @@ pub fn exists_and_synced(conn: &mut PgConnection, id: &str) -> Result<bool, Stor
 
     let synced = d::table
         .filter(d::deployment.eq(id))
-        .select(d::synced)
+        .select(d::synced_at.is_not_null())
         .first(conn)
         .optional()?
         .unwrap_or(false);
@@ -882,16 +896,24 @@ pub fn update_deployment_status(
 /// is healthy as of that block; errors are inserted according to the
 /// `block_ptr` they contain
 pub(crate) fn insert_subgraph_errors(
+    logger: &Logger,
     conn: &mut PgConnection,
     id: &DeploymentHash,
     deterministic_errors: &[SubgraphError],
     latest_block: BlockNumber,
 ) -> Result<(), StoreError> {
+    debug!(
+        logger,
+        "Inserting deterministic errors to the db";
+        "subgraph" => id.to_string(),
+        "errors" => deterministic_errors.len()
+    );
+
     for error in deterministic_errors {
         insert_subgraph_error(conn, error)?;
     }
 
-    check_health(conn, id, latest_block)
+    check_health(logger, conn, id, latest_block)
 }
 
 #[cfg(debug_assertions)]
@@ -910,6 +932,7 @@ pub(crate) fn error_count(
 /// Checks if the subgraph is healthy or unhealthy as of the given block, or the subgraph latest
 /// block if `None`, based on the presence of deterministic errors. Has no effect on failed subgraphs.
 fn check_health(
+    logger: &Logger,
     conn: &mut PgConnection,
     id: &DeploymentHash,
     block: BlockNumber,
@@ -919,7 +942,15 @@ fn check_health(
     let has_errors = has_deterministic_errors(conn, id, block)?;
 
     let (new, old) = match has_errors {
-        true => (SubgraphHealth::Unhealthy, SubgraphHealth::Healthy),
+        true => {
+            debug!(
+                logger,
+                "Subgraph has deterministic errors. Marking as unhealthy";
+                "subgraph" => id.to_string(),
+                "block" => block
+            );
+            (SubgraphHealth::Unhealthy, SubgraphHealth::Healthy)
+        }
         false => (SubgraphHealth::Healthy, SubgraphHealth::Unhealthy),
     };
 
@@ -971,6 +1002,7 @@ pub(crate) fn entities_with_causality_region(
 
 /// Reverts the errors and updates the subgraph health if necessary.
 pub(crate) fn revert_subgraph_errors(
+    logger: &Logger,
     conn: &mut PgConnection,
     id: &DeploymentHash,
     reverted_block: BlockNumber,
@@ -989,7 +1021,7 @@ pub(crate) fn revert_subgraph_errors(
     // The result will be the same at `reverted_block` or `reverted_block - 1` since the errors at
     // `reverted_block` were just deleted, but semantically we care about `reverted_block - 1` which
     // is the block being reverted to.
-    check_health(conn, id, reverted_block - 1)?;
+    check_health(&logger, conn, id, reverted_block - 1)?;
 
     // If the deployment is failed in both `failed` and `status` columns,
     // update both values respectively to `false` and `healthy`. Basically
@@ -1142,7 +1174,6 @@ pub fn create_deployment(
         d::id.eq(site.id),
         d::deployment.eq(site.deployment.as_str()),
         d::failed.eq(false),
-        d::synced.eq(false),
         d::health.eq(SubgraphHealth::Healthy),
         d::fatal_error.eq::<Option<String>>(None),
         d::non_fatal_errors.eq::<Vec<String>>(vec![]),
@@ -1218,17 +1249,12 @@ pub fn update_entity_count(
     Ok(())
 }
 
-/// Set the deployment's entity count to whatever `full_count_query` produces
-pub fn set_entity_count(
-    conn: &mut PgConnection,
-    site: &Site,
-    full_count_query: &str,
-) -> Result<(), StoreError> {
+/// Set the deployment's entity count back to `0`
+pub fn clear_entity_count(conn: &mut PgConnection, site: &Site) -> Result<(), StoreError> {
     use subgraph_deployment as d;
 
-    let full_count_query = format!("({})", full_count_query);
     update(d::table.filter(d::id.eq(site.id)))
-        .set(d::entity_count.eq(sql(&full_count_query)))
+        .set(d::entity_count.eq(BigDecimal::from(0)))
         .execute(conn)?;
     Ok(())
 }

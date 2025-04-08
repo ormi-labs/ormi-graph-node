@@ -332,10 +332,7 @@ impl IntrospectionResolver {
                 self.type_objects
                     .get(&String::from("Query"))
                     .cloned(),
-            subscriptionType:
-                self.type_objects
-                    .get(&String::from("Subscription"))
-                    .cloned(),
+            subscriptionType: r::Value::Null,
             mutationType: r::Value::Null,
             types: self.type_objects.values().cloned().collect::<Vec<_>>(),
             directives: self.directives.clone(),
@@ -359,7 +356,7 @@ impl Resolver for IntrospectionResolver {
     // see `fn as_introspection_context`, so this value is irrelevant.
     const CACHEABLE: bool = false;
 
-    async fn query_permit(&self) -> Result<QueryPermit, QueryExecutionError> {
+    async fn query_permit(&self) -> QueryPermit {
         unreachable!()
     }
 

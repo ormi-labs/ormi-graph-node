@@ -65,10 +65,9 @@ lazy_static! {
     ));
     static ref STORE_POOL_CONFIG: (Arc<Store>, ConnectionPool, Config, Arc<SubscriptionManager>) =
         build_store();
-    pub(crate) static ref PRIMARY_POOL: ConnectionPool = STORE_POOL_CONFIG.1.clone();
+    pub static ref PRIMARY_POOL: ConnectionPool = STORE_POOL_CONFIG.1.clone();
     pub static ref STORE: Arc<Store> = STORE_POOL_CONFIG.0.clone();
     static ref CONFIG: Config = STORE_POOL_CONFIG.2.clone();
-    pub static ref SUBSCRIPTION_MANAGER: Arc<SubscriptionManager> = STORE_POOL_CONFIG.3.clone();
     pub static ref NODE_ID: NodeId = NodeId::new("test").unwrap();
     pub static ref SUBGRAPH_STORE: Arc<DieselSubgraphStore> = STORE.subgraph_store();
     static ref BLOCK_STORE: Arc<DieselBlockStore> = STORE.block_store();
@@ -163,7 +162,7 @@ pub async fn create_subgraph(
 
     let manifest = SubgraphManifest::<graph::blockchain::mock::MockBlockchain> {
         id: subgraph_id.clone(),
-        spec_version: Version::new(1, 0, 0),
+        spec_version: Version::new(1, 3, 0),
         features: BTreeSet::new(),
         description: Some(format!("manifest for {}", subgraph_id)),
         repository: Some(format!("repo for {}", subgraph_id)),
@@ -227,7 +226,7 @@ pub async fn create_test_subgraph_with_features(
 
     let manifest = SubgraphManifest::<graph::blockchain::mock::MockBlockchain> {
         id: subgraph_id.clone(),
-        spec_version: Version::new(1, 0, 0),
+        spec_version: Version::new(1, 3, 0),
         features,
         description: Some(format!("manifest for {}", subgraph_id)),
         repository: Some(format!("repo for {}", subgraph_id)),
@@ -422,12 +421,13 @@ pub async fn insert_entities(
     deployment: &DeploymentLocator,
     entities: Vec<(EntityType, Entity)>,
 ) -> Result<(), StoreError> {
-    let insert_ops = entities
-        .into_iter()
-        .map(|(entity_type, data)| EntityOperation::Set {
+    let insert_ops = entities.into_iter().map(|(entity_type, mut data)| {
+        data.set_vid_if_empty();
+        EntityOperation::Set {
             key: entity_type.key(data.id()),
             data,
-        });
+        }
+    });
 
     transact_entity_operations(
         &SUBGRAPH_STORE,
@@ -526,11 +526,11 @@ async fn execute_subgraph_query_internal(
         100,
         graphql_metrics(),
     ));
-    let mut result = QueryResults::empty(query.root_trace(trace));
+    let mut result = QueryResults::empty(query.root_trace(trace), None);
     let deployment = query.schema.id().clone();
     let store = STORE
         .clone()
-        .query_store(QueryTarget::Deployment(deployment, version.clone()), false)
+        .query_store(QueryTarget::Deployment(deployment, version.clone()))
         .await
         .unwrap();
     let state = store.deployment_state().await.unwrap();
@@ -543,7 +543,6 @@ async fn execute_subgraph_query_internal(
                 &logger,
                 store.clone(),
                 &state,
-                SUBSCRIPTION_MANAGER.clone(),
                 ptr,
                 error_policy,
                 query.schema.id().clone(),
@@ -572,10 +571,10 @@ async fn execute_subgraph_query_internal(
 
 pub async fn deployment_state(store: &Store, subgraph_id: &DeploymentHash) -> DeploymentState {
     store
-        .query_store(
-            QueryTarget::Deployment(subgraph_id.clone(), Default::default()),
-            false,
-        )
+        .query_store(QueryTarget::Deployment(
+            subgraph_id.clone(),
+            Default::default(),
+        ))
         .await
         .expect("could get a query store")
         .deployment_state()

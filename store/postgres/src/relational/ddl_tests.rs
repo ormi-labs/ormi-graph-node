@@ -158,7 +158,7 @@ fn generate_postponed_indexes() {
     let layout = test_layout(THING_GQL);
     let table = layout.table(&SqlName::from("Scalar")).unwrap();
     let skip_colums = vec!["id".to_string()];
-    let query_vec = table.create_postponed_indexes(skip_colums);
+    let query_vec = table.create_postponed_indexes(skip_colums, true);
     assert!(query_vec.len() == 7);
     let queries = query_vec.join(" ");
     check_eqv(THING_POSTPONED_INDEXES, &queries)
@@ -221,8 +221,6 @@ fn generate_ddl() {
     let il = IndexList::mock_thing_index_list();
     let layout = test_layout(THING_GQL);
     let sql = layout.as_ddl(Some(il)).expect("Failed to generate DDL");
-    println!("SQL: {}", sql);
-    println!("THING_DDL_ON_COPY: {}", THING_DDL_ON_COPY);
     check_eqv(THING_DDL_ON_COPY, &sql);
 
     let layout = test_layout(MUSIC_GQL);
@@ -354,6 +352,97 @@ fn can_copy_from() {
     );
 }
 
+/// Check that we do not create the index on `block$` twice. There was a bug
+/// that if an immutable entity type had a `block` field and index creation
+/// was postponed, we would emit the index on `block$` twice, once from
+/// `Table.create_time_travel_indexes` and once through
+/// `IndexList.indexes_for_table`
+#[test]
+fn postponed_indexes_with_block_column() {
+    fn index_list() -> IndexList {
+        // To generate this list, print the output of `layout.as_ddl(None)`, run
+        // that in Postgres and do `select indexdef from pg_indexes where
+        // schemaname = 'sgd0815'`
+        const INDEX_DEFS: &[&str] = &[
+            "CREATE UNIQUE INDEX data_pkey ON sgd0815.data USING btree (vid)",
+            "CREATE UNIQUE INDEX data_id_key ON sgd0815.data USING btree (id)",
+            "CREATE INDEX data_block ON sgd0815.data USING btree (block$)",
+            "CREATE INDEX attr_1_0_data_block ON sgd0815.data USING btree (block, \"block$\")",
+        ];
+
+        let mut indexes: HashMap<String, Vec<CreateIndex>> = HashMap::new();
+        indexes.insert(
+            "data".to_string(),
+            INDEX_DEFS
+                .iter()
+                .map(|def| CreateIndex::parse(def.to_string()))
+                .collect(),
+        );
+        IndexList { indexes }
+    }
+
+    fn cr(index: &str) -> String {
+        format!("create index{}", index)
+    }
+
+    fn cre(index: &str) -> String {
+        format!("create index if not exists{}", index)
+    }
+
+    // Names of the two indexes we are interested in. Not the leading space
+    // to guard a little against overlapping names
+    const BLOCK_IDX: &str = " data_block";
+    const ATTR_IDX: &str = " attr_1_0_data_block";
+
+    let layout = test_layout(BLOCK_GQL);
+
+    // Create everything
+    let sql = layout.as_ddl(None).unwrap();
+    assert!(sql.contains(&cr(BLOCK_IDX)));
+    assert!(sql.contains(&cr(ATTR_IDX)));
+
+    // Defer attribute indexes
+    let sql = layout.as_ddl(Some(index_list())).unwrap();
+    assert!(sql.contains(&cr(BLOCK_IDX)));
+    assert!(!sql.contains(ATTR_IDX));
+    // This used to be duplicated
+    let count = sql.matches(BLOCK_IDX).count();
+    assert_eq!(1, count);
+
+    let table = layout.table(&SqlName::from("Data")).unwrap();
+    let sql = table.create_postponed_indexes(vec![], false);
+    assert_eq!(1, sql.len());
+    assert!(!sql[0].contains(BLOCK_IDX));
+    assert!(sql[0].contains(&cre(ATTR_IDX)));
+
+    let dst_nsp = Namespace::new("sgd2".to_string()).unwrap();
+    let arr = index_list()
+        .indexes_for_table(
+            &dst_nsp,
+            &table.name.to_string(),
+            &table,
+            true,
+            false,
+            false,
+        )
+        .unwrap();
+    assert_eq!(1, arr.len());
+    assert!(!arr[0].1.contains(BLOCK_IDX));
+    assert!(arr[0].1.contains(&cr(ATTR_IDX)));
+
+    let arr = index_list()
+        .indexes_for_table(
+            &dst_nsp,
+            &table.name.to_string(),
+            &table,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+    assert_eq!(0, arr.len());
+}
+
 const THING_GQL: &str = r#"
         type Thing @entity {
             id: ID!
@@ -386,7 +475,7 @@ create type sgd0815."size"
     as enum ('large', 'medium', 'small');
 
     create table "sgd0815"."thing" (
-        vid                  bigserial primary key,
+        vid                  bigint primary key,
         block_range          int4range not null,
         "id"                 text not null,
         "big_thing"          text not null
@@ -407,7 +496,7 @@ create index attr_0_1_thing_big_thing
 
 
     create table "sgd0815"."scalar" (
-        vid                  bigserial primary key,
+        vid                  bigint primary key,
         block_range          int4range not null,
         "id"                 text not null,
         "bool"               boolean,
@@ -446,7 +535,7 @@ create index attr_1_7_scalar_color
 
 
     create table "sgd0815"."file_thing" (
-        vid                  bigserial primary key,
+        vid                  bigint primary key,
         block_range          int4range not null,
         causality_region     int not null,
         "id"                 text not null
@@ -471,7 +560,7 @@ create type sgd0815."size"
     as enum ('large', 'medium', 'small');
 
     create table "sgd0815"."thing" (
-        vid                  bigserial primary key,
+        vid                  bigint primary key,
         block_range          int4range not null,
         "id"                 text not null,
         "big_thing"          text not null
@@ -486,13 +575,13 @@ create index thing_block_range_closed
     on "sgd0815"."thing"(coalesce(upper(block_range), 2147483647))
  where coalesce(upper(block_range), 2147483647) < 2147483647;
 create index attr_0_0_thing_id
-    on sgd0815."thing" using btree (id);
+    on sgd0815."thing" using btree ("id");
 create index attr_0_1_thing_big_thing
-    on sgd0815."thing" using gist (big_thing, block_range);
+    on sgd0815."thing" using gist ("big_thing", block_range);
 
 
     create table "sgd0815"."scalar" (
-        vid                  bigserial primary key,
+        vid                  bigint primary key,
         block_range          int4range not null,
         "id"                 text not null,
         "bool"               boolean,
@@ -513,11 +602,11 @@ create index scalar_block_range_closed
     on "sgd0815"."scalar"(coalesce(upper(block_range), 2147483647))
  where coalesce(upper(block_range), 2147483647) < 2147483647;
 create index attr_1_0_scalar_id
-    on sgd0815."scalar" using btree (id);
+    on sgd0815."scalar" using btree ("id");
 
 
     create table "sgd0815"."file_thing" (
-        vid                  bigserial primary key,
+        vid                  bigint primary key,
         block_range          int4range not null,
         causality_region     int not null,
         "id"                 text not null
@@ -532,7 +621,7 @@ create index file_thing_block_range_closed
     on "sgd0815"."file_thing"(coalesce(upper(block_range), 2147483647))
  where coalesce(upper(block_range), 2147483647) < 2147483647;
 create index attr_2_0_file_thing_id
-    on sgd0815."file_thing" using btree (id);
+    on sgd0815."file_thing" using btree ("id");
 "#;
 
 const BOOKS_GQL: &str = r#"type Author @entity {
@@ -577,7 +666,7 @@ type SongStat @entity {
     played: Int!
 }"#;
 const MUSIC_DDL: &str = r#"create table "sgd0815"."musician" (
-        vid                  bigserial primary key,
+        vid                  bigint primary key,
         block_range          int4range not null,
         "id"                 text not null,
         "name"               text not null,
@@ -600,7 +689,7 @@ create index attr_0_2_musician_main_band
     on "sgd0815"."musician" using gist("main_band", block_range);
 
 create table "sgd0815"."band" (
-        vid                  bigserial primary key,
+        vid                  bigint primary key,
         block_range          int4range not null,
         "id"                 text not null,
         "name"               text not null,
@@ -620,8 +709,8 @@ create index attr_1_1_band_name
     on "sgd0815"."band" using btree(left("name", 256));
 
 create table "sgd0815"."song" (
-        vid                    bigserial primary key,
-        block$                 int not null,
+        vid                  bigint primary key,
+        block$               int not null,
         "id"                 text not null,
         "title"              text not null,
         "written_by"         text not null,
@@ -636,7 +725,7 @@ create index attr_2_1_song_written_by
     on "sgd0815"."song" using btree("written_by", block$);
 
 create table "sgd0815"."song_stat" (
-        vid                  bigserial primary key,
+        vid                  bigint primary key,
         block_range          int4range not null,
         "id"                 text not null,
         "played"             int4 not null
@@ -678,7 +767,7 @@ type Habitat @entity {
 }"#;
 
 const FOREST_DDL: &str = r#"create table "sgd0815"."animal" (
-        vid                  bigserial primary key,
+        vid                  bigint primary key,
         block_range          int4range not null,
         "id"                 text not null,
         "forest"             text
@@ -697,8 +786,8 @@ create index attr_0_1_animal_forest
     on "sgd0815"."animal" using gist("forest", block_range);
 
 create table "sgd0815"."forest" (
-        vid                  bigserial primary key,
-        block_range          int4range not null,
+        vid                bigint primary key,
+        block_range        int4range not null,
         "id"               text not null
 );
 alter table "sgd0815"."forest"
@@ -713,7 +802,7 @@ create index attr_1_0_forest_id
     on "sgd0815"."forest" using btree("id");
 
 create table "sgd0815"."habitat" (
-        vid                  bigserial primary key,
+        vid                  bigint primary key,
         block_range          int4range not null,
         "id"                 text not null,
         "most_common"        text not null,
@@ -765,7 +854,7 @@ type Habitat @entity {
 }"#;
 
 const FULLTEXT_DDL: &str = r#"create table "sgd0815"."animal" (
-        vid                  bigserial primary key,
+        vid                  bigint primary key,
         block_range          int4range not null,
         "id"                 text not null,
         "name"               text not null,
@@ -793,7 +882,7 @@ create index attr_0_4_animal_search
     on "sgd0815"."animal" using gin("search");
 
 create table "sgd0815"."forest" (
-        vid                  bigserial primary key,
+        vid                  bigint primary key,
         block_range          int4range not null,
         "id"                 text not null
 );
@@ -810,7 +899,7 @@ create index attr_1_0_forest_id
     on "sgd0815"."forest" using btree("id");
 
 create table "sgd0815"."habitat" (
-        vid                  bigserial primary key,
+        vid                  bigint primary key,
         block_range          int4range not null,
         "id"                 text not null,
         "most_common"        text not null,
@@ -845,7 +934,7 @@ enum Orientation {
 const FORWARD_ENUM_SQL: &str = r#"create type sgd0815."orientation"
     as enum ('DOWN', 'UP');
 create table "sgd0815"."thing" (
-        vid                  bigserial primary key,
+        vid                  bigint primary key,
         block_range          int4range not null,
         "id"                 text not null,
         "orientation"        "sgd0815"."orientation" not null
@@ -882,8 +971,8 @@ type Stats @aggregation(intervals: ["hour", "day"], source: "Data") {
 
 const TS_SQL: &str = r#"
 create table "sgd0815"."data" (
-    vid                  bigserial primary key,
-    block$                int not null,
+    vid                  bigint primary key,
+    block$               int not null,
     "id"                 int8 not null,
     "timestamp"          timestamptz not null,
     "amount"             numeric not null,
@@ -898,7 +987,7 @@ create index attr_0_1_data_amount
 
 create table "sgd0815"."stats_hour" (
     vid                  bigserial primary key,
-    block$                int not null,
+    block$               int not null,
     "id"                 int8 not null,
     "timestamp"          timestamptz not null,
     "volume"             numeric not null,
@@ -973,9 +1062,9 @@ const LIFETIME_GQL: &str = r#"
 
 const LIFETIME_SQL: &str = r#"
 create table "sgd0815"."data" (
-    vid                  bigserial primary key,
-    block$                int not null,
-"id"                 int8 not null,
+    vid                  bigint primary key,
+    block$               int not null,
+    "id"                 int8 not null,
     "timestamp"          timestamptz not null,
     "group_1"            int4 not null,
     "group_2"            int4 not null,
@@ -995,8 +1084,8 @@ on "sgd0815"."data" using btree("amount");
 
 create table "sgd0815"."stats_1_hour" (
     vid                  bigserial primary key,
-    block$                int not null,
-"id"                 int8 not null,
+    block$               int not null,
+    "id"                 int8 not null,
     "timestamp"          timestamptz not null,
     "volume"             numeric not null,
     unique(id)
@@ -1011,8 +1100,8 @@ on "sgd0815"."stats_1_hour" using btree("volume");
 
 create table "sgd0815"."stats_1_day" (
     vid                  bigserial primary key,
-    block$                int not null,
-"id"                 int8 not null,
+    block$               int not null,
+    "id"                 int8 not null,
     "timestamp"          timestamptz not null,
     "volume"             numeric not null,
     unique(id)
@@ -1027,8 +1116,8 @@ on "sgd0815"."stats_1_day" using btree("volume");
 
 create table "sgd0815"."stats_2_hour" (
     vid                  bigserial primary key,
-    block$                int not null,
-"id"                 int8 not null,
+    block$               int not null,
+    "id"                 int8 not null,
     "timestamp"          timestamptz not null,
     "group_1"            int4 not null,
     "volume"             numeric not null,
@@ -1047,8 +1136,8 @@ on "sgd0815"."stats_2_hour"(group_1, timestamp);
 
 create table "sgd0815"."stats_2_day" (
     vid                  bigserial primary key,
-    block$                int not null,
-"id"                 int8 not null,
+    block$               int not null,
+    "id"                 int8 not null,
     "timestamp"          timestamptz not null,
     "group_1"            int4 not null,
     "volume"             numeric not null,
@@ -1067,8 +1156,8 @@ on "sgd0815"."stats_2_day"(group_1, timestamp);
 
 create table "sgd0815"."stats_3_hour" (
     vid                  bigserial primary key,
-    block$                int not null,
-"id"                 int8 not null,
+    block$               int not null,
+    "id"                 int8 not null,
     "timestamp"          timestamptz not null,
     "group_2"            int4 not null,
     "group_1"            int4 not null,
@@ -1090,8 +1179,8 @@ on "sgd0815"."stats_3_hour"(group_2, group_1, timestamp);
 
 create table "sgd0815"."stats_3_day" (
     vid                  bigserial primary key,
-    block$                int not null,
-"id"                 int8 not null,
+    block$               int not null,
+    "id"                 int8 not null,
     "timestamp"          timestamptz not null,
     "group_2"            int4 not null,
     "group_1"            int4 not null,
@@ -1110,4 +1199,16 @@ create index attr_8_3_stats_3_day_volume
 on "sgd0815"."stats_3_day" using btree("volume");
 create index stats_3_day_dims
 on "sgd0815"."stats_3_day"(group_2, group_1, timestamp);
+"#;
+
+const BLOCK_GQL: &str = r#"
+type Block @entity(immutable: true) {
+    id: ID!
+    number: Int!
+}
+
+type Data @entity(immutable: true) {
+    id: ID!
+    block: Block!
+}
 "#;

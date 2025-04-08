@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::ops::Deref;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 
@@ -32,18 +31,6 @@ use crate::module::WasmInstance;
 use crate::{error::DeterminismLevel, module::IntoTrap};
 
 use super::module::WasmInstanceData;
-
-fn write_poi_event(
-    proof_of_indexing: &SharedProofOfIndexing,
-    poi_event: &ProofOfIndexingEvent,
-    causality_region: &str,
-    logger: &Logger,
-) {
-    if let Some(proof_of_indexing) = proof_of_indexing {
-        let mut proof_of_indexing = proof_of_indexing.deref().borrow_mut();
-        proof_of_indexing.write(logger, causality_region, poi_event);
-    }
-}
 
 impl IntoTrap for HostExportError {
     fn determinism_level(&self) -> DeterminismLevel {
@@ -336,8 +323,7 @@ impl HostExports {
             .map_err(|e| HostExportError::Deterministic(anyhow!(e)))?;
 
         let poi_section = stopwatch.start_section("host_export_store_set__proof_of_indexing");
-        write_poi_event(
-            proof_of_indexing,
+        proof_of_indexing.write_event(
             &ProofOfIndexingEvent::SetEntity {
                 entity_type: &key.entity_type.typename(),
                 id: &key.entity_id.to_string(),
@@ -350,7 +336,12 @@ impl HostExports {
 
         state.metrics.track_entity_write(&entity_type, &entity);
 
-        state.entity_cache.set(key, entity)?;
+        state.entity_cache.set(
+            key,
+            entity,
+            block,
+            Some(&mut state.write_capacity_remaining),
+        )?;
 
         Ok(())
     }
@@ -364,8 +355,7 @@ impl HostExports {
         entity_id: String,
         gas: &GasCounter,
     ) -> Result<(), HostExportError> {
-        write_poi_event(
-            proof_of_indexing,
+        proof_of_indexing.write_event(
             &ProofOfIndexingEvent::RemoveEntity {
                 entity_type: &entity_type,
                 id: &entity_id,
@@ -1082,7 +1072,8 @@ impl HostExports {
 
         if level == slog::Level::Critical {
             return Err(DeterministicHostError::from(anyhow!(
-                "Critical error logged in mapping"
+                "Critical error logged in mapping with log message: {}",
+                msg
             )));
         }
         Ok(())
@@ -1229,6 +1220,36 @@ impl HostExports {
             // We can't do `tokens[0]` because the value can't be moved out of the `Vec`.
             .map(|mut tokens| tokens.pop().unwrap())
             .context("Failed to decode")
+    }
+
+    pub(crate) fn yaml_from_bytes(
+        &self,
+        bytes: &[u8],
+        gas: &GasCounter,
+        state: &mut BlockState,
+    ) -> Result<serde_yaml::Value, DeterministicHostError> {
+        const YAML_MAX_SIZE_BYTES: usize = 10_000_000;
+
+        Self::track_gas_and_ops(
+            gas,
+            state,
+            gas::YAML_FROM_BYTES.with_args(complexity::Size, bytes),
+            "yaml_from_bytes",
+        )?;
+
+        if bytes.len() > YAML_MAX_SIZE_BYTES {
+            return Err(DeterministicHostError::Other(
+                anyhow!(
+                    "YAML size exceeds max size of {} bytes",
+                    YAML_MAX_SIZE_BYTES
+                )
+                .into(),
+            ));
+        }
+
+        serde_yaml::from_slice(bytes)
+            .context("failed to parse YAML from bytes")
+            .map_err(DeterministicHostError::from)
     }
 }
 

@@ -154,25 +154,11 @@ where
         let logger = self.logger.clone();
 
         self.subscription_manager
-            .subscribe(FromIterator::from_iter([SubscriptionFilter::Assignment]))
+            .subscribe()
             .map_err(|()| anyhow!("Entity change stream failed"))
             .map(|event| {
-                // We're only interested in the SubgraphDeploymentAssignment change; we
-                // know that there is at least one, as that is what we subscribed to
-                let filter = SubscriptionFilter::Assignment;
-                let assignments = event
-                    .changes
-                    .iter()
-                    .filter(|change| filter.matches(change))
-                    .map(|change| match change {
-                        EntityChange::Data { .. } => unreachable!(),
-                        EntityChange::Assignment {
-                            deployment,
-                            operation,
-                        } => (deployment.clone(), operation.clone()),
-                    })
-                    .collect::<Vec<_>>();
-                stream::iter_ok(assignments)
+                let changes: Vec<_> = event.changes.iter().cloned().map(AssignmentChange::into_parts).collect();
+                stream::iter_ok(changes)
             })
             .flatten()
             .and_then(
@@ -183,7 +169,7 @@ where
                                 );
 
                     match operation {
-                        EntityChangeOperation::Set => {
+                        AssignmentOperation::Set => {
                             store
                                 .assignment_status(&deployment)
                                 .map_err(|e| {
@@ -220,7 +206,7 @@ where
                                     }
                                 })
                         }
-                        EntityChangeOperation::Removed => {
+                        AssignmentOperation::Removed => {
                             // Send remove event without checking node ID.
                             // If node ID does not match, then this is a no-op when handled in
                             // assignment provider.
@@ -381,44 +367,8 @@ where
                 )
                 .await?
             }
-            BlockchainKind::Cosmos => {
-                create_subgraph_version::<graph_chain_cosmos::Chain, _>(
-                    &logger,
-                    self.store.clone(),
-                    self.chains.cheap_clone(),
-                    name.clone(),
-                    hash.cheap_clone(),
-                    start_block_override,
-                    graft_block_override,
-                    raw,
-                    node_id,
-                    debug_fork,
-                    self.version_switching_mode,
-                    &self.resolver,
-                    history_blocks,
-                )
-                .await?
-            }
             BlockchainKind::Substreams => {
                 create_subgraph_version::<graph_chain_substreams::Chain, _>(
-                    &logger,
-                    self.store.clone(),
-                    self.chains.cheap_clone(),
-                    name.clone(),
-                    hash.cheap_clone(),
-                    start_block_override,
-                    graft_block_override,
-                    raw,
-                    node_id,
-                    debug_fork,
-                    self.version_switching_mode,
-                    &self.resolver,
-                    history_blocks,
-                )
-                .await?
-            }
-            BlockchainKind::Starknet => {
-                create_subgraph_version::<graph_chain_starknet::Chain, _>(
                     &logger,
                     self.store.clone(),
                     self.chains.cheap_clone(),
@@ -629,7 +579,6 @@ async fn create_subgraph_version<C: Blockchain, S: SubgraphStore>(
     )
     .map_err(SubgraphRegistrarError::ResolveError)
     .await?;
-
     // Determine if the graft_base should be validated.
     // Validate the graft_base if there is a pending graft, ensuring its presence.
     // If the subgraph is new (indicated by DeploymentNotFound), the graft_base should be validated.

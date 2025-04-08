@@ -11,16 +11,17 @@ use graph::data::store::Value;
 use graph::data::subgraph::schema::SubgraphError;
 use graph::data::subgraph::{
     Prune, LATEST_VERSION, SPEC_VERSION_0_0_4, SPEC_VERSION_0_0_7, SPEC_VERSION_0_0_8,
-    SPEC_VERSION_0_0_9, SPEC_VERSION_1_0_0, SPEC_VERSION_1_2_0,
+    SPEC_VERSION_0_0_9, SPEC_VERSION_1_0_0, SPEC_VERSION_1_2_0, SPEC_VERSION_1_3_0,
 };
 use graph::data_source::offchain::OffchainDataSourceKind;
-use graph::data_source::DataSourceTemplate;
+use graph::data_source::{DataSourceEnum, DataSourceTemplate};
 use graph::entity;
 use graph::env::ENV_VARS;
 use graph::prelude::web3::types::H256;
 use graph::prelude::{
     anyhow, async_trait, serde_yaml, tokio, BigDecimal, BigInt, DeploymentHash, Link, Logger,
-    SubgraphManifest, SubgraphManifestValidationError, SubgraphStore, UnvalidatedSubgraphManifest,
+    SubgraphManifest, SubgraphManifestResolveError, SubgraphManifestValidationError, SubgraphStore,
+    UnvalidatedSubgraphManifest,
 };
 use graph::{
     blockchain::NodeCapabilities as _,
@@ -37,6 +38,33 @@ const GQL_SCHEMA: &str = r#"
   type TestEntity @entity { id: ID! }
 "#;
 const GQL_SCHEMA_FULLTEXT: &str = include_str!("full-text.graphql");
+const SOURCE_SUBGRAPH_MANIFEST: &str = "
+dataSources: []
+schema:
+  file:
+    /: /ipfs/QmSourceSchema
+specVersion: 1.3.0
+";
+
+const SOURCE_SUBGRAPH_SCHEMA: &str = "
+type TestEntity @entity(immutable: true) { id: ID! }
+type MutableEntity @entity { id: ID! }
+type User @entity(immutable: true) { id: ID! }
+type Profile @entity(immutable: true) { id: ID! }
+
+type TokenData @entity(timeseries: true) {
+    id: Int8!
+    timestamp: Timestamp!
+    amount: BigDecimal!
+}
+
+type TokenStats @aggregation(intervals: [\"hour\", \"day\"], source: \"TokenData\") {
+    id: Int8!
+    timestamp: Timestamp!
+    totalAmount: BigDecimal! @aggregate(fn: \"sum\", arg: \"amount\")
+}
+";
+
 const MAPPING_WITH_IPFS_FUNC_WASM: &[u8] = include_bytes!("ipfs-on-ethereum-contracts.wasm");
 const ABI: &str = "[{\"type\":\"function\", \"inputs\": [{\"name\": \"i\",\"type\": \"uint256\"}],\"name\":\"get\",\"outputs\": [{\"type\": \"address\",\"name\": \"o\"}]}]";
 const FILE: &str = "{}";
@@ -83,10 +111,10 @@ impl LinkResolverTrait for TextResolver {
     }
 }
 
-async fn resolve_manifest(
+async fn try_resolve_manifest(
     text: &str,
     max_spec_version: Version,
-) -> SubgraphManifest<graph_chain_ethereum::Chain> {
+) -> Result<SubgraphManifest<graph_chain_ethereum::Chain>, anyhow::Error> {
     let mut resolver = TextResolver::default();
     let id = DeploymentHash::new("Qmmanifest").unwrap();
 
@@ -94,12 +122,22 @@ async fn resolve_manifest(
     resolver.add("/ipfs/Qmschema", &GQL_SCHEMA);
     resolver.add("/ipfs/Qmabi", &ABI);
     resolver.add("/ipfs/Qmmapping", &MAPPING_WITH_IPFS_FUNC_WASM);
+    resolver.add("/ipfs/QmSource", &SOURCE_SUBGRAPH_MANIFEST);
+    resolver.add("/ipfs/QmSource2", &SOURCE_SUBGRAPH_MANIFEST);
+    resolver.add("/ipfs/QmSourceSchema", &SOURCE_SUBGRAPH_SCHEMA);
     resolver.add(FILE_CID, &FILE);
 
     let resolver: Arc<dyn LinkResolverTrait> = Arc::new(resolver);
 
-    let raw = serde_yaml::from_str(text).unwrap();
-    SubgraphManifest::resolve_from_raw(id, raw, &resolver, &LOGGER, max_spec_version)
+    let raw = serde_yaml::from_str(text)?;
+    Ok(SubgraphManifest::resolve_from_raw(id, raw, &resolver, &LOGGER, max_spec_version).await?)
+}
+
+async fn resolve_manifest(
+    text: &str,
+    max_spec_version: Version,
+) -> SubgraphManifest<graph_chain_ethereum::Chain> {
+    try_resolve_manifest(text, max_spec_version)
         .await
         .expect("Parsing simple manifest works")
 }
@@ -166,8 +204,160 @@ specVersion: 0.0.7
     let data_source = match &manifest.templates[0] {
         DataSourceTemplate::Offchain(ds) => ds,
         DataSourceTemplate::Onchain(_) => unreachable!(),
+        DataSourceTemplate::Subgraph(_) => unreachable!(),
     };
     assert_eq!(data_source.kind, OffchainDataSourceKind::Ipfs);
+}
+
+#[tokio::test]
+async fn subgraph_ds_manifest() {
+    let yaml = "
+schema:
+  file:
+    /: /ipfs/Qmschema
+dataSources:
+  - name: SubgraphSource
+    kind: subgraph
+    entities:
+        - Gravatar
+    network: mainnet
+    source: 
+      address: 'QmSource'
+      startBlock: 9562480
+    mapping:
+      apiVersion: 0.0.6
+      language: wasm/assemblyscript
+      entities:
+        - TestEntity
+      file:
+        /: /ipfs/Qmmapping
+      handlers:
+        - handler: handleEntity
+          entity: TestEntity
+specVersion: 1.3.0
+";
+
+    let manifest = resolve_manifest(yaml, SPEC_VERSION_1_3_0).await;
+
+    assert_eq!("Qmmanifest", manifest.id.as_str());
+    assert_eq!(manifest.data_sources.len(), 1);
+    let data_source = &manifest.data_sources[0];
+    match data_source {
+        DataSourceEnum::Subgraph(ds) => {
+            assert_eq!(ds.name, "SubgraphSource");
+            assert_eq!(ds.kind, "subgraph");
+            assert_eq!(ds.source.start_block, 9562480);
+        }
+        _ => panic!("Expected a subgraph data source"),
+    }
+}
+
+#[tokio::test]
+async fn subgraph_ds_manifest_aggregations_should_fail() {
+    let yaml = "
+schema:
+  file:
+    /: /ipfs/Qmschema
+dataSources:
+  - name: SubgraphSource
+    kind: subgraph
+    entities:
+        - Gravatar
+    network: mainnet
+    source: 
+      address: 'QmSource'
+      startBlock: 9562480
+    mapping:
+      apiVersion: 0.0.6
+      language: wasm/assemblyscript
+      entities:
+        - TestEntity
+      file:
+        /: /ipfs/Qmmapping
+      handlers:
+        - handler: handleEntity
+          entity: TokenStats # This is an aggregation and should fail
+specVersion: 1.3.0
+";
+
+    let result = try_resolve_manifest(yaml, SPEC_VERSION_1_3_0).await;
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("Entity TokenStats is an aggregation and cannot be used as a mapping entity"));
+}
+
+#[tokio::test]
+async fn multiple_subgraph_ds_manifest() {
+    let yaml = "
+schema:
+  file:
+    /: /ipfs/Qmschema
+dataSources:
+  - name: SubgraphSource1
+    kind: subgraph
+    entities:
+        - Gravatar
+    network: mainnet
+    source: 
+      address: 'QmSource'
+      startBlock: 9562480
+    mapping:
+      apiVersion: 0.0.6
+      language: wasm/assemblyscript
+      entities:
+        - TestEntity
+      file:
+        /: /ipfs/Qmmapping
+      handlers:
+        - handler: handleEntity
+          entity: User
+  - name: SubgraphSource2
+    kind: subgraph
+    entities:
+        - Profile
+    network: mainnet
+    source:
+      address: 'QmSource2'
+      startBlock: 9562500
+    mapping:
+      apiVersion: 0.0.6
+      language: wasm/assemblyscript
+      entities:
+        - TestEntity2
+      file:
+        /: /ipfs/Qmmapping
+      handlers:
+        - handler: handleProfile
+          entity: Profile
+specVersion: 1.3.0
+";
+
+    let manifest = resolve_manifest(yaml, SPEC_VERSION_1_3_0).await;
+
+    assert_eq!("Qmmanifest", manifest.id.as_str());
+    assert_eq!(manifest.data_sources.len(), 2);
+
+    // Validate first data source
+    match &manifest.data_sources[0] {
+        DataSourceEnum::Subgraph(ds) => {
+            assert_eq!(ds.name, "SubgraphSource1");
+            assert_eq!(ds.kind, "subgraph");
+            assert_eq!(ds.source.start_block, 9562480);
+        }
+        _ => panic!("Expected a subgraph data source"),
+    }
+
+    // Validate second data source
+    match &manifest.data_sources[1] {
+        DataSourceEnum::Subgraph(ds) => {
+            assert_eq!(ds.name, "SubgraphSource2");
+            assert_eq!(ds.kind, "subgraph");
+            assert_eq!(ds.source.start_block, 9562500);
+        }
+        _ => panic!("Expected a subgraph data source"),
+    }
 }
 
 #[tokio::test]
@@ -1409,6 +1599,8 @@ dataSources:
           calls:
             fake1: Factory[event.address].get(event.params.address)
             fake2: Factory[event.params.address].get(event.params.address)
+            fake3: Factory[0xDeaDbeefdEAdbeefdEadbEEFdeadbeEFdEaDbeeF].get(event.address)
+            fake4: Factory[0xDeaDbeefdEAdbeefdEadbEEFdeadbeEFdEaDbeeF].get(0xDeaDbeefdEAdbeefdEadbEEFdeadbeEFdEaDbeeF)
 ";
 
     test_store::run_test_sequentially(|store| async move {
@@ -1440,6 +1632,299 @@ dataSources:
         // For more detailed tests of parsing CallDecls see the data_soure
         // module in chain/ethereum
         let decls = &ds.mapping.event_handlers[0].calls.decls;
-        assert_eq!(2, decls.len());
+        assert_eq!(4, decls.len());
     });
+}
+
+#[test]
+fn parses_eth_call_decls_for_subgraph_datasource() {
+    const YAML: &str = "
+specVersion: 1.3.0
+schema:
+  file:
+    /: /ipfs/Qmschema
+features:
+  - ipfsOnEthereumContracts
+dataSources:
+  - kind: subgraph
+    name: Factory
+    entities:
+        - Gravatar
+    network: mainnet
+    source: 
+      address: 'QmSource'
+      startBlock: 9562480
+    mapping:
+      apiVersion: 0.0.6
+      language: wasm/assemblyscript
+      entities:
+        - TestEntity
+      file:
+        /: /ipfs/Qmmapping
+      abis:
+        - name: Factory
+          file:
+            /: /ipfs/Qmabi
+      handlers:
+        - handler: handleEntity
+          entity: User
+          calls:
+            fake1: Factory[entity.address].get(entity.user)
+            fake3: Factory[0xDeaDbeefdEAdbeefdEadbEEFdeadbeEFdEaDbeeF].get(entity.address)
+            fake4: Factory[0xDeaDbeefdEAdbeefdEadbEEFdeadbeEFdEaDbeeF].get(0xDeaDbeefdEAdbeefdEadbEEFdeadbeEFdEaDbeeF)
+";
+
+    test_store::run_test_sequentially(|store| async move {
+        let store = store.subgraph_store();
+        let unvalidated: UnvalidatedSubgraphManifest<Chain> = {
+            let mut resolver = TextResolver::default();
+            let id = DeploymentHash::new("Qmmanifest").unwrap();
+            resolver.add(id.as_str(), &YAML);
+            resolver.add("/ipfs/Qmabi", &ABI);
+            resolver.add("/ipfs/Qmschema", &GQL_SCHEMA);
+            resolver.add("/ipfs/Qmmapping", &MAPPING_WITH_IPFS_FUNC_WASM);
+            resolver.add("/ipfs/QmSource", &SOURCE_SUBGRAPH_MANIFEST);
+            resolver.add("/ipfs/QmSourceSchema", &SOURCE_SUBGRAPH_SCHEMA);
+
+            let resolver: Arc<dyn LinkResolverTrait> = Arc::new(resolver);
+
+            let raw = serde_yaml::from_str(YAML).unwrap();
+            UnvalidatedSubgraphManifest::resolve(
+                id,
+                raw,
+                &resolver,
+                &LOGGER,
+                SPEC_VERSION_1_3_0.clone(),
+            )
+            .await
+            .expect("Parsing simple manifest works")
+        };
+
+        let manifest = unvalidated.validate(store.clone(), true).await.unwrap();
+        let ds = &manifest.data_sources[0].as_subgraph().unwrap();
+        // For more detailed tests of parsing CallDecls see the data_soure
+        // module in chain/ethereum
+        let decls = &ds.mapping.handlers[0].calls.decls;
+        assert_eq!(3, decls.len());
+    });
+}
+
+#[tokio::test]
+async fn mixed_subgraph_and_onchain_ds_manifest_should_fail() {
+    let yaml = "
+schema:
+  file:
+    /: /ipfs/Qmschema
+dataSources:
+  - name: SubgraphSource
+    kind: subgraph
+    entities:
+        - User
+    network: mainnet
+    source: 
+      address: 'QmSource'
+      startBlock: 9562480
+    mapping:
+      apiVersion: 0.0.6
+      language: wasm/assemblyscript
+      entities:
+        - TestEntity
+      file:
+        /: /ipfs/Qmmapping
+      handlers:
+        - handler: handleEntity
+          entity: User
+  - kind: ethereum/contract
+    name: Gravity
+    network: mainnet
+    source:
+      address: '0x2E645469f354BB4F5c8a05B3b30A929361cf77eC'
+      abi: Gravity
+      startBlock: 1
+    mapping:
+      kind: ethereum/events
+      apiVersion: 0.0.6
+      language: wasm/assemblyscript
+      entities:
+        - Gravatar
+      abis:
+        - name: Gravity
+          file:
+            /: /ipfs/Qmabi
+      file:
+        /: /ipfs/Qmmapping
+      handlers:
+        - event: NewGravatar(uint256,address,string,string)
+          handler: handleNewGravatar
+specVersion: 1.3.0
+";
+
+    let result = try_resolve_manifest(yaml, SPEC_VERSION_1_3_0).await;
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    println!("Error: {}", err);
+    assert!(err
+        .to_string()
+        .contains("Subgraph datasources cannot be used alongside onchain datasources"));
+}
+
+#[test]
+fn nested_subgraph_ds_manifest_should_fail() {
+    let yaml = r#"
+schema:
+  file:
+    /: /ipfs/Qmschema
+dataSources:
+- name: SubgraphSource
+  kind: subgraph
+  entities:
+      - User
+  network: mainnet
+  source: 
+    address: 'QmNestedSource'
+    startBlock: 9562480
+  mapping:
+    apiVersion: 0.0.6
+    language: wasm/assemblyscript
+    entities:
+      - TestEntity
+    file:
+      /: /ipfs/Qmmapping
+    handlers:
+      - handler: handleEntity
+        entity: User
+specVersion: 1.3.0
+"#;
+
+    // First modify SOURCE_SUBGRAPH_MANIFEST to include a subgraph datasource
+    const NESTED_SOURCE_MANIFEST: &str = r#"
+schema:
+  file:
+    /: /ipfs/QmSourceSchema
+dataSources:
+- kind: subgraph
+  name: NestedSource
+  network: mainnet
+  entities:
+      - User
+  source:
+    address: 'QmSource'
+    startBlock: 1
+  mapping:
+    apiVersion: 0.0.6
+    language: wasm/assemblyscript
+    entities:
+      - User
+    file:
+      /: /ipfs/Qmmapping
+    handlers:
+      - handler: handleNested
+        entity: User
+specVersion: 1.3.0
+"#;
+
+    let mut resolver = TextResolver::default();
+    let id = DeploymentHash::new("Qmmanifest").unwrap();
+
+    resolver.add(id.as_str(), &yaml);
+    resolver.add("/ipfs/Qmabi", &ABI);
+    resolver.add("/ipfs/Qmschema", &GQL_SCHEMA);
+    resolver.add("/ipfs/Qmmapping", &MAPPING_WITH_IPFS_FUNC_WASM);
+    resolver.add("/ipfs/QmNestedSource", &NESTED_SOURCE_MANIFEST);
+    resolver.add("/ipfs/QmSource", &SOURCE_SUBGRAPH_MANIFEST);
+    resolver.add("/ipfs/QmSourceSchema", &SOURCE_SUBGRAPH_SCHEMA);
+
+    let resolver: Arc<dyn LinkResolverTrait> = Arc::new(resolver);
+
+    let raw = serde_yaml::from_str(yaml).unwrap();
+    test_store::run_test_sequentially(|_| async move {
+        let result: Result<UnvalidatedSubgraphManifest<Chain>, _> =
+            UnvalidatedSubgraphManifest::resolve(
+                id,
+                raw,
+                &resolver,
+                &LOGGER,
+                SPEC_VERSION_1_3_0.clone(),
+            )
+            .await;
+
+        match result {
+            Ok(_) => panic!("Expected resolution to fail"),
+            Err(e) => {
+                assert!(matches!(e, SubgraphManifestResolveError::ResolveError(_)));
+                let error_msg = e.to_string();
+                println!("{}", error_msg);
+                assert!(error_msg.contains("Nested subgraph data sources are not supported."));
+            }
+        }
+    })
+}
+
+#[tokio::test]
+async fn subgraph_ds_manifest_mutable_entities_should_fail() {
+    let yaml = "
+schema:
+  file:
+    /: /ipfs/Qmschema
+dataSources:
+  - name: SubgraphSource
+    kind: subgraph
+    entities:
+        - Gravatar
+    network: mainnet
+    source: 
+      address: 'QmSource'
+      startBlock: 9562480
+    mapping:
+      apiVersion: 0.0.6
+      language: wasm/assemblyscript
+      entities:
+        - TestEntity
+      file:
+        /: /ipfs/Qmmapping
+      handlers:
+        - handler: handleEntity
+          entity: MutableEntity # This is a mutable entity and should fail
+specVersion: 1.3.0
+";
+
+    let result = try_resolve_manifest(yaml, SPEC_VERSION_1_3_0).await;
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("Entity MutableEntity is not immutable and cannot be used as a mapping entity"));
+}
+
+#[tokio::test]
+async fn subgraph_ds_manifest_immutable_entities_should_succeed() {
+    let yaml = "
+schema:
+  file:
+    /: /ipfs/Qmschema
+dataSources:
+  - name: SubgraphSource
+    kind: subgraph
+    entities:
+        - Gravatar
+    network: mainnet
+    source: 
+      address: 'QmSource'
+      startBlock: 9562480
+    mapping:
+      apiVersion: 0.0.6
+      language: wasm/assemblyscript
+      entities:
+        - TestEntity
+      file:
+        /: /ipfs/Qmmapping
+      handlers:
+        - handler: handleEntity
+          entity: User # This is an immutable entity and should succeed
+specVersion: 1.3.0
+";
+
+    let result = try_resolve_manifest(yaml, SPEC_VERSION_1_3_0).await;
+
+    assert!(result.is_ok());
 }

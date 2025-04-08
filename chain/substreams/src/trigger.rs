@@ -15,8 +15,7 @@ use graph::{
     substreams::Modules,
 };
 use graph_runtime_wasm::module::ToAscPtr;
-use lazy_static::__Deref;
-use std::sync::Arc;
+use std::{collections::BTreeSet, sync::Arc};
 
 use crate::{Block, Chain, NoopDataSourceTemplate, ParsedChanges};
 
@@ -136,6 +135,18 @@ impl blockchain::TriggersAdapter<Chain> for TriggersAdapter {
         unimplemented!()
     }
 
+    async fn load_block_ptrs_by_numbers(
+        &self,
+        _logger: Logger,
+        _block_numbers: BTreeSet<BlockNumber>,
+    ) -> Result<Vec<Block>, Error> {
+        unimplemented!()
+    }
+
+    async fn chain_head_ptr(&self) -> Result<Option<BlockPtr>, Error> {
+        unimplemented!()
+    }
+
     async fn scan_triggers(
         &self,
         _from: BlockNumber,
@@ -164,18 +175,6 @@ impl blockchain::TriggersAdapter<Chain> for TriggersAdapter {
             hash: BlockHash::from(vec![0xff; 32]),
             number: block.number.saturating_sub(1),
         }))
-    }
-}
-
-fn write_poi_event(
-    proof_of_indexing: &SharedProofOfIndexing,
-    poi_event: &ProofOfIndexingEvent,
-    causality_region: &str,
-    logger: &Logger,
-) {
-    if let Some(proof_of_indexing) = proof_of_indexing {
-        let mut proof_of_indexing = proof_of_indexing.deref().borrow_mut();
-        proof_of_indexing.write(logger, causality_region, poi_event);
     }
 }
 
@@ -214,8 +213,7 @@ where
                     return Err(MappingError::Unknown(anyhow!("Detected UNSET entity operation, either a server error or there's a new type of operation and we're running an outdated protobuf")));
                 }
                 ParsedChanges::Upsert { key, entity } => {
-                    write_poi_event(
-                        proof_of_indexing,
+                    proof_of_indexing.write_event(
                         &ProofOfIndexingEvent::SetEntity {
                             entity_type: key.entity_type.typename(),
                             id: &key.entity_id.to_string(),
@@ -225,15 +223,19 @@ where
                         logger,
                     );
 
-                    state.entity_cache.set(key, entity)?;
+                    state.entity_cache.set(
+                        key,
+                        entity,
+                        block.number,
+                        Some(&mut state.write_capacity_remaining),
+                    )?;
                 }
                 ParsedChanges::Delete(entity_key) => {
                     let entity_type = entity_key.entity_type.cheap_clone();
                     let id = entity_key.entity_id.clone();
                     state.entity_cache.remove(entity_key);
 
-                    write_poi_event(
-                        proof_of_indexing,
+                    proof_of_indexing.write_event(
                         &ProofOfIndexingEvent::RemoveEntity {
                             entity_type: entity_type.typename(),
                             id: &id.to_string(),

@@ -115,6 +115,24 @@ impl PartialEq<&str> for Word {
     }
 }
 
+impl PartialEq<str> for Word {
+    fn eq(&self, other: &str) -> bool {
+        self.as_str() == other
+    }
+}
+
+impl PartialEq<String> for Word {
+    fn eq(&self, other: &String) -> bool {
+        self.as_str() == other
+    }
+}
+
+impl PartialEq<Word> for String {
+    fn eq(&self, other: &Word) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
 impl PartialEq<Word> for &str {
     fn eq(&self, other: &Word) -> bool {
         self == &other.as_str()
@@ -276,7 +294,7 @@ impl<'a> IntoIterator for &'a Object {
 impl std::fmt::Debug for Object {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_map()
-            .entries(self.0.into_iter().map(|e| {
+            .entries(self.0.iter().map(|e| {
                 (
                     e.key.as_ref().map(|w| w.as_str()).unwrap_or("---"),
                     &e.value,

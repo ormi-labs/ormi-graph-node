@@ -14,16 +14,21 @@ mod ddl_tests;
 #[cfg(test)]
 mod query_tests;
 
+pub(crate) mod dsl;
 pub(crate) mod index;
 mod prune;
 mod rollup;
+pub(crate) mod value;
 
 use diesel::deserialize::FromSql;
 use diesel::pg::Pg;
 use diesel::serialize::{Output, ToSql};
 use diesel::sql_types::Text;
 use diesel::{connection::SimpleConnection, Connection};
-use diesel::{debug_query, sql_query, OptionalExtension, PgConnection, QueryResult, RunQueryDsl};
+use diesel::{
+    debug_query, sql_query, OptionalExtension, PgConnection, QueryDsl, QueryResult, RunQueryDsl,
+};
+use graph::blockchain::block_stream::{EntityOperationKind, EntitySourceOperation};
 use graph::blockchain::BlockTime;
 use graph::cheap_clone::CheapClone;
 use graph::components::store::write::{RowGroup, WriteChunk};
@@ -46,30 +51,32 @@ use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::convert::{From, TryFrom};
 use std::fmt::{self, Write};
+use std::ops::Range;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::relational::value::{FromOidRow, OidRow};
 use crate::relational_queries::{
-    ConflictingEntitiesData, ConflictingEntitiesQuery, FindChangesQuery, FindDerivedQuery,
-    FindPossibleDeletionsQuery, ReturnedEntityData,
+    ConflictingEntitiesData, ConflictingEntitiesQuery, EntityDataExt, FindChangesQuery,
+    FindDerivedQuery, FindPossibleDeletionsQuery, ReturnedEntityData,
 };
 use crate::{
     primary::{Namespace, Site},
     relational_queries::{
         ClampRangeQuery, EntityData, EntityDeletion, FilterCollection, FilterQuery, FindManyQuery,
-        FindQuery, InsertQuery, RevertClampQuery, RevertRemoveQuery,
+        FindRangeQuery, InsertQuery, RevertClampQuery, RevertRemoveQuery,
     },
 };
-use graph::components::store::DerivedEntityQuery;
+use graph::components::store::{AttributeNames, DerivedEntityQuery};
 use graph::data::store::{Id, IdList, IdType, BYTES_SCALAR};
 use graph::data::subgraph::schema::POI_TABLE;
 use graph::prelude::{
-    anyhow, info, BlockNumber, DeploymentHash, Entity, EntityChange, EntityOperation, Logger,
-    QueryExecutionError, StoreError, StoreEvent, ValueType, BLOCK_NUMBER_MAX,
+    anyhow, info, BlockNumber, DeploymentHash, Entity, EntityOperation, Logger,
+    QueryExecutionError, StoreError, ValueType,
 };
 
-use crate::block_range::{BLOCK_COLUMN, BLOCK_RANGE_COLUMN};
+use crate::block_range::{BoundSide, BLOCK_COLUMN, BLOCK_RANGE_COLUMN};
 pub use crate::catalog::Catalog;
 use crate::connection_pool::ForeignServer;
 use crate::{catalog, deployment};
@@ -172,6 +179,12 @@ impl From<String> for SqlName {
     }
 }
 
+impl From<SqlName> for Word {
+    fn from(name: SqlName) -> Self {
+        Word::from(name.0)
+    }
+}
+
 impl fmt::Display for SqlName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(f)
@@ -181,6 +194,12 @@ impl fmt::Display for SqlName {
 impl Borrow<str> for &SqlName {
     fn borrow(&self) -> &str {
         self.as_str()
+    }
+}
+
+impl PartialEq<str> for SqlName {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other
     }
 }
 
@@ -212,8 +231,6 @@ pub struct Layout {
     pub tables: HashMap<EntityType, Arc<Table>>,
     /// The database schema for this subgraph
     pub catalog: Catalog,
-    /// The query to count all entities
-    pub count_query: String,
     /// How many blocks of history the subgraph should keep
     pub history_blocks: BlockNumber,
 
@@ -271,25 +288,6 @@ impl Layout {
             ))
         }
 
-        let count_query = tables
-            .iter()
-            .map(|table| {
-                if table.immutable {
-                    format!(
-                        "select count(*) from \"{}\".\"{}\"",
-                        &catalog.site.namespace, table.name
-                    )
-                } else {
-                    format!(
-                        "select count(*) from \"{}\".\"{}\" where block_range @> {}",
-                        &catalog.site.namespace, table.name, BLOCK_NUMBER_MAX
-                    )
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\nunion all\n");
-        let count_query = format!("select sum(e.count) from ({}) e", count_query);
-
         let tables: HashMap<_, _> = tables
             .into_iter()
             .fold(HashMap::new(), |mut tables, table| {
@@ -303,7 +301,6 @@ impl Layout {
             site,
             catalog,
             tables,
-            count_query,
             history_blocks: i32::MAX,
             input_schema: schema.cheap_clone(),
             rollups,
@@ -361,9 +358,11 @@ impl Layout {
         }
 
         let table_name = SqlName::verbatim(POI_TABLE.to_owned());
+        let nsp = catalog.site.namespace.clone();
         Table {
             object: poi_type.to_owned(),
             qualified_name: SqlName::qualified_name(&catalog.site.namespace, &table_name),
+            nsp,
             name: table_name,
             columns,
             // The position of this table in all the tables for this layout; this
@@ -374,10 +373,6 @@ impl Layout {
             immutable: false,
             has_causality_region: false,
         }
-    }
-
-    pub fn supports_proof_of_indexing(&self) -> bool {
-        self.tables.contains_key(&self.input_schema.poi_type())
     }
 
     pub fn create_relational_schema(
@@ -469,11 +464,19 @@ impl Layout {
         key: &EntityKey,
         block: BlockNumber,
     ) -> Result<Option<Entity>, StoreError> {
-        let table = self.table_for_entity(&key.entity_type)?;
-        FindQuery::new(table.as_ref(), key, block)
-            .get_result::<EntityData>(conn)
+        let table = self.table_for_entity(&key.entity_type)?.dsl_table();
+        let columns = table.selected_columns::<Entity>(&AttributeNames::All, None)?;
+
+        let query = table
+            .select_cols(&columns)
+            .filter(table.id_eq(&key.entity_id))
+            .filter(table.at_block(block))
+            .filter(table.belongs_to_causality_region(key.causality_region));
+
+        query
+            .get_result::<OidRow>(conn)
             .optional()?
-            .map(|entity_data| entity_data.deserialize_with_layout(self, None))
+            .map(|row| Entity::from_oid_row(row, &self.input_schema, &columns))
             .transpose()
     }
 
@@ -511,6 +514,143 @@ impl Layout {
                 entities.insert(key, entity_data);
             }
         }
+        Ok(entities)
+    }
+
+    pub fn find_range(
+        &self,
+        conn: &mut PgConnection,
+        entity_types: Vec<EntityType>,
+        causality_region: CausalityRegion,
+        block_range: Range<BlockNumber>,
+    ) -> Result<BTreeMap<BlockNumber, Vec<EntitySourceOperation>>, StoreError> {
+        let mut tables = vec![];
+        for et in entity_types {
+            tables.push(self.table_for_entity(&et)?.as_ref());
+        }
+        let mut entities: BTreeMap<BlockNumber, Vec<EntitySourceOperation>> = BTreeMap::new();
+
+        // Collect all entities that have their 'lower(block_range)' attribute in the
+        // interval of blocks defined by the variable block_range. For the immutable
+        // entities the respective attribute is 'block$'.
+        // Here are all entities that are created or modified in the block_range.
+        let lower_vec = FindRangeQuery::new(
+            &tables,
+            causality_region,
+            BoundSide::Lower,
+            block_range.clone(),
+        )
+        .get_results::<EntityDataExt>(conn)
+        .optional()?
+        .unwrap_or_default();
+        // Collect all entities that have their 'upper(block_range)' attribute in the
+        // interval of blocks defined by the variable block_range. For the immutable
+        // entities no entries are returned.
+        // Here are all entities that are modified or deleted in the block_range,
+        // but will have the previous versions, i.e. in the case of an update, it's
+        // the version before the update, and lower_vec will have a corresponding
+        // entry with the new version.
+        let upper_vec =
+            FindRangeQuery::new(&tables, causality_region, BoundSide::Upper, block_range)
+                .get_results::<EntityDataExt>(conn)
+                .optional()?
+                .unwrap_or_default();
+        let mut lower_iter = lower_vec.iter().fuse().peekable();
+        let mut upper_iter = upper_vec.iter().fuse().peekable();
+        let mut lower_now = lower_iter.next();
+        let mut upper_now = upper_iter.next();
+        // A closure to convert the entity data from the database into entity operation.
+        let transform = |ede: &EntityDataExt,
+                         entity_op: EntityOperationKind|
+         -> Result<(EntitySourceOperation, BlockNumber), StoreError> {
+            let e = EntityData::new(ede.entity.clone(), ede.data.clone());
+            let block = ede.block_number;
+            let entity_type = e.entity_type(&self.input_schema);
+            let entity = e.deserialize_with_layout::<Entity>(self, None)?;
+            let vid = ede.vid;
+            let ewt = EntitySourceOperation {
+                entity_op,
+                entity_type,
+                entity,
+                vid,
+            };
+            Ok((ewt, block))
+        };
+
+        fn compare_entity_data_ext(a: &EntityDataExt, b: &EntityDataExt) -> std::cmp::Ordering {
+            a.block_number
+                .cmp(&b.block_number)
+                .then_with(|| a.entity.cmp(&b.entity))
+                .then_with(|| a.id.cmp(&b.id))
+        }
+
+        // The algorithm is a similar to merge sort algorithm and it relays on the fact that both vectors
+        // are ordered by (block_number, entity_type, entity_id). It advances simultaneously entities from
+        // both lower_vec and upper_vec and tries to match entities that have entries in both vectors for
+        // a particular block. The match is successful if an entry in one array has the same values in the
+        // other one for the number of the block, entity type and the entity id. The comparison operation
+        // over the EntityDataExt implements that check. If there is a match it’s a modification operation,
+        // since both sides of a range are present for that block, entity type and id. If one side of the
+        // range exists and the other is missing it is a creation or deletion depending on which side is
+        // present. For immutable entities the entries in upper_vec are missing, hence they are considered
+        // having a lower bound at particular block and upper bound at infinity.
+        while lower_now.is_some() || upper_now.is_some() {
+            let (ewt, block) = match (lower_now, upper_now) {
+                (Some(lower), Some(upper)) => {
+                    match compare_entity_data_ext(lower, upper) {
+                        std::cmp::Ordering::Greater => {
+                            // we have upper bound at this block, but no lower bounds at the same block so it's deletion
+                            let (ewt, block) = transform(upper, EntityOperationKind::Delete)?;
+                            // advance upper_vec pointer
+                            upper_now = upper_iter.next();
+                            (ewt, block)
+                        }
+                        std::cmp::Ordering::Less => {
+                            // we have lower bound at this block but no upper bound at the same block so its creation
+                            let (ewt, block) = transform(lower, EntityOperationKind::Create)?;
+                            // advance lower_vec pointer
+                            lower_now = lower_iter.next();
+                            (ewt, block)
+                        }
+                        std::cmp::Ordering::Equal => {
+                            let (ewt, block) = transform(lower, EntityOperationKind::Modify)?;
+                            // advance both lower_vec and upper_vec pointers
+                            lower_now = lower_iter.next();
+                            upper_now = upper_iter.next();
+                            (ewt, block)
+                        }
+                    }
+                }
+                (Some(lower), None) => {
+                    // we have lower bound at this block but no upper bound at the same block so its creation
+                    let (ewt, block) = transform(lower, EntityOperationKind::Create)?;
+                    // advance lower_vec pointer
+                    lower_now = lower_iter.next();
+                    (ewt, block)
+                }
+                (None, Some(upper)) => {
+                    // we have upper bound at this block, but no lower bounds at all so it's deletion
+                    let (ewt, block) = transform(upper, EntityOperationKind::Delete)?;
+                    // advance upper_vec pointer
+                    upper_now = upper_iter.next();
+                    (ewt, block)
+                }
+                _ => panic!("Imposible case to happen"),
+            };
+
+            match entities.get_mut(&block) {
+                Some(vec) => vec.push(ewt),
+                None => {
+                    let _ = entities.insert(block, vec![ewt]);
+                }
+            };
+        }
+
+        // sort the elements in each blocks bucket by vid
+        for (_, vec) in &mut entities {
+            vec.sort_by(|a, b| a.vid.cmp(&b.vid));
+        }
+
         Ok(entities)
     }
 
@@ -860,23 +1000,25 @@ impl Layout {
         Ok(count)
     }
 
-    pub fn truncate_tables(&self, conn: &mut PgConnection) -> Result<StoreEvent, StoreError> {
+    pub fn truncate_tables(&self, conn: &mut PgConnection) -> Result<(), StoreError> {
         for table in self.tables.values() {
             sql_query(&format!("TRUNCATE TABLE {}", table.qualified_name)).execute(conn)?;
         }
-        Ok(StoreEvent::new(vec![]))
+        Ok(())
     }
 
     /// Revert the block with number `block` and all blocks with higher
     /// numbers. After this operation, only entity versions inserted or
     /// updated at blocks with numbers strictly lower than `block` will
     /// remain
+    ///
+    /// The `i32` that is returned is the amount by which the entity count
+    /// for the subgraph needs to be adjusted
     pub fn revert_block(
         &self,
         conn: &mut PgConnection,
         block: BlockNumber,
-    ) -> Result<(StoreEvent, i32), StoreError> {
-        let mut changes: Vec<EntityChange> = Vec::new();
+    ) -> Result<i32, StoreError> {
         let mut count: i32 = 0;
 
         for table in self.tables.values() {
@@ -905,23 +1047,8 @@ impl Layout {
             let deleted = removed.difference(&unclamped).count() as i32;
             let inserted = unclamped.difference(&removed).count() as i32;
             count += inserted - deleted;
-            // EntityChange for versions we just deleted
-            let deleted = removed
-                .into_iter()
-                .filter(|id| !unclamped.contains(id))
-                .map(|_| EntityChange::Data {
-                    subgraph_id: self.site.deployment.clone(),
-                    entity_type: table.object.to_string(),
-                });
-            changes.extend(deleted);
-            // EntityChange for versions that we just updated or inserted
-            let set = unclamped.into_iter().map(|_| EntityChange::Data {
-                subgraph_id: self.site.deployment.clone(),
-                entity_type: table.object.to_string(),
-            });
-            changes.extend(set);
         }
-        Ok((StoreEvent::new(changes), count))
+        Ok(count)
     }
 
     /// Revert the metadata (dynamic data sources and related entities) for
@@ -930,12 +1057,13 @@ impl Layout {
     /// For metadata, reversion always means deletion since the metadata that
     /// is subject to reversion is only ever created but never updated
     pub fn revert_metadata(
+        logger: &Logger,
         conn: &mut PgConnection,
         site: &Site,
         block: BlockNumber,
     ) -> Result<(), StoreError> {
         crate::dynds::revert(conn, site, block)?;
-        crate::deployment::revert_subgraph_errors(conn, &site.deployment, block)?;
+        crate::deployment::revert_subgraph_errors(logger, conn, &site.deployment, block)?;
 
         Ok(())
     }
@@ -1009,6 +1137,20 @@ impl Layout {
             .transpose()?
             .map(|value| BlockTime::since_epoch(value, 0));
         Ok(block_time)
+    }
+
+    /// Find the time of the last rollup for the subgraph. We do this by
+    /// looking for the maximum timestamp in any aggregation table and
+    /// adding a little bit more than the corresponding interval to it. This
+    /// method crucially depends on the fact that we always write the rollup
+    /// for all aggregations, meaning that if some aggregations do not have
+    /// an entry with the maximum timestamp that there was just no data for
+    /// that interval, but we did try to aggregate at that time.
+    pub(crate) fn last_rollup(
+        &self,
+        conn: &mut PgConnection,
+    ) -> Result<Option<BlockTime>, StoreError> {
+        Rollup::last_rollup(&self.rollups, conn)
     }
 
     /// Construct `Rolllup` for each of the aggregation mappings
@@ -1347,6 +1489,21 @@ impl Column {
         })
     }
 
+    pub fn pseudo_column(name: &str, column_type: ColumnType) -> Column {
+        let field_type = q::Type::NamedType(column_type.to_string());
+        let name = SqlName::verbatim(name.to_string());
+        let field = Word::from(name.as_str());
+        Column {
+            name,
+            field,
+            field_type,
+            column_type,
+            fulltext_fields: None,
+            is_reference: false,
+            use_prefix_comparison: false,
+        }
+    }
+
     fn new_fulltext(def: &FulltextDefinition) -> Result<Column, StoreError> {
         SqlName::check_valid_identifier(&def.name, "attribute")?;
         let sql_name = SqlName::from(def.name.as_str());
@@ -1439,6 +1596,9 @@ pub struct Table {
     /// `Stats_hour`, not the overall aggregation type `Stats`.
     pub object: EntityType,
 
+    /// The namespace in which the table lives
+    nsp: Namespace,
+
     /// The name of the database table for this type ('thing'), snakecased
     /// version of `object`
     pub name: SqlName,
@@ -1486,17 +1646,18 @@ impl Table {
         let table_name = SqlName::from(defn.as_str());
         let columns = object_type
             .fields
-            .into_iter()
+            .iter()
             .filter(|field| !field.is_derived())
             .map(|field| Column::new(schema, &table_name, field, catalog))
             .chain(fulltexts.iter().map(Column::new_fulltext))
             .collect::<Result<Vec<Column>, StoreError>>()?;
         let qualified_name = SqlName::qualified_name(&catalog.site.namespace, &table_name);
         let immutable = defn.is_immutable();
-
+        let nsp = catalog.site.namespace.clone();
         let table = Table {
             object: defn.cheap_clone(),
             name: table_name,
+            nsp,
             qualified_name,
             // Default `is_account_like` to `false`; the caller should call
             // `refresh` after constructing the layout, but that requires a
@@ -1515,6 +1676,7 @@ impl Table {
     pub fn new_like(&self, namespace: &Namespace, name: &SqlName) -> Arc<Table> {
         let other = Table {
             object: self.object.clone(),
+            nsp: namespace.clone(),
             name: name.clone(),
             qualified_name: SqlName::qualified_name(namespace, name),
             columns: self.columns.clone(),
@@ -1588,6 +1750,10 @@ impl Table {
         } else {
             &crate::block_range::BLOCK_RANGE_COLUMN_SQL
         }
+    }
+
+    pub fn dsl_table(&self) -> dsl::Table<'_> {
+        dsl::Table::new(self)
     }
 }
 

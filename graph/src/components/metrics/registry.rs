@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
+use prometheus::IntGauge;
 use prometheus::{labels, Histogram, IntCounterVec};
+use slog::debug;
 
 use crate::components::metrics::{counter_with_labels, gauge_with_labels};
 use crate::prelude::Collector;
@@ -120,52 +122,35 @@ impl MetricsRegistry {
         }
     }
 
-    pub fn register(&self, name: &str, c: Box<dyn Collector>) {
-        let err = match self.registry.register(c).err() {
-            None => {
+    /// Adds the metric to the registry.
+    ///
+    /// If the metric is a duplicate, it replaces a previous registration.
+    fn register<T>(&self, name: &str, collector: Box<T>)
+    where
+        T: Collector + Clone + 'static,
+    {
+        let logger = self.logger.new(o!("metric_name" => name.to_string()));
+        let mut result = self.registry.register(collector.clone());
+
+        if matches!(result, Err(PrometheusError::AlreadyReg)) {
+            debug!(logger, "Resolving duplicate metric registration");
+
+            // Since the current metric is a duplicate,
+            // we can use it to unregister the previous registration.
+            self.unregister(collector.clone());
+
+            result = self.registry.register(collector);
+        }
+
+        match result {
+            Ok(()) => {
                 self.registered_metrics.inc();
-                return;
             }
-            Some(err) => {
+            Err(err) => {
+                error!(logger, "Failed to register a new metric"; "error" => format!("{err:#}"));
                 self.register_errors.inc();
-                err
             }
-        };
-        match err {
-            PrometheusError::AlreadyReg => {
-                error!(
-                    self.logger,
-                    "registering metric [{}] failed because it was already registered", name,
-                );
-            }
-            PrometheusError::InconsistentCardinality { expect, got } => {
-                error!(
-                    self.logger,
-                    "registering metric [{}] failed due to inconsistent caridinality, expected = {} got = {}",
-                    name,
-                    expect,
-                    got,
-                );
-            }
-            PrometheusError::Msg(msg) => {
-                error!(
-                    self.logger,
-                    "registering metric [{}] failed because: {}", name, msg,
-                );
-            }
-            PrometheusError::Io(err) => {
-                error!(
-                    self.logger,
-                    "registering metric [{}] failed due to io error: {}", name, err,
-                );
-            }
-            PrometheusError::Protobuf(err) => {
-                error!(
-                    self.logger,
-                    "registering metric [{}] failed due to protobuf error: {}", name, err
-                );
-            }
-        };
+        }
     }
 
     pub fn global_counter(
@@ -509,6 +494,23 @@ impl MetricsRegistry {
         )?);
         self.register(name, histograms.clone());
         Ok(histograms)
+    }
+
+    pub fn new_int_gauge(
+        &self,
+        name: impl AsRef<str>,
+        help: impl AsRef<str>,
+        const_labels: impl IntoIterator<Item = (impl Into<String>, impl Into<String>)>,
+    ) -> Result<IntGauge, PrometheusError> {
+        let opts = Opts::new(name.as_ref(), help.as_ref()).const_labels(
+            const_labels
+                .into_iter()
+                .map(|(a, b)| (a.into(), b.into()))
+                .collect(),
+        );
+        let gauge = IntGauge::with_opts(opts)?;
+        self.register(name.as_ref(), Box::new(gauge.clone()));
+        Ok(gauge)
     }
 }
 

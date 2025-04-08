@@ -6,7 +6,7 @@ use crate::polling_monitor::{
 use anyhow::{self, Error};
 use bytes::Bytes;
 use graph::{
-    blockchain::{BlockTime, Blockchain},
+    blockchain::{BlockTime, Blockchain, TriggerFilterWrapper},
     components::{
         store::{DeploymentId, SubgraphFork},
         subgraph::{HostMetrics, MappingError, RuntimeHost as _, SharedProofOfIndexing},
@@ -18,7 +18,7 @@ use graph::{
         CausalityRegion, DataSource, DataSourceTemplate,
     },
     derive::CheapClone,
-    ipfs_client::CidFile,
+    ipfs::ContentPath,
     prelude::{
         BlockNumber, BlockPtr, BlockState, CancelGuard, CheapClone, DeploymentHash,
         MetricsRegistry, RuntimeHostBuilder, SubgraphCountMetric, SubgraphInstanceMetrics,
@@ -58,6 +58,10 @@ impl SubgraphKeepAlive {
             self.sg_metrics.running_count.inc();
         }
     }
+
+    pub fn contains(&self, deployment_id: &DeploymentId) -> bool {
+        self.alive_map.read().unwrap().contains_key(deployment_id)
+    }
 }
 
 // The context keeps track of mutable in-memory state that is retained across blocks.
@@ -73,7 +77,7 @@ where
     pub(crate) instance: SubgraphInstance<C, T>,
     pub instances: SubgraphKeepAlive,
     pub offchain_monitor: OffchainMonitor,
-    pub filter: Option<C::TriggerFilter>,
+    pub filter: Option<TriggerFilterWrapper<C>>,
     pub(crate) trigger_processor: Box<dyn TriggerProcessor<C, T>>,
     pub(crate) decoder: Box<Decoder<C, T>>,
 }
@@ -122,11 +126,7 @@ impl<C: Blockchain, T: RuntimeHostBuilder<C>> IndexingContext<C, T> {
     ) -> Result<BlockState, MappingError> {
         let error_count = state.deterministic_errors.len();
 
-        if let Some(proof_of_indexing) = proof_of_indexing {
-            proof_of_indexing
-                .borrow_mut()
-                .start_handler(causality_region);
-        }
+        proof_of_indexing.start_handler(causality_region);
 
         let start = Instant::now();
 
@@ -152,16 +152,12 @@ impl<C: Blockchain, T: RuntimeHostBuilder<C>> IndexingContext<C, T> {
         let elapsed = start.elapsed().as_secs_f64();
         subgraph_metrics.observe_trigger_processing_duration(elapsed);
 
-        if let Some(proof_of_indexing) = proof_of_indexing {
-            if state.deterministic_errors.len() != error_count {
-                assert!(state.deterministic_errors.len() == error_count + 1);
+        if state.deterministic_errors.len() != error_count {
+            assert!(state.deterministic_errors.len() == error_count + 1);
 
-                // If a deterministic error has happened, write a new
-                // ProofOfIndexingEvent::DeterministicError to the SharedProofOfIndexing.
-                proof_of_indexing
-                    .borrow_mut()
-                    .write_deterministic_error(logger, causality_region);
-            }
+            // If a deterministic error has happened, write a new
+            // ProofOfIndexingEvent::DeterministicError to the SharedProofOfIndexing.
+            proof_of_indexing.write_deterministic_error(logger, causality_region);
         }
 
         Ok(state)
@@ -228,8 +224,8 @@ impl<C: Blockchain, T: RuntimeHostBuilder<C>> IndexingContext<C, T> {
 }
 
 pub struct OffchainMonitor {
-    ipfs_monitor: PollingMonitor<CidFile>,
-    ipfs_monitor_rx: mpsc::UnboundedReceiver<(CidFile, Bytes)>,
+    ipfs_monitor: PollingMonitor<ContentPath>,
+    ipfs_monitor_rx: mpsc::UnboundedReceiver<(ContentPath, Bytes)>,
     arweave_monitor: PollingMonitor<Base64>,
     arweave_monitor_rx: mpsc::UnboundedReceiver<(Base64, Bytes)>,
 }

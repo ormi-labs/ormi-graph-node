@@ -1,6 +1,5 @@
 use clap::Parser as _;
 use git_testament::{git_testament, render_testament};
-use graph::components::adapter::IdentValidator;
 use graph::futures01::Future as _;
 use graph::futures03::compat::Future01CompatExt;
 use graph::futures03::future::TryFutureExt;
@@ -21,7 +20,6 @@ use graph_core::{
     SubgraphRegistrar as IpfsSubgraphRegistrar,
 };
 use graph_graphql::prelude::GraphQlRunner;
-use graph_node::chain::create_ipfs_clients;
 use graph_node::config::Config;
 use graph_node::network_setup::Networks;
 use graph_node::opt;
@@ -30,8 +28,11 @@ use graph_server_http::GraphQLServer as GraphQLQueryServer;
 use graph_server_index_node::IndexNodeServer;
 use graph_server_json_rpc::JsonRpcServer;
 use graph_server_metrics::PrometheusMetricsServer;
-use graph_server_websocket::SubscriptionServer as GraphQLSubscriptionServer;
-use graph_store_postgres::register_jobs as register_store_jobs;
+use graph_store_postgres::connection_pool::ConnectionPool;
+use graph_store_postgres::Store;
+use graph_store_postgres::{register_jobs as register_store_jobs, NotificationSender};
+use graphman_server::GraphmanServer;
+use graphman_server::GraphmanServerConfig;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::time::Duration;
@@ -140,7 +141,6 @@ async fn main() {
 
     // Obtain ports to use for the GraphQL server(s)
     let http_port = opt.http_port;
-    let ws_port = opt.ws_port;
 
     // Obtain JSON-RPC server port
     let json_rpc_port = opt.admin_port;
@@ -198,15 +198,17 @@ async fn main() {
     let logger_factory =
         LoggerFactory::new(logger.clone(), elastic_config, metrics_registry.clone());
 
-    // Try to create IPFS clients for each URL specified in `--ipfs`
-    let ipfs_clients: Vec<_> = create_ipfs_clients(&logger, &opt.ipfs);
-    let ipfs_client = ipfs_clients.first().cloned().expect("Missing IPFS client");
+    let ipfs_client = graph::ipfs::new_ipfs_client(&opt.ipfs, &logger)
+        .await
+        .unwrap_or_else(|err| panic!("Failed to create IPFS client: {err:#}"));
+
     let ipfs_service = ipfs_service(
-        ipfs_client,
+        ipfs_client.cheap_clone(),
         ENV_VARS.mappings.max_ipfs_file_bytes,
         ENV_VARS.mappings.ipfs_timeout,
         ENV_VARS.mappings.ipfs_request_limit,
     );
+
     let arweave_resolver = Arc::new(ArweaveClient::new(
         logger.cheap_clone(),
         opt.arweave
@@ -225,7 +227,7 @@ async fn main() {
 
     // Convert the clients into a link resolver. Since we want to get past
     // possible temporary DNS failures, make the resolver retry
-    let link_resolver = Arc::new(IpfsResolver::new(ipfs_clients, env_vars.cheap_clone()));
+    let link_resolver = Arc::new(IpfsResolver::new(ipfs_client, env_vars.cheap_clone()));
     let metrics_server = PrometheusMetricsServer::new(&logger_factory, prometheus_registry.clone());
 
     let endpoint_metrics = Arc::new(EndpointMetrics::new(
@@ -251,20 +253,48 @@ async fn main() {
     )
     .await;
 
-    let launch_services = |logger: Logger, env_vars: Arc<EnvVars>| async move {
-        let subscription_manager = store_builder.subscription_manager();
-        let chain_head_update_listener = store_builder.chain_head_update_listener();
-        let primary_pool = store_builder.primary_pool();
+    let primary_pool = store_builder.primary_pool();
+    let subscription_manager = store_builder.subscription_manager();
+    let chain_head_update_listener = store_builder.chain_head_update_listener();
+    let network_store = store_builder.network_store(config.chain_ids());
 
-        let network_store = store_builder.network_store(config.chain_ids());
+    let graphman_server_config = make_graphman_server_config(
+        primary_pool.clone(),
+        network_store.cheap_clone(),
+        metrics_registry.cheap_clone(),
+        &env_vars,
+        &logger,
+        &logger_factory,
+    );
+
+    start_graphman_server(opt.graphman_port, graphman_server_config).await;
+
+    let launch_services = |logger: Logger, env_vars: Arc<EnvVars>| async move {
+        use graph::components::network_provider;
+
         let block_store = network_store.block_store();
-        let validator: Arc<dyn IdentValidator> = network_store.block_store();
+
+        let mut provider_checks: Vec<Arc<dyn network_provider::ProviderCheck>> = Vec::new();
+
+        if env_vars.genesis_validation_enabled {
+            provider_checks.push(Arc::new(network_provider::GenesisHashCheck::new(
+                block_store.clone(),
+            )));
+        }
+
+        provider_checks.push(Arc::new(network_provider::ExtendedBlocksCheck::new(
+            env_vars
+                .firehose_disable_extended_blocks_for_chains
+                .iter()
+                .map(|x| x.as_str().into()),
+        )));
+
         let network_adapters = Networks::from_config(
             logger.cheap_clone(),
             &config,
             metrics_registry.cheap_clone(),
             endpoint_metrics,
-            validator,
+            &provider_checks,
         )
         .await
         .expect("unable to parse network configuration");
@@ -325,13 +355,10 @@ async fn main() {
         let graphql_runner = Arc::new(GraphQlRunner::new(
             &logger,
             network_store.clone(),
-            subscription_manager.clone(),
             load_manager,
             graphql_metrics_registry,
         ));
         let graphql_server = GraphQLQueryServer::new(&logger_factory, graphql_runner.clone());
-        let subscription_server =
-            GraphQLSubscriptionServer::new(&logger, graphql_runner.clone(), network_store.clone());
 
         let index_node_server = IndexNodeServer::new(
             &logger_factory,
@@ -414,7 +441,6 @@ async fn main() {
         let json_rpc_server = JsonRpcServer::serve(
             json_rpc_port,
             http_port,
-            ws_port,
             subgraph_registrar.clone(),
             node_id.clone(),
             logger.clone(),
@@ -476,10 +502,7 @@ async fn main() {
         }
 
         // Serve GraphQL queries over HTTP
-        graph::spawn(async move { graphql_server.start(http_port, ws_port).await });
-
-        // Serve GraphQL subscriptions over WebSockets
-        graph::spawn(subscription_server.serve(ws_port));
+        graph::spawn(async move { graphql_server.start(http_port).await });
 
         // Run the index node server
         graph::spawn(async move { index_node_server.start(index_node_port).await });
@@ -528,4 +551,46 @@ async fn main() {
     });
 
     graph::futures03::future::pending::<()>().await;
+}
+
+async fn start_graphman_server(port: u16, config: Option<GraphmanServerConfig<'_>>) {
+    let Some(config) = config else {
+        return;
+    };
+
+    let server = GraphmanServer::new(config)
+        .unwrap_or_else(|err| panic!("Invalid graphman server configuration: {err:#}"));
+
+    server
+        .start(port)
+        .await
+        .unwrap_or_else(|err| panic!("Failed to start graphman server: {err:#}"));
+}
+
+fn make_graphman_server_config<'a>(
+    pool: ConnectionPool,
+    store: Arc<Store>,
+    metrics_registry: Arc<MetricsRegistry>,
+    env_vars: &EnvVars,
+    logger: &Logger,
+    logger_factory: &'a LoggerFactory,
+) -> Option<GraphmanServerConfig<'a>> {
+    let Some(auth_token) = &env_vars.graphman_server_auth_token else {
+        warn!(
+            logger,
+            "Missing graphman server auth token; graphman server will not start",
+        );
+
+        return None;
+    };
+
+    let notification_sender = Arc::new(NotificationSender::new(metrics_registry.clone()));
+
+    Some(GraphmanServerConfig {
+        pool,
+        notification_sender,
+        store,
+        logger_factory,
+        auth_token: auth_token.to_owned(),
+    })
 }

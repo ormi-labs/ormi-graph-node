@@ -1,4 +1,4 @@
-use std::{fmt::Write, sync::Arc, time::Instant};
+use std::{collections::HashMap, fmt::Write, sync::Arc};
 
 use diesel::{
     connection::SimpleConnection,
@@ -18,50 +18,15 @@ use graph::{
 use itertools::Itertools;
 
 use crate::{
-    catalog,
-    copy::AdaptiveBatchSize,
-    deployment,
+    catalog, deployment,
     relational::{Table, VID_COLUMN},
+    vid_batcher::{VidBatcher, VidRange},
 };
 
-use super::{Catalog, Layout, Namespace};
-
-// Additions to `Table` that are useful for pruning
-impl Table {
-    /// Return the first and last vid of any entity that is visible in the
-    /// block range from `first_block` (inclusive) to `last_block`
-    /// (exclusive)
-    fn vid_range(
-        &self,
-        conn: &mut PgConnection,
-        first_block: BlockNumber,
-        last_block: BlockNumber,
-    ) -> Result<(i64, i64), StoreError> {
-        #[derive(QueryableByName)]
-        struct VidRange {
-            #[diesel(sql_type = BigInt)]
-            min_vid: i64,
-            #[diesel(sql_type = BigInt)]
-            max_vid: i64,
-        }
-
-        // Determine the last vid that we need to copy
-        let VidRange { min_vid, max_vid } = sql_query(format!(
-            "/* controller=prune,first={first_block},last={last_block} */ \
-                     select coalesce(min(vid), 0) as min_vid, \
-                            coalesce(max(vid), -1) as max_vid from {src} \
-                      where lower(block_range) <= $2 \
-                        and coalesce(upper(block_range), 2147483647) > $1 \
-                        and coalesce(upper(block_range), 2147483647) <= $2 \
-                        and block_range && int4range($1, $2)",
-            src = self.qualified_name,
-        ))
-        .bind::<Integer, _>(first_block)
-        .bind::<Integer, _>(last_block)
-        .get_result::<VidRange>(conn)?;
-        Ok((min_vid, max_vid))
-    }
-}
+use super::{
+    index::{load_indexes_from_table, CreateIndex, IndexList},
+    Catalog, Layout, Namespace,
+};
 
 /// Utility to copy relevant data out of a source table and into a new
 /// destination table and replace the source table with the destination
@@ -94,9 +59,18 @@ impl TablePair {
         if catalog::table_exists(conn, dst_nsp.as_str(), &dst.name)? {
             writeln!(query, "truncate table {};", dst.qualified_name)?;
         } else {
+            let mut list = IndexList {
+                indexes: HashMap::new(),
+            };
+            let indexes = load_indexes_from_table(conn, &src, src_nsp.as_str())?
+                .into_iter()
+                .map(|index| index.with_nsp(dst_nsp.to_string()))
+                .collect::<Result<Vec<CreateIndex>, _>>()?;
+            list.indexes.insert(src.name.to_string(), indexes);
+
             // In case of pruning we don't do delayed creation of indexes,
             // as the asumption is that there is not that much data inserted.
-            dst.as_ddl(schema, catalog, None, &mut query)?;
+            dst.as_ddl(schema, catalog, Some(&list), &mut query)?;
         }
         conn.batch_execute(&query)?;
 
@@ -123,52 +97,48 @@ impl TablePair {
         let column_list = self.column_list();
 
         // Determine the last vid that we need to copy
-        let (min_vid, max_vid) = self.src.vid_range(conn, earliest_block, final_block)?;
+        let range = VidRange::for_prune(conn, &self.src, earliest_block, final_block)?;
+        let mut batcher = VidBatcher::load(conn, &self.src_nsp, &self.src, range)?;
 
-        let mut batch_size = AdaptiveBatchSize::new(&self.src);
-        // The first vid we still need to copy
-        let mut next_vid = min_vid;
-        while next_vid <= max_vid {
-            let start = Instant::now();
-            let rows = conn.transaction(|conn| {
-                // Page through all rows in `src` in batches of `batch_size`
-                // and copy the ones that are visible to queries at block
-                // heights between `earliest_block` and `final_block`, but
-                // whose block_range does not extend past `final_block`
-                // since they could still be reverted while we copy.
-                // The conditions on `block_range` are expressed redundantly
-                // to make more indexes useable
-                sql_query(format!(
-                    "/* controller=prune,phase=final,start_vid={next_vid},batch_size={batch_size} */ \
+        while !batcher.finished() {
+            let (_, rows) = batcher.step(|start, end| {
+                conn.transaction(|conn| {
+                    // Page through all rows in `src` in batches of `batch_size`
+                    // and copy the ones that are visible to queries at block
+                    // heights between `earliest_block` and `final_block`, but
+                    // whose block_range does not extend past `final_block`
+                    // since they could still be reverted while we copy.
+                    // The conditions on `block_range` are expressed redundantly
+                    // to make more indexes useable
+                    sql_query(format!(
+                    "/* controller=prune,phase=final,start_vid={start},batch_size={batch_size} */ \
                      insert into {dst}({column_list}) \
                      select {column_list} from {src} \
                       where lower(block_range) <= $2 \
                         and coalesce(upper(block_range), 2147483647) > $1 \
                         and coalesce(upper(block_range), 2147483647) <= $2 \
                         and block_range && int4range($1, $2, '[]') \
-                        and vid >= $3 and vid < $3 + $4 \
+                        and vid >= $3 and vid <= $4 \
                       order by vid",
                     src = self.src.qualified_name,
                     dst = self.dst.qualified_name,
-                    batch_size = batch_size.size,
+                    batch_size = end - start + 1,
                 ))
-                .bind::<Integer, _>(earliest_block)
-                .bind::<Integer, _>(final_block)
-                .bind::<BigInt, _>(next_vid)
-                .bind::<BigInt, _>(&batch_size)
-                .execute(conn)
+                    .bind::<Integer, _>(earliest_block)
+                    .bind::<Integer, _>(final_block)
+                    .bind::<BigInt, _>(start)
+                    .bind::<BigInt, _>(end)
+                    .execute(conn)
+                    .map_err(StoreError::from)
+                })
             })?;
             cancel.check_cancel()?;
 
-            next_vid += batch_size.size;
-
-            batch_size.adapt(start.elapsed());
-
             reporter.prune_batch(
                 self.src.name.as_str(),
-                rows,
+                rows.unwrap_or(0),
                 PrunePhase::CopyFinal,
-                next_vid > max_vid,
+                batcher.finished(),
             );
         }
         Ok(())
@@ -186,49 +156,42 @@ impl TablePair {
         let column_list = self.column_list();
 
         // Determine the last vid that we need to copy
-        let (min_vid, max_vid) = self
-            .src
-            .vid_range(conn, final_block + 1, BLOCK_NUMBER_MAX)?;
+        let range = VidRange::for_prune(conn, &self.src, final_block + 1, BLOCK_NUMBER_MAX)?;
+        let mut batcher = VidBatcher::load(conn, &self.src.nsp, &self.src, range)?;
 
-        let mut batch_size = AdaptiveBatchSize::new(&self.src);
-        // The first vid we still need to copy
-        let mut next_vid = min_vid;
-        while next_vid <= max_vid {
-            let start = Instant::now();
-            let rows = conn.transaction(|conn| {
+        while !batcher.finished() {
+            let (_, rows) = batcher.step(|start, end| {
                 // Page through all the rows in `src` in batches of
                 // `batch_size` that are visible to queries at block heights
-                // starting right after `final_block`.
-                // The conditions on `block_range` are expressed redundantly
-                // to make more indexes useable
-                sql_query(format!(
-                    "/* controller=prune,phase=nonfinal,start_vid={next_vid},batch_size={batch_size} */ \
+                // starting right after `final_block`. The conditions on
+                // `block_range` are expressed redundantly to make more
+                // indexes useable
+                conn.transaction(|conn| {
+                    sql_query(format!(
+                        "/* controller=prune,phase=nonfinal,start_vid={start},batch_size={batch_size} */ \
                      insert into {dst}({column_list}) \
                      select {column_list} from {src} \
                       where coalesce(upper(block_range), 2147483647) > $1 \
                         and block_range && int4range($1, null) \
-                        and vid >= $2 and vid < $2 + $3 \
+                        and vid >= $2 and vid <= $3 \
                       order by vid",
-                    dst = self.dst.qualified_name,
-                    src = self.src.qualified_name,
-                    batch_size = batch_size.size
-                ))
-                .bind::<Integer, _>(final_block)
-                .bind::<BigInt, _>(next_vid)
-                .bind::<BigInt, _>(&batch_size)
-                .execute(conn)
-                .map_err(StoreError::from)
+                        dst = self.dst.qualified_name,
+                        src = self.src.qualified_name,
+                        batch_size = end - start + 1,
+                    ))
+                    .bind::<Integer, _>(final_block)
+                    .bind::<BigInt, _>(start)
+                    .bind::<BigInt, _>(end)
+                    .execute(conn)
+                    .map_err(StoreError::from)
+                })
             })?;
-
-            next_vid += batch_size.size;
-
-            batch_size.adapt(start.elapsed());
 
             reporter.prune_batch(
                 self.src.name.as_str(),
-                rows,
+                rows.unwrap_or(0),
                 PrunePhase::CopyNonfinal,
-                next_vid > max_vid,
+                batcher.finished(),
             );
         }
         Ok(())
@@ -252,12 +215,14 @@ impl TablePair {
                   "src" => src_nsp.as_str(), "error" => e.to_string());
         }
 
-        // Make sure the vid sequence
-        // continues from where it was
-        writeln!(
-            query,
-            "select setval('{dst_nsp}.{vid_seq}', nextval('{src_nsp}.{vid_seq}'));"
-        )?;
+        // Make sure the vid sequence continues from where it was in case
+        // that we use autoincrementing order of the DB
+        if !self.src.object.has_vid_seq() {
+            writeln!(
+                query,
+                "select setval('{dst_nsp}.{vid_seq}', nextval('{src_nsp}.{vid_seq}'));"
+            )?;
+        }
 
         writeln!(query, "drop table {src_qname};")?;
         writeln!(query, "alter table {dst_qname} set schema {src_nsp}")?;
@@ -458,33 +423,28 @@ impl Layout {
                 PruningStrategy::Delete => {
                     // Delete all entity versions whose range was closed
                     // before `req.earliest_block`
-                    let (min_vid, max_vid) = table.vid_range(conn, 0, req.earliest_block)?;
-                    let mut batch_size = AdaptiveBatchSize::new(&table);
-                    let mut next_vid = min_vid;
-                    while next_vid <= max_vid {
-                        let start = Instant::now();
-                        let rows = sql_query(format!(
-                            "/* controller=prune,phase=delete,start_vid={next_vid},batch_size={batch_size} */ \
+                    let range = VidRange::for_prune(conn, &table, 0, req.earliest_block)?;
+                    let mut batcher = VidBatcher::load(conn, &self.site.namespace, &table, range)?;
+
+                    while !batcher.finished() {
+                        let (_, rows) = batcher.step(|start, end| {sql_query(format!(
+                            "/* controller=prune,phase=delete,start_vid={start},batch_size={batch_size} */ \
                              delete from {qname} \
                                           where coalesce(upper(block_range), 2147483647) <= $1 \
-                                            and vid >= $2 and vid < $2 + $3",
+                                            and vid >= $2 and vid <= $3",
                             qname = table.qualified_name,
-                            batch_size = batch_size.size
+                            batch_size = end - start + 1
                         ))
                         .bind::<Integer, _>(req.earliest_block)
-                        .bind::<BigInt, _>(next_vid)
-                        .bind::<BigInt, _>(&batch_size)
-                        .execute(conn)?;
-
-                        next_vid += batch_size.size;
-
-                        batch_size.adapt(start.elapsed());
+                        .bind::<BigInt, _>(start)
+                        .bind::<BigInt, _>(end)
+                        .execute(conn).map_err(StoreError::from)})?;
 
                         reporter.prune_batch(
                             table.name.as_str(),
-                            rows as usize,
+                            rows.unwrap_or(0),
                             PrunePhase::Delete,
-                            next_vid > max_vid,
+                            batcher.finished(),
                         );
                     }
                 }

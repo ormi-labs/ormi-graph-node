@@ -1,11 +1,12 @@
 use std::collections::BTreeSet;
-use std::ops::Deref;
+use std::ops::{Deref, Range};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, RwLock, TryLockError as RwLockError};
 use std::time::Instant;
 use std::{collections::BTreeMap, sync::Arc};
 
-use graph::blockchain::block_stream::FirehoseCursor;
+use async_trait::async_trait;
+use graph::blockchain::block_stream::{EntitySourceOperation, FirehoseCursor};
 use graph::blockchain::BlockTime;
 use graph::components::store::{Batch, DeploymentCursorTracker, DerivedEntityQuery, ReadStore};
 use graph::constraint_violation;
@@ -17,7 +18,7 @@ use graph::prelude::{
     SubgraphStore as _, BLOCK_NUMBER_MAX,
 };
 use graph::schema::{EntityKey, EntityType, InputSchema};
-use graph::slog::{info, warn};
+use graph::slog::{debug, info, warn};
 use graph::tokio::select;
 use graph::tokio::sync::Notify;
 use graph::tokio::task::JoinHandle;
@@ -189,19 +190,6 @@ impl SyncStore {
             last_rollup,
         })
     }
-
-    /// Try to send a `StoreEvent`; if sending fails, log the error but
-    /// return `Ok(())`
-    fn try_send_store_event(&self, event: StoreEvent) -> Result<(), StoreError> {
-        if !ENV_VARS.store.disable_subscription_notifications {
-            let _ = self.store.send_store_event(&event).map_err(
-                |e| error!(self.logger, "Could not send store event"; "error" => e.to_string()),
-            );
-            Ok(())
-        } else {
-            Ok(())
-        }
-    }
 }
 
 // Methods that mirror `WritableStoreTrait`
@@ -232,8 +220,10 @@ impl SyncStore {
                 }
                 None => None,
             };
-            self.writable
-                .start_subgraph(logger, self.site.clone(), graft_base)?;
+            graph::block_on(
+                self.writable
+                    .start_subgraph(logger, self.site.clone(), graft_base),
+            )?;
             self.store.primary_conn()?.copy_finished(self.site.as_ref())
         })
     }
@@ -244,7 +234,7 @@ impl SyncStore {
         firehose_cursor: &FirehoseCursor,
     ) -> Result<(), StoreError> {
         retry::forever(&self.logger, "revert_block_operations", || {
-            let event = self.writable.revert_block_operations(
+            self.writable.revert_block_operations(
                 self.site.clone(),
                 block_ptr_to.clone(),
                 firehose_cursor,
@@ -253,9 +243,7 @@ impl SyncStore {
             let block_time = self
                 .writable
                 .block_time(self.site.cheap_clone(), block_ptr_to.number)?;
-            self.last_rollup.set(block_time)?;
-
-            self.try_send_store_event(event)
+            self.last_rollup.set(block_time)
         })
     }
 
@@ -293,15 +281,6 @@ impl SyncStore {
         .await
     }
 
-    async fn supports_proof_of_indexing(&self) -> Result<bool, StoreError> {
-        retry::forever_async(&self.logger, "supports_proof_of_indexing", || async {
-            self.writable
-                .supports_proof_of_indexing(self.site.clone())
-                .await
-        })
-        .await
-    }
-
     fn get(&self, key: &EntityKey, block: BlockNumber) -> Result<Option<Entity>, StoreError> {
         retry::forever(&self.logger, "get", || {
             self.writable.get(self.site.cheap_clone(), key, block)
@@ -314,7 +293,7 @@ impl SyncStore {
         stopwatch: &StopwatchMetrics,
     ) -> Result<(), StoreError> {
         retry::forever(&self.logger, "transact_block_operations", move || {
-            let event = self.writable.transact_block_operations(
+            self.writable.transact_block_operations(
                 &self.logger,
                 self.site.clone(),
                 batch,
@@ -325,9 +304,6 @@ impl SyncStore {
             // unwrap: batch.block_times is never empty
             let last_block_time = batch.block_times.last().unwrap().1;
             self.last_rollup.set(Some(last_block_time))?;
-
-            let _section = stopwatch.start_section("send_store_event");
-            self.try_send_store_event(event)?;
             Ok(())
         })
     }
@@ -420,7 +396,7 @@ impl SyncStore {
         }
     }
 
-    fn deployment_synced(&self) -> Result<(), StoreError> {
+    fn deployment_synced(&self, block_ptr: BlockPtr) -> Result<(), StoreError> {
         retry::forever(&self.logger, "deployment_synced", || {
             let event = {
                 // Make sure we drop `pconn` before we call into the deployment
@@ -452,7 +428,8 @@ impl SyncStore {
                 }
             }
 
-            self.writable.deployment_synced(&self.site.deployment)?;
+            self.writable
+                .deployment_synced(&self.site.deployment, block_ptr.clone())?;
 
             self.store.send_store_event(&event)
         })
@@ -935,6 +912,7 @@ impl Queue {
                         // Graceful shutdown. We also handled the request
                         // successfully
                         queue.queue.pop().await;
+                        debug!(logger, "Subgraph writer has processed a stop request");
                         return;
                     }
                     Ok(Err(e)) => {
@@ -1569,6 +1547,47 @@ impl ReadStore for WritableStore {
     }
 }
 
+pub struct SourceableStore {
+    site: Arc<Site>,
+    store: Arc<DeploymentStore>,
+    input_schema: InputSchema,
+}
+
+impl SourceableStore {
+    pub fn new(site: Arc<Site>, store: Arc<DeploymentStore>, input_schema: InputSchema) -> Self {
+        Self {
+            site,
+            store,
+            input_schema,
+        }
+    }
+}
+
+#[async_trait]
+impl store::SourceableStore for SourceableStore {
+    fn get_range(
+        &self,
+        entity_types: Vec<EntityType>,
+        causality_region: CausalityRegion,
+        block_range: Range<BlockNumber>,
+    ) -> Result<BTreeMap<BlockNumber, Vec<EntitySourceOperation>>, StoreError> {
+        self.store.get_range(
+            self.site.clone(),
+            entity_types,
+            causality_region,
+            block_range,
+        )
+    }
+
+    fn input_schema(&self) -> InputSchema {
+        self.input_schema.cheap_clone()
+    }
+
+    async fn block_ptr(&self) -> Result<Option<BlockPtr>, StoreError> {
+        self.store.block_ptr(self.site.cheap_clone()).await
+    }
+}
+
 impl DeploymentCursorTracker for WritableStore {
     fn block_ptr(&self) -> Option<BlockPtr> {
         self.block_ptr.lock().unwrap().clone()
@@ -1641,10 +1660,6 @@ impl WritableStoreTrait for WritableStore {
         self.store.fail_subgraph(error).await
     }
 
-    async fn supports_proof_of_indexing(&self) -> Result<bool, StoreError> {
-        self.store.supports_proof_of_indexing().await
-    }
-
     async fn transact_block_operations(
         &self,
         block_ptr_to: BlockPtr,
@@ -1659,7 +1674,7 @@ impl WritableStoreTrait for WritableStore {
         is_caught_up_with_chain_head: bool,
     ) -> Result<(), StoreError> {
         if is_caught_up_with_chain_head {
-            self.deployment_synced()?;
+            self.deployment_synced(block_ptr_to.clone())?;
         } else {
             self.writer.start_batching();
         }
@@ -1696,10 +1711,10 @@ impl WritableStoreTrait for WritableStore {
     /// - Disable the time-to-sync metrics gathering.
     /// - Stop batching writes.
     /// - Promote it to 'synced' status in the DB, if that hasn't been done already.
-    fn deployment_synced(&self) -> Result<(), StoreError> {
+    fn deployment_synced(&self, block_ptr: BlockPtr) -> Result<(), StoreError> {
         self.writer.deployment_synced();
         if !self.is_deployment_synced.load(Ordering::SeqCst) {
-            self.store.deployment_synced()?;
+            self.store.deployment_synced(block_ptr)?;
             self.is_deployment_synced.store(true, Ordering::SeqCst);
         }
         Ok(())

@@ -136,7 +136,7 @@ where
 async fn insert_test_data(store: Arc<DieselSubgraphStore>) -> DeploymentLocator {
     let manifest = SubgraphManifest::<graph_chain_ethereum::Chain> {
         id: TEST_SUBGRAPH_ID.clone(),
-        spec_version: Version::new(1, 0, 0),
+        spec_version: Version::new(1, 3, 0),
         features: Default::default(),
         description: None,
         repository: None,
@@ -175,6 +175,7 @@ async fn insert_test_data(store: Arc<DieselSubgraphStore>) -> DeploymentLocator 
         184.4,
         false,
         None,
+        0,
     );
     transact_entity_operations(&store, &deployment, BLOCKS[0].clone(), vec![test_entity_1])
         .await
@@ -189,6 +190,7 @@ async fn insert_test_data(store: Arc<DieselSubgraphStore>) -> DeploymentLocator 
         159.1,
         true,
         Some("red"),
+        1,
     );
     let test_entity_3_1 = create_test_entity(
         "3",
@@ -199,6 +201,7 @@ async fn insert_test_data(store: Arc<DieselSubgraphStore>) -> DeploymentLocator 
         111.7,
         false,
         Some("blue"),
+        2,
     );
     transact_entity_operations(
         &store,
@@ -218,6 +221,7 @@ async fn insert_test_data(store: Arc<DieselSubgraphStore>) -> DeploymentLocator 
         111.7,
         false,
         None,
+        3,
     );
     transact_entity_operations(
         &store,
@@ -241,6 +245,7 @@ fn create_test_entity(
     weight: f64,
     coffee: bool,
     favorite_color: Option<&str>,
+    vid: i64,
 ) -> EntityOperation {
     let bin_name = scalar::Bytes::from_str(&hex::encode(name)).unwrap();
     let test_entity = entity! { TEST_SUBGRAPH_SCHEMA =>
@@ -252,7 +257,8 @@ fn create_test_entity(
         seconds_age: age * 31557600,
         weight: Value::BigDecimal(weight.into()),
         coffee: coffee,
-        favorite_color: favorite_color
+        favorite_color: favorite_color,
+        vid: vid,
     };
 
     let entity_type = TEST_SUBGRAPH_SCHEMA.entity_type(entity_type).unwrap();
@@ -324,6 +330,7 @@ async fn check_graft(
 
     // Make our own entries for block 2
     shaq.set("email", "shaq@gmail.com").unwrap();
+    let _ = shaq.set_vid(3);
     let op = EntityOperation::Set {
         key: user_type.parse_key("3").unwrap(),
         data: shaq,
@@ -482,7 +489,7 @@ fn on_sync() {
                     .await?;
 
                 writable.start_subgraph_deployment(&LOGGER).await?;
-                writable.deployment_synced()?;
+                writable.deployment_synced(BLOCKS[0].clone())?;
 
                 let mut primary = primary_connection();
                 let src_site = primary.locate_site(src)?.unwrap();
@@ -539,7 +546,7 @@ fn on_sync() {
             store.activate(&dst)?;
             store.remove_deployment(src.id.into())?;
 
-            let res = writable.deployment_synced();
+            let res = writable.deployment_synced(BLOCKS[2].clone());
             assert!(res.is_ok());
         }
         Ok(())
@@ -601,6 +608,7 @@ fn prune() {
                 157.1,
                 true,
                 Some("red"),
+                4,
             );
             transact_and_wait(&store, &src, BLOCKS[5].clone(), vec![user2])
                 .await

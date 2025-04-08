@@ -2,7 +2,9 @@ use clap::{Parser, Subcommand};
 use config::PoolSize;
 use git_testament::{git_testament, render_testament};
 use graph::bail;
+use graph::blockchain::BlockHash;
 use graph::cheap_clone::CheapClone;
+use graph::components::network_provider::ChainName;
 use graph::endpoint::EndpointMetrics;
 use graph::env::ENV_VARS;
 use graph::log::logger_with_levels;
@@ -10,7 +12,7 @@ use graph::prelude::{MetricsRegistry, BLOCK_NUMBER_MAX};
 use graph::{data::graphql::load_manager::LoadManager, prelude::chrono, prometheus::Registry};
 use graph::{
     prelude::{
-        anyhow::{self, Context as AnyhowContextTrait},
+        anyhow::{self, anyhow, Context as AnyhowContextTrait},
         info, tokio, Logger, NodeId,
     },
     url::Url,
@@ -22,9 +24,7 @@ use graph_node::manager::color::Terminal;
 use graph_node::manager::commands;
 use graph_node::network_setup::Networks;
 use graph_node::{
-    manager::{deployment::DeploymentSearch, PanicSubscriptionManager},
-    store_builder::StoreBuilder,
-    MetricsContext,
+    manager::deployment::DeploymentSearch, store_builder::StoreBuilder, MetricsContext,
 };
 use graph_store_postgres::connection_pool::PoolCoordinator;
 use graph_store_postgres::ChainStore;
@@ -32,7 +32,10 @@ use graph_store_postgres::{
     connection_pool::ConnectionPool, BlockStore, NotificationSender, Shard, Store, SubgraphStore,
     SubscriptionManager, PRIMARY_SHARD,
 };
+use itertools::Itertools;
 use lazy_static::lazy_static;
+use std::env;
+use std::str::FromStr;
 use std::{collections::HashMap, num::ParseIntError, sync::Arc, time::Duration};
 const VERSION_LABEL_KEY: &str = "version";
 
@@ -139,6 +142,12 @@ pub enum Command {
         /// List only used (current and pending) versions
         #[clap(long, short)]
         used: bool,
+        /// List names only for the active deployment
+        #[clap(long, short)]
+        brief: bool,
+        /// Do not print subgraph names
+        #[clap(long, short = 'N')]
+        no_name: bool,
     },
     /// Manage unused deployments
     ///
@@ -178,10 +187,10 @@ pub enum Command {
         /// The deployment (see `help info`)
         deployment: DeploymentSearch,
     },
-    /// Pause and resume a deployment
+    /// Pause and resume one or multiple deployments
     Restart {
-        /// The deployment (see `help info`)
-        deployment: DeploymentSearch,
+        /// The deployment(s) (see `help info`)
+        deployments: Vec<DeploymentSearch>,
         /// Sleep for this many seconds after pausing subgraphs
         #[clap(
             long,
@@ -347,7 +356,7 @@ pub enum Command {
         force: bool,
     },
 
-    // Deploy a subgraph
+    /// Deploy a subgraph
     Deploy {
         name: DeploymentSearch,
         deployment: DeploymentSearch,
@@ -435,6 +444,15 @@ pub enum ConfigCommand {
         features: String,
         network: String,
     },
+
+    /// Run all available provider checks against all providers.
+    CheckProviders {
+        /// Maximum duration of all provider checks for a provider.
+        ///
+        /// Defaults to 60 seconds.
+        timeout_seconds: Option<u64>,
+    },
+
     /// Show subgraph-specific settings
     ///
     /// GRAPH_EXPERIMENTAL_SUBGRAPH_SETTINGS can add a file that contains
@@ -450,14 +468,8 @@ pub enum ConfigCommand {
 pub enum ListenCommand {
     /// Listen only to assignment events
     Assignments,
-    /// Listen to events for entities in a specific deployment
-    Entities {
-        /// The deployment (see `help info`).
-        deployment: DeploymentSearch,
-        /// The entity types for which to print change notifications
-        entity_types: Vec<String>,
-    },
 }
+
 #[derive(Clone, Debug, Subcommand)]
 pub enum CopyCommand {
     /// Create a copy of an existing subgraph
@@ -545,6 +557,16 @@ pub enum ChainCommand {
         /// Skips confirmation prompt
         #[clap(long, short)]
         force: bool,
+    },
+
+    /// Update the genesis block hash for a chain
+    UpdateGenesis {
+        #[clap(long, short)]
+        force: bool,
+        #[clap(value_parser = clap::builder::NonEmptyStringValueParser::new())]
+        block_hash: String,
+        #[clap(value_parser = clap::builder::NonEmptyStringValueParser::new())]
+        chain_name: String,
     },
 
     /// Change the block cache shard for a chain
@@ -876,7 +898,7 @@ impl Context {
 
     fn primary_pool(self) -> ConnectionPool {
         let primary = self.config.primary_store();
-        let coord = Arc::new(PoolCoordinator::new(Arc::new(vec![])));
+        let coord = Arc::new(PoolCoordinator::new(&self.logger, Arc::new(vec![])));
         let pool = StoreBuilder::main_pool(
             &self.logger,
             &self.node_id,
@@ -901,13 +923,6 @@ impl Context {
             primary.connection.clone(),
             self.registry.clone(),
         ))
-    }
-
-    fn primary_and_subscription_manager(self) -> (ConnectionPool, Arc<SubscriptionManager>) {
-        let mgr = self.subscription_manager();
-        let primary_pool = self.primary_pool();
-
-        (primary_pool, mgr)
     }
 
     fn store(&self) -> Arc<Store> {
@@ -969,29 +984,23 @@ impl Context {
         (store.block_store(), primary.clone())
     }
 
-    fn graphql_runner(self) -> Arc<GraphQlRunner<Store, PanicSubscriptionManager>> {
+    fn graphql_runner(self) -> Arc<GraphQlRunner<Store>> {
         let logger = self.logger.clone();
         let registry = self.registry.clone();
 
         let store = self.store();
 
-        let subscription_manager = Arc::new(PanicSubscriptionManager);
         let load_manager = Arc::new(LoadManager::new(&logger, vec![], vec![], registry.clone()));
 
-        Arc::new(GraphQlRunner::new(
-            &logger,
-            store,
-            subscription_manager,
-            load_manager,
-            registry,
-        ))
+        Arc::new(GraphQlRunner::new(&logger, store, load_manager, registry))
     }
 
-    async fn networks(&self, block_store: Arc<BlockStore>) -> anyhow::Result<Networks> {
+    async fn networks(&self) -> anyhow::Result<Networks> {
         let logger = self.logger.clone();
         let registry = self.metrics_registry();
         let metrics = Arc::new(EndpointMetrics::mock());
-        Networks::from_config(logger, &self.config, registry, metrics, block_store).await
+
+        Networks::from_config(logger, &self.config, registry, metrics, &[]).await
     }
 
     fn chain_store(self, chain_name: &str) -> anyhow::Result<Arc<ChainStore>> {
@@ -1006,8 +1015,7 @@ impl Context {
         self,
         chain_name: &str,
     ) -> anyhow::Result<(Arc<ChainStore>, Arc<EthereumAdapter>)> {
-        let block_store = self.store().block_store();
-        let networks = self.networks(block_store).await?;
+        let networks = self.networks().await?;
         let chain_store = self.chain_store(chain_name)?;
         let ethereum_adapter = networks
             .ethereum_rpcs(chain_name.into())
@@ -1023,6 +1031,9 @@ impl Context {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Disable load management for graphman commands
+    env::set_var("GRAPH_LOAD_THRESHOLD", "0");
+
     let opt = Opt::parse();
 
     Terminal::set_color_preference(&opt.color);
@@ -1039,6 +1050,10 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let mut config = Cfg::load(&logger, &opt.clone().into()).context("Configuration error")?;
+    config.stores.iter_mut().for_each(|(_, shard)| {
+        shard.pool_size = PoolSize::Fixed(5);
+        shard.fdw_pool_size = PoolSize::Fixed(5);
+    });
 
     if opt.pool_size > 0 && !opt.cmd.use_configured_pool_size() {
         // Override pool size from configuration
@@ -1100,29 +1115,28 @@ async fn main() -> anyhow::Result<()> {
             status,
             used,
             all,
+            brief,
+            no_name,
         } => {
-            let (primary, store) = if status {
-                let (store, primary) = ctx.store_and_primary();
-                (primary, Some(store))
-            } else {
-                (ctx.primary_pool(), None)
+            let (store, primary_pool) = ctx.store_and_primary();
+
+            let ctx = commands::deployment::info::Context {
+                primary_pool,
+                store,
             };
 
-            match deployment {
-                Some(deployment) => {
-                    commands::info::run(primary, store, deployment, current, pending, used).err();
-                }
-                None => {
-                    if all {
-                        let deployment = DeploymentSearch::All;
-                        commands::info::run(primary, store, deployment, current, pending, used)
-                            .err();
-                    } else {
-                        bail!("Please specify a deployment or use --all to list all deployments");
-                    }
-                }
+            let args = commands::deployment::info::Args {
+                deployment: deployment.map(make_deployment_selector),
+                current,
+                pending,
+                status,
+                used,
+                all,
+                brief,
+                no_name,
             };
-            Ok(())
+
+            commands::deployment::info::run(ctx, args)
         }
         Unused(cmd) => {
             let store = ctx.subgraph_store();
@@ -1149,6 +1163,16 @@ async fn main() -> anyhow::Result<()> {
             use ConfigCommand::*;
 
             match cmd {
+                CheckProviders { timeout_seconds } => {
+                    let logger = ctx.logger.clone();
+                    let networks = ctx.networks().await?;
+                    let store = ctx.store().block_store();
+                    let timeout = Duration::from_secs(timeout_seconds.unwrap_or(60));
+
+                    commands::provider_checks::execute(&logger, &networks, store, timeout).await;
+
+                    Ok(())
+                }
                 Place { name, network } => {
                     commands::config::place(&ctx.config.deployment, &name, &network)
                 }
@@ -1166,33 +1190,53 @@ async fn main() -> anyhow::Result<()> {
         Remove { name } => commands::remove::run(ctx.subgraph_store(), &name),
         Create { name } => commands::create::run(ctx.subgraph_store(), name),
         Unassign { deployment } => {
-            let sender = ctx.notification_sender();
-            commands::assign::unassign(ctx.primary_pool(), &sender, &deployment).await
+            let notifications_sender = ctx.notification_sender();
+            let primary_pool = ctx.primary_pool();
+            let deployment = make_deployment_selector(deployment);
+            commands::deployment::unassign::run(primary_pool, notifications_sender, deployment)
         }
         Reassign { deployment, node } => {
-            let sender = ctx.notification_sender();
-            commands::assign::reassign(ctx.primary_pool(), &sender, &deployment, node)
+            let notifications_sender = ctx.notification_sender();
+            let primary_pool = ctx.primary_pool();
+            let deployment = make_deployment_selector(deployment);
+            let node = NodeId::new(node).map_err(|node| anyhow!("invalid node id {:?}", node))?;
+            commands::deployment::reassign::run(
+                primary_pool,
+                notifications_sender,
+                deployment,
+                &node,
+            )
         }
         Pause { deployment } => {
-            let sender = ctx.notification_sender();
-            let pool = ctx.primary_pool();
-            let locator = &deployment.locate_unique(&pool)?;
-            commands::assign::pause_or_resume(pool, &sender, locator, true)
-        }
+            let notifications_sender = ctx.notification_sender();
+            let primary_pool = ctx.primary_pool();
+            let deployment = make_deployment_selector(deployment);
 
+            commands::deployment::pause::run(primary_pool, notifications_sender, deployment)
+        }
         Resume { deployment } => {
-            let sender = ctx.notification_sender();
-            let pool = ctx.primary_pool();
-            let locator = &deployment.locate_unique(&pool).unwrap();
+            let notifications_sender = ctx.notification_sender();
+            let primary_pool = ctx.primary_pool();
+            let deployment = make_deployment_selector(deployment);
 
-            commands::assign::pause_or_resume(pool, &sender, locator, false)
+            commands::deployment::resume::run(primary_pool, notifications_sender, deployment)
         }
-        Restart { deployment, sleep } => {
-            let sender = ctx.notification_sender();
-            let pool = ctx.primary_pool();
-            let locator = &deployment.locate_unique(&pool).unwrap();
+        Restart { deployments, sleep } => {
+            let notifications_sender = ctx.notification_sender();
+            let primary_pool = ctx.primary_pool();
 
-            commands::assign::restart(pool, &sender, locator, sleep)
+            for deployment in deployments.into_iter().unique() {
+                let deployment = make_deployment_selector(deployment);
+
+                commands::deployment::restart::run(
+                    primary_pool.clone(),
+                    notifications_sender.clone(),
+                    deployment,
+                    sleep,
+                )?;
+            }
+
+            Ok(())
         }
         Rewind {
             force,
@@ -1257,13 +1301,6 @@ async fn main() -> anyhow::Result<()> {
             use ListenCommand::*;
             match cmd {
                 Assignments => commands::listen::assignments(ctx.subscription_manager()).await,
-                Entities {
-                    deployment,
-                    entity_types,
-                } => {
-                    let (primary, mgr) = ctx.primary_and_subscription_manager();
-                    commands::listen::entities(primary, mgr, &deployment, entity_types).await
-                }
             }
         }
         Copy(cmd) => {
@@ -1326,6 +1363,29 @@ async fn main() -> anyhow::Result<()> {
                         shard,
                     )
                 }
+
+                UpdateGenesis {
+                    force,
+                    block_hash,
+                    chain_name,
+                } => {
+                    let store_builder = ctx.store_builder().await;
+                    let store = ctx.store().block_store();
+                    let networks = ctx.networks().await?;
+                    let chain_id = ChainName::from(chain_name);
+                    let block_hash = BlockHash::from_str(&block_hash)?;
+                    commands::chain::update_chain_genesis(
+                        &networks,
+                        store_builder.coord.cheap_clone(),
+                        store,
+                        &logger,
+                        chain_id,
+                        block_hash,
+                        force,
+                    )
+                    .await
+                }
+
                 CheckBlocks { method, chain_name } => {
                     use commands::check_blocks::{by_hash, by_number, by_range};
                     use CheckBlockMethod::*;
@@ -1584,4 +1644,17 @@ async fn main() -> anyhow::Result<()> {
 
 fn parse_duration_in_secs(s: &str) -> Result<Duration, ParseIntError> {
     Ok(Duration::from_secs(s.parse()?))
+}
+
+fn make_deployment_selector(
+    deployment: DeploymentSearch,
+) -> graphman::deployment::DeploymentSelector {
+    use graphman::deployment::DeploymentSelector::*;
+
+    match deployment {
+        DeploymentSearch::Name { name } => Name(name),
+        DeploymentSearch::Hash { hash, shard } => Subgraph { hash, shard },
+        DeploymentSearch::All => All,
+        DeploymentSearch::Deployment { namespace } => Schema(namespace),
+    }
 }

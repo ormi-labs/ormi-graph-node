@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use graph::components::store::{QueryPermit, UnitStream};
+use graph::components::store::QueryPermit;
 use graph::data::query::{CacheStatus, Trace};
 use graph::prelude::{async_trait, s, Error, QueryExecutionError};
 use graph::schema::ApiSchema;
@@ -18,7 +18,7 @@ use super::Query;
 pub trait Resolver: Sized + Send + Sync + 'static {
     const CACHEABLE: bool;
 
-    async fn query_permit(&self) -> Result<QueryPermit, QueryExecutionError>;
+    async fn query_permit(&self) -> QueryPermit;
 
     /// Prepare for executing a query by prefetching as much data as possible
     fn prefetch(
@@ -109,18 +109,6 @@ pub trait Resolver: Sized + Send + Sync + 'static {
             s::TypeDefinition::Object(object) => Some(object),
             _ => unreachable!("only objects may implement interfaces"),
         }
-    }
-
-    // Resolves a change stream for a given field.
-    fn resolve_field_stream(
-        &self,
-        _schema: &ApiSchema,
-        _object_type: &s::ObjectType,
-        _field: &a::Field,
-    ) -> Result<UnitStream, QueryExecutionError> {
-        Err(QueryExecutionError::NotSupported(String::from(
-            "Resolving field streams is not supported by this resolver",
-        )))
     }
 
     fn post_process(&self, _result: &mut QueryResult) -> Result<(), Error> {

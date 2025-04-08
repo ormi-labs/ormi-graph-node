@@ -2,11 +2,14 @@ use futures03::{future::BoxFuture, stream::FuturesUnordered};
 use graph::blockchain::client::ChainClient;
 use graph::blockchain::BlockHash;
 use graph::blockchain::ChainIdentifier;
+use graph::blockchain::ExtendedBlockPtr;
+
 use graph::components::transaction_receipt::LightTransactionReceipt;
 use graph::data::store::ethereum::call;
 use graph::data::store::scalar;
 use graph::data::subgraph::UnifiedMappingApiVersion;
 use graph::data::subgraph::API_VERSION_0_0_7;
+use graph::data_source::common::ContractCall;
 use graph::futures01::stream;
 use graph::futures01::Future;
 use graph::futures01::Stream;
@@ -58,15 +61,16 @@ use crate::chain::BlockFinality;
 use crate::trigger::LogRef;
 use crate::Chain;
 use crate::NodeCapabilities;
+use crate::TriggerFilter;
 use crate::{
     adapter::{
-        ContractCall, ContractCallError, EthGetLogsFilter, EthereumAdapter as EthereumAdapterTrait,
+        ContractCallError, EthGetLogsFilter, EthereumAdapter as EthereumAdapterTrait,
         EthereumBlockFilter, EthereumCallFilter, EthereumLogFilter, ProviderEthRpcMetrics,
         SubgraphEthRpcMetrics,
     },
     transport::Transport,
     trigger::{EthereumBlockTriggerType, EthereumTrigger},
-    TriggerFilter, ENV_VARS,
+    ENV_VARS,
 };
 
 #[derive(Debug, Clone)]
@@ -143,6 +147,7 @@ impl EthereumAdapter {
         let retry_log_message =
             format!("trace_filter RPC call for block range: [{}..{}]", from, to);
         retry(retry_log_message, &logger)
+            .redact_log_urls(true)
             .limit(ENV_VARS.request_retries)
             .timeout_secs(ENV_VARS.json_rpc_timeout.as_secs())
             .run(move || {
@@ -291,6 +296,7 @@ impl EthereumAdapter {
         let eth_adapter = self.clone();
         let retry_log_message = format!("eth_getLogs RPC call for block range: [{}..{}]", from, to);
         retry(retry_log_message, &logger)
+            .redact_log_urls(true)
             .when(move |res: &Result<_, web3::error::Error>| match res {
                 Ok(_) => false,
                 Err(e) => !too_many_logs_fingerprints
@@ -403,6 +409,7 @@ impl EthereumAdapter {
             "503 Service Unavailable",   // Alchemy
             "ServerError(-32000)",       // Alchemy
             "Try with this block range", // zKSync era
+            "block range too large",     // Monad
         ];
 
         if from > to {
@@ -506,6 +513,7 @@ impl EthereumAdapter {
         let retry_log_message = format!("eth_getCode RPC call for block {}", block_ptr);
 
         retry(retry_log_message, &logger)
+            .redact_log_urls(true)
             .when(|result| match result {
                 Ok(_) => false,
                 Err(_) => true,
@@ -541,6 +549,7 @@ impl EthereumAdapter {
         let retry_log_message = format!("eth_getBalance RPC call for block {}", block_ptr);
 
         retry(retry_log_message, &logger)
+            .redact_log_urls(true)
             .when(|result| match result {
                 Ok(_) => false,
                 Err(_) => true,
@@ -581,6 +590,7 @@ impl EthereumAdapter {
         let block_id = self.block_ptr_to_id(&block_ptr);
         let retry_log_message = format!("eth_call RPC call for block {}", block_ptr);
         retry(retry_log_message, &logger)
+            .redact_log_urls(true)
             .limit(ENV_VARS.request_retries)
             .timeout_secs(ENV_VARS.json_rpc_timeout.as_secs())
             .run(move || {
@@ -619,8 +629,10 @@ impl EthereumAdapter {
                     // See f0af4ab0-6b7c-4b68-9141-5b79346a5f61.
                     const PARITY_OUT_OF_GAS: &str = "Out of gas";
 
+                    // Also covers Nethermind reverts
                     const PARITY_VM_EXECUTION_ERROR: i64 = -32015;
-                    const PARITY_REVERT_PREFIX: &str = "Reverted 0x";
+                    const PARITY_REVERT_PREFIX: &str = "revert";
+
                     const XDAI_REVERT: &str = "revert";
 
                     // Deterministic Geth execution errors. We might need to expand this as
@@ -678,7 +690,7 @@ impl EthereumAdapter {
                         {
                             match rpc_error.data.as_ref().and_then(|d| d.as_str()) {
                                 Some(data)
-                                    if data.starts_with(PARITY_REVERT_PREFIX)
+                                    if data.to_lowercase().starts_with(PARITY_REVERT_PREFIX)
                                         || data.starts_with(PARITY_BAD_JUMP_PREFIX)
                                         || data.starts_with(PARITY_STACK_LIMIT_PREFIX)
                                         || data == PARITY_BAD_INSTRUCTION_FE
@@ -758,6 +770,7 @@ impl EthereumAdapter {
         stream::iter_ok::<_, Error>(ids.into_iter().map(move |hash| {
             let web3 = web3.clone();
             retry(format!("load block {}", hash), &logger)
+                .redact_log_urls(true)
                 .limit(ENV_VARS.request_retries)
                 .timeout_secs(ENV_VARS.json_rpc_timeout.as_secs())
                 .run(move || {
@@ -778,6 +791,65 @@ impl EthereumAdapter {
         .buffered(ENV_VARS.block_batch_size)
     }
 
+    /// Request blocks by number through JSON-RPC.
+    pub fn load_block_ptrs_by_numbers_rpc(
+        &self,
+        logger: Logger,
+        numbers: Vec<BlockNumber>,
+    ) -> impl futures03::Stream<Item = Result<Arc<ExtendedBlockPtr>, Error>> + Send {
+        let web3 = self.web3.clone();
+
+        futures03::stream::iter(numbers.into_iter().map(move |number| {
+            let web3 = web3.clone();
+            let logger = logger.clone();
+
+            async move {
+                retry(format!("load block {}", number), &logger)
+                    .redact_log_urls(true)
+                    .limit(ENV_VARS.request_retries)
+                    .timeout_secs(ENV_VARS.json_rpc_timeout.as_secs())
+                    .run(move || {
+                        let web3 = web3.clone();
+
+                        async move {
+                            let block_result = web3
+                                .eth()
+                                .block(BlockId::Number(Web3BlockNumber::Number(number.into())))
+                                .await;
+
+                            match block_result {
+                                Ok(Some(block)) => {
+                                    let ptr = ExtendedBlockPtr::try_from((
+                                        block.hash,
+                                        block.number,
+                                        block.parent_hash,
+                                        block.timestamp,
+                                    ))
+                                    .map_err(|e| {
+                                        anyhow::anyhow!("Failed to convert block: {}", e)
+                                    })?;
+                                    Ok(Arc::new(ptr))
+                                }
+                                Ok(None) => Err(anyhow::anyhow!(
+                                    "Ethereum node did not find block with number {:?}",
+                                    number
+                                )),
+                                Err(e) => Err(anyhow::anyhow!("Failed to fetch block: {}", e)),
+                            }
+                        }
+                    })
+                    .await
+                    .map_err(|e| match e {
+                        TimeoutError::Elapsed => {
+                            anyhow::anyhow!("Timeout while fetching block {}", number)
+                        }
+                        TimeoutError::Inner(e) => e,
+                    })
+            }
+        }))
+        .buffered(ENV_VARS.block_ptr_batch_size)
+    }
+
     /// Request blocks ptrs for numbers through JSON-RPC.
     ///
     /// Reorg safety: If ids are numbers, they must be a final blocks.
@@ -791,6 +863,7 @@ impl EthereumAdapter {
         stream::iter_ok::<_, Error>(block_nums.into_iter().map(move |block_num| {
             let web3 = web3.clone();
             retry(format!("load block ptr {}", block_num), &logger)
+                .redact_log_urls(true)
                 .when(|res| !res.is_ok() && !detect_null_block(res))
                 .no_limit()
                 .timeout_secs(ENV_VARS.json_rpc_timeout.as_secs())
@@ -1075,6 +1148,7 @@ impl EthereumAdapter {
         let web3 = self.web3.clone();
         u64::try_from(
             retry("chain_id RPC call", &logger)
+                .redact_log_urls(true)
                 .no_limit()
                 .timeout_secs(ENV_VARS.json_rpc_timeout.as_secs())
                 .run(move || {
@@ -1110,6 +1184,7 @@ impl EthereumAdapterTrait for EthereumAdapter {
         let metrics = self.metrics.clone();
         let provider = self.provider().to_string();
         let net_version_future = retry("net_version RPC call", &logger)
+            .redact_log_urls(true)
             .no_limit()
             .timeout_secs(20)
             .run(move || {
@@ -1138,6 +1213,7 @@ impl EthereumAdapterTrait for EthereumAdapter {
             ENV_VARS.genesis_block_number
         );
         let gen_block_hash_future = retry(retry_log_message, &logger)
+            .redact_log_urls(true)
             .no_limit()
             .timeout_secs(30)
             .run(move || {
@@ -1189,6 +1265,7 @@ impl EthereumAdapterTrait for EthereumAdapter {
         let web3 = self.web3.clone();
         Box::new(
             retry("eth_getBlockByNumber(latest) no txs RPC call", logger)
+                .redact_log_urls(true)
                 .no_limit()
                 .timeout_secs(ENV_VARS.json_rpc_timeout.as_secs())
                 .run(move || {
@@ -1223,6 +1300,7 @@ impl EthereumAdapterTrait for EthereumAdapter {
         let web3 = self.web3.clone();
         Box::new(
             retry("eth_getBlockByNumber(latest) with txs RPC call", logger)
+                .redact_log_urls(true)
                 .no_limit()
                 .timeout_secs(ENV_VARS.json_rpc_timeout.as_secs())
                 .run(move || {
@@ -1280,6 +1358,7 @@ impl EthereumAdapterTrait for EthereumAdapter {
         );
         Box::new(
             retry(retry_log_message, &logger)
+                .redact_log_urls(true)
                 .limit(ENV_VARS.request_retries)
                 .timeout_secs(ENV_VARS.json_rpc_timeout.as_secs())
                 .run(move || {
@@ -1311,6 +1390,7 @@ impl EthereumAdapterTrait for EthereumAdapter {
         );
         Box::new(
             retry(retry_log_message, &logger)
+                .redact_log_urls(true)
                 .no_limit()
                 .timeout_secs(ENV_VARS.json_rpc_timeout.as_secs())
                 .run(move || {
@@ -1393,6 +1473,7 @@ impl EthereumAdapterTrait for EthereumAdapter {
         );
         Box::new(
             retry(retry_log_message, logger)
+                .redact_log_urls(true)
                 .no_limit()
                 .timeout_secs(ENV_VARS.json_rpc_timeout.as_secs())
                 .run(move || {
@@ -1460,6 +1541,7 @@ impl EthereumAdapterTrait for EthereumAdapter {
             let web3 = self.web3.clone();
             let logger = logger.clone();
             let res = retry(retry_log_message, &logger)
+                .redact_log_urls(true)
                 .when(|res| !res.is_ok() && !detect_null_block(res))
                 .no_limit()
                 .timeout_secs(ENV_VARS.json_rpc_timeout.as_secs())
@@ -1921,6 +2003,9 @@ pub(crate) async fn get_calls(
                 calls: Some(calls),
             }))
         }
+        BlockFinality::Ptr(_) => {
+            unreachable!("get_calls called with BlockFinality::Ptr")
+        }
     }
 }
 
@@ -2075,8 +2160,8 @@ async fn filter_call_triggers_from_unsuccessful_transactions(
     let transaction_hashes: BTreeSet<H256> = block
         .trigger_data
         .iter()
-        .filter_map(|trigger| match trigger {
-            EthereumTrigger::Call(call_trigger) => Some(call_trigger.transaction_hash),
+        .filter_map(|trigger| match trigger.as_chain() {
+            Some(EthereumTrigger::Call(call_trigger)) => Some(call_trigger.transaction_hash),
             _ => None,
         })
         .collect::<Option<BTreeSet<H256>>>()
@@ -2100,6 +2185,11 @@ async fn filter_call_triggers_from_unsuccessful_transactions(
             BlockFinality::NonFinal(_block_with_calls) => {
                 unreachable!(
                     "this function should not be called when dealing with non-final blocks"
+                )
+            }
+            BlockFinality::Ptr(_block) => {
+                unreachable!(
+                    "this function should not be called when dealing with header-only blocks"
                 )
             }
         }
@@ -2167,7 +2257,7 @@ async fn filter_call_triggers_from_unsuccessful_transactions(
 
     // Filter call triggers from unsuccessful transactions
     block.trigger_data.retain(|trigger| {
-        if let EthereumTrigger::Call(call_trigger) = trigger {
+        if let Some(EthereumTrigger::Call(call_trigger)) = trigger.as_chain() {
             // Unwrap: We already checked that those values exist
             transaction_success[&call_trigger.transaction_hash.unwrap()]
         } else {
@@ -2206,6 +2296,7 @@ async fn fetch_transaction_receipts_in_batch_with_retry(
         block_hash
     );
     retry(retry_log_message, &logger)
+        .redact_log_urls(true)
         .limit(ENV_VARS.request_retries)
         .no_logging()
         .timeout_secs(ENV_VARS.json_rpc_timeout.as_secs())
@@ -2333,6 +2424,7 @@ async fn fetch_block_receipts_with_retry(
 
     // Perform the retry operation
     let receipts_option = retry(retry_log_message, &logger)
+        .redact_log_urls(true)
         .limit(ENV_VARS.request_retries)
         .timeout_secs(ENV_VARS.json_rpc_timeout.as_secs())
         .run(move || web3.eth().block_receipts(BlockId::Hash(block_hash)).boxed())
@@ -2377,6 +2469,7 @@ async fn fetch_transaction_receipt_with_retry(
         transaction_hash
     );
     retry(retry_log_message, &logger)
+        .redact_log_urls(true)
         .limit(ENV_VARS.request_retries)
         .timeout_secs(ENV_VARS.json_rpc_timeout.as_secs())
         .run(move || web3.eth().transaction_receipt(transaction_hash).boxed())

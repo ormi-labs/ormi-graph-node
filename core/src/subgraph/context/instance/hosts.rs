@@ -57,7 +57,7 @@ impl<C: Blockchain, T: RuntimeHostBuilder<C>> OnchainHosts<C, T> {
     }
 
     pub fn push(&mut self, host: Arc<T::Host>) {
-        assert!(host.data_source().as_onchain().is_some());
+        assert!(host.data_source().is_chain_based());
 
         self.hosts.push(host.cheap_clone());
         let idx = self.hosts.len() - 1;
@@ -194,7 +194,7 @@ impl<C: Blockchain, T: RuntimeHostBuilder<C>> OffchainHosts<C, T> {
     pub fn matches_by_address<'a>(
         &'a self,
         address: Option<&[u8]>,
-    ) -> Box<dyn Iterator<Item = &T::Host> + Send + 'a> {
+    ) -> Box<dyn Iterator<Item = &'a T::Host> + Send + 'a> {
         let Some(address) = address else {
             return Box::new(self.by_block.values().flatten().map(|host| host.as_ref()));
         };

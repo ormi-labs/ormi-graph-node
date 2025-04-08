@@ -1,16 +1,12 @@
 use graph::blockchain::block_stream::FirehoseCursor;
 use graph::blockchain::BlockTime;
 use graph::data::graphql::ext::TypeDefinitionExt;
-use graph::data::query::QueryTarget;
 use graph::data::subgraph::schema::DeploymentCreate;
-use graph::futures01::{future, Stream};
-use graph::futures03::compat::Future01CompatExt;
+use graph::data_source::common::MappingABI;
 use graph::schema::{EntityType, InputSchema};
-use graph_chain_ethereum::{Mapping, MappingABI};
+use graph_chain_ethereum::Mapping;
 use hex_literal::hex;
 use lazy_static::lazy_static;
-use std::time::Duration;
-use std::{collections::HashSet, sync::Mutex};
 use std::{marker::PhantomData, str::FromStr};
 use test_store::*;
 
@@ -18,10 +14,7 @@ use graph::components::store::{DeploymentLocator, ReadStore, WritableStore};
 use graph::data::subgraph::*;
 use graph::{
     blockchain::DataSource,
-    components::store::{
-        BlockStore as _, EntityFilter, EntityOrder, EntityQuery, StatusStore,
-        SubscriptionManager as _,
-    },
+    components::store::{BlockStore as _, EntityFilter, EntityOrder, EntityQuery, StatusStore},
     prelude::ethabi::Contract,
 };
 use graph::{data::store::scalar, semver::Version};
@@ -164,7 +157,7 @@ where
 async fn insert_test_data(store: Arc<DieselSubgraphStore>) -> DeploymentLocator {
     let manifest = SubgraphManifest::<graph_chain_ethereum::Chain> {
         id: TEST_SUBGRAPH_ID.clone(),
-        spec_version: Version::new(1, 0, 0),
+        spec_version: Version::new(1, 3, 0),
         features: Default::default(),
         description: None,
         repository: None,
@@ -200,6 +193,7 @@ async fn insert_test_data(store: Arc<DieselSubgraphStore>) -> DeploymentLocator 
         184.4,
         false,
         None,
+        0,
     );
     transact_entity_operations(
         &store,
@@ -219,6 +213,7 @@ async fn insert_test_data(store: Arc<DieselSubgraphStore>) -> DeploymentLocator 
         159.1,
         true,
         Some("red"),
+        1,
     );
     let test_entity_3_1 = create_test_entity(
         "3",
@@ -229,6 +224,7 @@ async fn insert_test_data(store: Arc<DieselSubgraphStore>) -> DeploymentLocator 
         111.7,
         false,
         Some("blue"),
+        2,
     );
     transact_entity_operations(
         &store,
@@ -248,6 +244,7 @@ async fn insert_test_data(store: Arc<DieselSubgraphStore>) -> DeploymentLocator 
         111.7,
         false,
         None,
+        3,
     );
     transact_and_wait(
         &store,
@@ -271,6 +268,7 @@ fn create_test_entity(
     weight: f64,
     coffee: bool,
     favorite_color: Option<&str>,
+    vid: i64,
 ) -> EntityOperation {
     let bin_name = scalar::Bytes::from_str(&hex::encode(name)).unwrap();
     let test_entity = entity! { TEST_SUBGRAPH_SCHEMA =>
@@ -283,6 +281,7 @@ fn create_test_entity(
         weight: Value::BigDecimal(weight.into()),
         coffee: coffee,
         favorite_color: favorite_color,
+        vid: vid,
     };
 
     EntityOperation::Set {
@@ -351,6 +350,7 @@ fn get_entity_1() {
             seconds_age: Value::BigInt(BigInt::from(2114359200)),
             weight: Value::BigDecimal(184.4.into()),
             coffee: false,
+            vid: 0i64
         };
         // "favorite_color" was set to `Null` earlier and should be absent
 
@@ -376,6 +376,7 @@ fn get_entity_3() {
            seconds_age: Value::BigInt(BigInt::from(883612800)),
            weight: Value::BigDecimal(111.7.into()),
            coffee: false,
+           vid: 3_i64,
         };
         // "favorite_color" was set to `Null` earlier and should be absent
 
@@ -397,6 +398,7 @@ fn insert_entity() {
             111.7,
             true,
             Some("green"),
+            5,
         );
         let count = get_entity_count(store.clone(), &deployment.hash);
         transact_and_wait(
@@ -428,6 +430,7 @@ fn update_existing() {
             111.7,
             true,
             Some("green"),
+            6,
         );
         let mut new_data = match op {
             EntityOperation::Set { ref data, .. } => data.clone(),
@@ -466,7 +469,8 @@ fn partially_update_existing() {
         let entity_key = USER_TYPE.parse_key("1").unwrap();
         let schema = writable.input_schema();
 
-        let partial_entity = entity! { schema => id: "1", name: "Johnny Boy", email: Value::Null };
+        let partial_entity =
+            entity! { schema => id: "1", name: "Johnny Boy", email: Value::Null, vid: 11i64 };
 
         let original_entity = writable
             .get(&entity_key)
@@ -900,78 +904,7 @@ fn find() {
     });
 }
 
-fn make_entity_change(entity_type: &EntityType) -> EntityChange {
-    EntityChange::Data {
-        subgraph_id: TEST_SUBGRAPH_ID.clone(),
-        entity_type: entity_type.to_string(),
-    }
-}
-
-// Get as events until we've seen all the expected events or we time out waiting
-async fn check_events(
-    stream: StoreEventStream<impl Stream<Item = Arc<StoreEvent>, Error = ()> + Send>,
-    expected: Vec<StoreEvent>,
-) {
-    fn as_set(events: Vec<Arc<StoreEvent>>) -> HashSet<EntityChange> {
-        events.into_iter().fold(HashSet::new(), |mut set, event| {
-            set.extend(event.changes.iter().cloned());
-            set
-        })
-    }
-
-    let expected = Mutex::new(as_set(expected.into_iter().map(Arc::new).collect()));
-    // Capture extra changes here; this is only needed for debugging, really.
-    // It's permissible that we get more changes than we expected because of
-    // how store events group changes together
-    let extra: Mutex<HashSet<EntityChange>> = Mutex::new(HashSet::new());
-    // Get events from the store until we've either seen all the changes we
-    // expected or we timed out waiting for them
-    stream
-        .take_while(|event| {
-            let mut expected = expected.lock().unwrap();
-            for change in &event.changes {
-                if !expected.remove(change) {
-                    extra.lock().unwrap().insert(change.clone());
-                }
-            }
-            future::ok(!expected.is_empty())
-        })
-        .collect()
-        .compat()
-        .timeout(Duration::from_secs(3))
-        .await
-        .unwrap_or_else(|_| {
-            panic!(
-                "timed out waiting for events\n  still waiting for {:?}\n  got extra events {:?}",
-                expected.lock().unwrap().clone(),
-                extra.lock().unwrap().clone()
-            )
-        })
-        .expect("something went wrong getting events");
-    // Check again that we really got everything
-    assert_eq!(HashSet::new(), expected.lock().unwrap().clone());
-}
-
-// Subscribe to store events
-fn subscribe(
-    subgraph: &DeploymentHash,
-    entity_type: &EntityType,
-) -> StoreEventStream<impl Stream<Item = Arc<StoreEvent>, Error = ()> + Send> {
-    let subscription =
-        SUBSCRIPTION_MANAGER.subscribe(FromIterator::from_iter([SubscriptionFilter::Entities(
-            subgraph.clone(),
-            entity_type.to_owned(),
-        )]));
-
-    StoreEventStream::new(subscription)
-}
-
-async fn check_basic_revert(
-    store: Arc<DieselStore>,
-    expected: StoreEvent,
-    deployment: &DeploymentLocator,
-    entity_type: &EntityType,
-) {
+async fn check_basic_revert(store: Arc<DieselStore>, deployment: &DeploymentLocator) {
     let this_query = user_query()
         .filter(EntityFilter::Equal(
             "name".to_owned(),
@@ -979,7 +912,6 @@ async fn check_basic_revert(
         ))
         .desc("name");
 
-    let subscription = subscribe(&deployment.hash, entity_type);
     let state = deployment_state(store.as_ref(), &deployment.hash).await;
     assert_eq!(&deployment.hash, &state.id);
 
@@ -1002,17 +934,13 @@ async fn check_basic_revert(
 
     let state = deployment_state(store.as_ref(), &deployment.hash).await;
     assert_eq!(&deployment.hash, &state.id);
-
-    check_events(subscription, vec![expected]).await
 }
 
 #[test]
 fn revert_block_basic_user() {
     run_test(|store, _, deployment| async move {
-        let expected = StoreEvent::new(vec![make_entity_change(&*USER_TYPE)]);
-
         let count = get_entity_count(store.clone(), &deployment.hash);
-        check_basic_revert(store.clone(), expected, &deployment, &*USER_TYPE).await;
+        check_basic_revert(store.clone(), &deployment).await;
         assert_eq!(count, get_entity_count(store.clone(), &deployment.hash));
     })
 }
@@ -1040,8 +968,6 @@ fn revert_block_with_delete() {
         .await
         .unwrap();
 
-        let subscription = subscribe(&deployment.hash, &*USER_TYPE);
-
         // Revert deletion
         let count = get_entity_count(store.clone(), &deployment.hash);
         revert_block(&store, &deployment, &TEST_BLOCK_2_PTR).await;
@@ -1061,12 +987,6 @@ fn revert_block_with_delete() {
         let test_value = Value::String("dinici@email.com".to_owned());
         assert!(returned_name.is_some());
         assert_eq!(&test_value, returned_name.unwrap());
-
-        // Check that the subscription notified us of the changes
-        let expected = StoreEvent::new(vec![make_entity_change(&*USER_TYPE)]);
-
-        // The last event is the one for the reversion
-        check_events(subscription, vec![expected]).await
     })
 }
 
@@ -1076,7 +996,8 @@ fn revert_block_with_partial_update() {
         let entity_key = USER_TYPE.parse_key("1").unwrap();
         let schema = writable.input_schema();
 
-        let partial_entity = entity! { schema => id: "1", name: "Johnny Boy", email: Value::Null };
+        let partial_entity =
+            entity! { schema => id: "1", name: "Johnny Boy", email: Value::Null, vid: 5i64 };
 
         let original_entity = writable.get(&entity_key).unwrap().expect("missing entity");
 
@@ -1087,13 +1008,11 @@ fn revert_block_with_partial_update() {
             TEST_BLOCK_3_PTR.clone(),
             vec![EntityOperation::Set {
                 key: entity_key.clone(),
-                data: partial_entity.clone(),
+                data: partial_entity,
             }],
         )
         .await
         .unwrap();
-
-        let subscription = subscribe(&deployment.hash, &*USER_TYPE);
 
         // Perform revert operation, reversing the partial update
         let count = get_entity_count(store.clone(), &deployment.hash);
@@ -1105,11 +1024,6 @@ fn revert_block_with_partial_update() {
 
         // Verify that the entity has been returned to its original state
         assert_eq!(reverted_entity, original_entity);
-
-        // Check that the subscription notified us of the changes
-        let expected = StoreEvent::new(vec![make_entity_change(&*USER_TYPE)]);
-
-        check_events(subscription, vec![expected]).await
     })
 }
 
@@ -1171,7 +1085,8 @@ fn revert_block_with_dynamic_data_source_operations() {
 
         // Create operations to add a user
         let user_key = USER_TYPE.parse_key("1").unwrap();
-        let partial_entity = entity! { schema => id: "1", name: "Johnny Boy", email: Value::Null };
+        let partial_entity =
+            entity! { schema => id: "1", name: "Johnny Boy", email: Value::Null, vid: 5i64 };
 
         // Get the original user for comparisons
         let original_user = writable.get(&user_key).unwrap().expect("missing entity");
@@ -1215,8 +1130,6 @@ fn revert_block_with_dynamic_data_source_operations() {
             **loaded_dds[0].param.as_ref().unwrap()
         );
 
-        let subscription = subscribe(&deployment.hash, &*USER_TYPE);
-
         // Revert block that added the user and the dynamic data source
         revert_block(&store, &deployment, &TEST_BLOCK_2_PTR).await;
 
@@ -1232,224 +1145,6 @@ fn revert_block_with_dynamic_data_source_operations() {
             .await
             .unwrap();
         assert_eq!(0, loaded_dds.len());
-
-        // Verify that the right change events were emitted for the reversion
-        let expected_events = vec![StoreEvent {
-            tag: 3,
-            changes: HashSet::from_iter(
-                vec![EntityChange::Data {
-                    subgraph_id: DeploymentHash::new("testsubgraph").unwrap(),
-                    entity_type: USER_TYPE.to_string(),
-                }]
-                .into_iter(),
-            ),
-        }];
-        check_events(subscription, expected_events).await
-    })
-}
-
-#[test]
-fn entity_changes_are_fired_and_forwarded_to_subscriptions() {
-    run_test(|store, _, _| async move {
-        let subgraph_id = DeploymentHash::new("EntityChangeTestSubgraph").unwrap();
-        let schema = InputSchema::parse_latest(USER_GQL, subgraph_id.clone())
-            .expect("Failed to parse user schema");
-        let manifest = SubgraphManifest::<graph_chain_ethereum::Chain> {
-            id: subgraph_id.clone(),
-            spec_version: Version::new(1, 0, 0),
-            features: Default::default(),
-            description: None,
-            repository: None,
-            schema: schema.clone(),
-            data_sources: vec![],
-            graft: None,
-            templates: vec![],
-            chain: PhantomData,
-            indexer_hints: None,
-        };
-
-        let deployment =
-            DeploymentCreate::new(String::new(), &manifest, Some(TEST_BLOCK_0_PTR.clone()));
-        let name = SubgraphName::new("test/entity-changes-are-fired").unwrap();
-        let node_id = NodeId::new("test").unwrap();
-        let deployment = store
-            .subgraph_store()
-            .create_subgraph_deployment(
-                name,
-                &schema,
-                deployment,
-                node_id,
-                NETWORK_NAME.to_string(),
-                SubgraphVersionSwitchingMode::Instant,
-            )
-            .unwrap();
-
-        let subscription = subscribe(&subgraph_id, &*USER_TYPE);
-
-        // Add two entities to the store
-        let added_entities = vec![
-            (
-                "1".to_owned(),
-                entity! { schema => id: "1", name: "Johnny Boy" },
-            ),
-            ("2".to_owned(), entity! { schema => id: "2", name: "Tessa" }),
-        ];
-        transact_and_wait(
-            &store.subgraph_store(),
-            &deployment,
-            TEST_BLOCK_1_PTR.clone(),
-            added_entities
-                .iter()
-                .map(|(id, data)| EntityOperation::Set {
-                    key: USER_TYPE.parse_key(id.as_str()).unwrap(),
-                    data: data.clone(),
-                })
-                .collect(),
-        )
-        .await
-        .unwrap();
-
-        // Update an entity in the store
-        let updated_entity = entity! { schema => id: "1", name: "Johnny" };
-        let update_op = EntityOperation::Set {
-            key: USER_TYPE.parse_key("1").unwrap(),
-            data: updated_entity.clone(),
-        };
-
-        // Delete an entity in the store
-        let delete_op = EntityOperation::Remove {
-            key: USER_TYPE.parse_key("2").unwrap(),
-        };
-
-        // Commit update & delete ops
-        transact_and_wait(
-            &store.subgraph_store(),
-            &deployment,
-            TEST_BLOCK_2_PTR.clone(),
-            vec![update_op, delete_op],
-        )
-        .await
-        .unwrap();
-
-        // We're expecting two events to be written to the subscription stream
-        let expected = vec![
-            StoreEvent::new(vec![
-                EntityChange::Data {
-                    subgraph_id: subgraph_id.clone(),
-                    entity_type: USER_TYPE.to_string(),
-                },
-                EntityChange::Data {
-                    subgraph_id: subgraph_id.clone(),
-                    entity_type: USER_TYPE.to_string(),
-                },
-            ]),
-            StoreEvent::new(vec![
-                EntityChange::Data {
-                    subgraph_id: subgraph_id.clone(),
-                    entity_type: USER_TYPE.to_string(),
-                },
-                EntityChange::Data {
-                    subgraph_id: subgraph_id.clone(),
-                    entity_type: USER_TYPE.to_string(),
-                },
-            ]),
-        ];
-
-        check_events(subscription, expected).await
-    })
-}
-
-#[test]
-fn throttle_subscription_delivers() {
-    run_test(|store, _, deployment| async move {
-        let subscription = subscribe(&deployment.hash, &*USER_TYPE)
-            .throttle_while_syncing(
-                &LOGGER,
-                store
-                    .clone()
-                    .query_store(
-                        QueryTarget::Deployment(deployment.hash.clone(), Default::default()),
-                        true,
-                    )
-                    .await
-                    .unwrap(),
-                Duration::from_millis(500),
-            )
-            .await;
-
-        let user4 = create_test_entity(
-            "4",
-            &*USER_TYPE,
-            "Steve",
-            "nieve@email.com",
-            72_i32,
-            120.7,
-            false,
-            None,
-        );
-
-        transact_entity_operations(
-            &store.subgraph_store(),
-            &deployment,
-            TEST_BLOCK_3_PTR.clone(),
-            vec![user4],
-        )
-        .await
-        .unwrap();
-
-        let expected = StoreEvent::new(vec![make_entity_change(&*USER_TYPE)]);
-
-        check_events(subscription, vec![expected]).await
-    })
-}
-
-#[test]
-fn throttle_subscription_throttles() {
-    run_test(|store, _, deployment| async move {
-        // Throttle for a very long time (30s)
-        let subscription = subscribe(&deployment.hash, &*USER_TYPE)
-            .throttle_while_syncing(
-                &LOGGER,
-                store
-                    .clone()
-                    .query_store(
-                        QueryTarget::Deployment(deployment.hash.clone(), Default::default()),
-                        true,
-                    )
-                    .await
-                    .unwrap(),
-                Duration::from_secs(30),
-            )
-            .await;
-
-        let user4 = create_test_entity(
-            "4",
-            &*USER_TYPE,
-            "Steve",
-            "nieve@email.com",
-            72_i32,
-            120.7,
-            false,
-            None,
-        );
-
-        transact_entity_operations(
-            &store.subgraph_store(),
-            &deployment,
-            TEST_BLOCK_3_PTR.clone(),
-            vec![user4],
-        )
-        .await
-        .unwrap();
-
-        // Make sure we time out waiting for the subscription
-        let res = subscription
-            .take(1)
-            .collect()
-            .compat()
-            .timeout(Duration::from_millis(500))
-            .await;
-        assert!(res.is_err());
     })
 }
 
@@ -1504,8 +1199,9 @@ fn handle_large_string_with_index() {
         name: &str,
         schema: &InputSchema,
         block: BlockNumber,
+        vid: i64,
     ) -> EntityModification {
-        let data = entity! { schema => id: id, name: name };
+        let data = entity! { schema => id: id, name: name, vid: vid };
 
         let key = USER_TYPE.parse_key(id).unwrap();
 
@@ -1538,8 +1234,8 @@ fn handle_large_string_with_index() {
                 BlockTime::for_test(&*TEST_BLOCK_3_PTR),
                 FirehoseCursor::None,
                 vec![
-                    make_insert_op(ONE, &long_text, &schema, block),
-                    make_insert_op(TWO, &other_text, &schema, block),
+                    make_insert_op(ONE, &long_text, &schema, block, 11),
+                    make_insert_op(TWO, &other_text, &schema, block, 12),
                 ],
                 &stopwatch_metrics,
                 Vec::new(),
@@ -1550,6 +1246,7 @@ fn handle_large_string_with_index() {
             )
             .await
             .expect("Failed to insert large text");
+
         writable.flush().await.unwrap();
 
         let query = user_query()
@@ -1603,8 +1300,9 @@ fn handle_large_bytea_with_index() {
         name: &[u8],
         schema: &InputSchema,
         block: BlockNumber,
+        vid: i64,
     ) -> EntityModification {
-        let data = entity! { schema => id: id, bin_name: scalar::Bytes::from(name) };
+        let data = entity! { schema => id: id, bin_name: scalar::Bytes::from(name), vid: vid };
 
         let key = USER_TYPE.parse_key(id).unwrap();
 
@@ -1642,8 +1340,8 @@ fn handle_large_bytea_with_index() {
                 BlockTime::for_test(&*TEST_BLOCK_3_PTR),
                 FirehoseCursor::None,
                 vec![
-                    make_insert_op(ONE, &long_bytea, &schema, block),
-                    make_insert_op(TWO, &other_bytea, &schema, block),
+                    make_insert_op(ONE, &long_bytea, &schema, block, 10),
+                    make_insert_op(TWO, &other_bytea, &schema, block, 11),
                 ],
                 &stopwatch_metrics,
                 Vec::new(),
@@ -1811,8 +1509,10 @@ fn window() {
         id: &str,
         color: &str,
         age: i32,
+        vid: i64,
     ) -> EntityOperation {
-        let entity = entity! { TEST_SUBGRAPH_SCHEMA => id: id, age: age, favorite_color: color };
+        let entity =
+            entity! { TEST_SUBGRAPH_SCHEMA => id: id, age: age, favorite_color: color, vid: vid };
 
         EntityOperation::Set {
             key: entity_type.parse_key(id).unwrap(),
@@ -1820,25 +1520,25 @@ fn window() {
         }
     }
 
-    fn make_user(id: &str, color: &str, age: i32) -> EntityOperation {
-        make_color_and_age(&*USER_TYPE, id, color, age)
+    fn make_user(id: &str, color: &str, age: i32, vid: i64) -> EntityOperation {
+        make_color_and_age(&*USER_TYPE, id, color, age, vid)
     }
 
-    fn make_person(id: &str, color: &str, age: i32) -> EntityOperation {
-        make_color_and_age(&*PERSON_TYPE, id, color, age)
+    fn make_person(id: &str, color: &str, age: i32, vid: i64) -> EntityOperation {
+        make_color_and_age(&*PERSON_TYPE, id, color, age, vid)
     }
 
     let ops = vec![
-        make_user("4", "green", 34),
-        make_user("5", "green", 17),
-        make_user("6", "green", 41),
-        make_user("7", "red", 25),
-        make_user("8", "red", 45),
-        make_user("9", "yellow", 37),
-        make_user("10", "blue", 27),
-        make_user("11", "blue", 19),
-        make_person("p1", "green", 12),
-        make_person("p2", "red", 15),
+        make_user("4", "green", 34, 11),
+        make_user("5", "green", 17, 12),
+        make_user("6", "green", 41, 13),
+        make_user("7", "red", 25, 14),
+        make_user("8", "red", 45, 15),
+        make_user("9", "yellow", 37, 16),
+        make_user("10", "blue", 27, 17),
+        make_user("11", "blue", 19, 18),
+        make_person("p1", "green", 12, 19),
+        make_person("p2", "red", 15, 20),
     ];
 
     run_test(|store, _, deployment| async move {
@@ -2076,6 +1776,7 @@ fn reorg_tracking() {
         deployment: &DeploymentLocator,
         age: i32,
         block: &BlockPtr,
+        vid: i64,
     ) {
         let test_entity_1 = create_test_entity(
             "1",
@@ -2086,6 +1787,7 @@ fn reorg_tracking() {
             184.4,
             false,
             None,
+            vid,
         );
         transact_and_wait(store, deployment, block.clone(), vec![test_entity_1])
             .await
@@ -2136,15 +1838,15 @@ fn reorg_tracking() {
         check_state!(store, 2, 2, 2);
 
         // Forward to block 3
-        update_john(&subgraph_store, &deployment, 70, &TEST_BLOCK_3_PTR).await;
+        update_john(&subgraph_store, &deployment, 70, &TEST_BLOCK_3_PTR, 5).await;
         check_state!(store, 2, 2, 3);
 
         // Forward to block 4
-        update_john(&subgraph_store, &deployment, 71, &TEST_BLOCK_4_PTR).await;
+        update_john(&subgraph_store, &deployment, 71, &TEST_BLOCK_4_PTR, 6).await;
         check_state!(store, 2, 2, 4);
 
         // Forward to block 5
-        update_john(&subgraph_store, &deployment, 72, &TEST_BLOCK_5_PTR).await;
+        update_john(&subgraph_store, &deployment, 72, &TEST_BLOCK_5_PTR, 7).await;
         check_state!(store, 2, 2, 5);
 
         // Revert all the way back to block 2

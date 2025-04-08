@@ -17,6 +17,7 @@ use crate::data::graphql::{DirectiveExt, DocumentExt, ObjectTypeExt, TypeExt, Va
 use crate::data::store::{
     self, EntityValidationError, IdType, IntoEntityIterator, TryIntoEntityIterator, ValueType, ID,
 };
+use crate::data::subgraph::SPEC_VERSION_1_3_0;
 use crate::data::value::Word;
 use crate::derive::CheapClone;
 use crate::prelude::q::Value;
@@ -35,6 +36,7 @@ pub(crate) const POI_OBJECT: &str = "Poi$";
 const POI_DIGEST: &str = "digest";
 /// The name of the PoI attribute for storing the block time
 const POI_BLOCK_TIME: &str = "blockTime";
+pub(crate) const VID_FIELD: &str = "vid";
 
 pub mod kw {
     pub const ENTITY: &str = "entity";
@@ -822,7 +824,7 @@ impl Aggregate {
 
     /// The field needed for the finalised aggregation for hourly/daily
     /// values
-    fn as_agg_field(&self) -> Field {
+    pub fn as_agg_field(&self) -> Field {
         Field {
             name: self.name.clone(),
             field_type: self.field_type.clone(),
@@ -929,7 +931,7 @@ impl Aggregation {
 
     pub fn dimensions(&self) -> impl Iterator<Item = &Field> {
         self.fields
-            .into_iter()
+            .iter()
             .filter(|field| &field.name != &*ID && field.name != kw::TIMESTAMP)
     }
 
@@ -954,6 +956,7 @@ pub struct Inner {
     pool: Arc<AtomPool>,
     /// A list of all timeseries types by interval
     agg_mappings: Box<[AggregationMapping]>,
+    spec_version: Version,
 }
 
 impl InputSchema {
@@ -1041,6 +1044,7 @@ impl InputSchema {
                 enum_map,
                 pool,
                 agg_mappings,
+                spec_version: spec_version.clone(),
             }),
         })
     }
@@ -1240,7 +1244,7 @@ impl InputSchema {
         };
         Ok(obj_type
             .shared_interfaces
-            .into_iter()
+            .iter()
             .map(|atom| EntityType::new(self.cheap_clone(), *atom))
             .collect())
     }
@@ -1584,6 +1588,14 @@ impl InputSchema {
         }?;
         Some(EntityType::new(self.cheap_clone(), obj_type.name))
     }
+
+    /// How the values for the VID field are generated.
+    /// When this is `false`, this subgraph uses the old way of autoincrementing `vid` in the database.
+    /// When it is `true`, `graph-node` sets the `vid` explicitly to a number based on block number
+    /// and the order in which entities are written, and comparing by `vid` will order entities by that order.
+    pub fn strict_vid_order(&self) -> bool {
+        self.inner.spec_version >= SPEC_VERSION_1_3_0
+    }
 }
 
 /// Create a new pool that contains the names of all the types defined
@@ -1596,6 +1608,8 @@ fn atom_pool(document: &s::Document) -> AtomPool {
     pool.intern(POI_OBJECT);
     pool.intern(POI_DIGEST);
     pool.intern(POI_BLOCK_TIME);
+
+    pool.intern(VID_FIELD);
 
     for definition in &document.definitions {
         match definition {

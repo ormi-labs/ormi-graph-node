@@ -1,21 +1,25 @@
-use prometheus::Counter;
-
-use crate::blockchain::block_stream::BlockStreamMetrics;
-use crate::prelude::{Gauge, Histogram, HostMetrics};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use prometheus::Counter;
+use prometheus::IntGauge;
+
 use super::stopwatch::StopwatchMetrics;
 use super::MetricsRegistry;
+use crate::blockchain::block_stream::BlockStreamMetrics;
+use crate::components::store::DeploymentLocator;
+use crate::prelude::{Gauge, Histogram, HostMetrics};
 
 pub struct SubgraphInstanceMetrics {
     pub block_trigger_count: Box<Histogram>,
     pub block_processing_duration: Box<Histogram>,
     pub block_ops_transaction_duration: Box<Histogram>,
     pub firehose_connection_errors: Counter,
-
     pub stopwatch: StopwatchMetrics,
+    pub deployment_status: DeploymentStatusMetric,
+    pub deployment_synced: DeploymentSyncedMetric,
+
     trigger_processing_duration: Box<Histogram>,
     blocks_processed_secs: Box<Counter>,
     blocks_processed_count: Box<Counter>,
@@ -26,6 +30,7 @@ impl SubgraphInstanceMetrics {
         registry: Arc<MetricsRegistry>,
         subgraph_hash: &str,
         stopwatch: StopwatchMetrics,
+        deployment_status: DeploymentStatusMetric,
     ) -> Self {
         let block_trigger_count = registry
             .new_deployment_histogram(
@@ -86,13 +91,18 @@ impl SubgraphInstanceMetrics {
                 labels,
             )
             .expect("failed to create blocks_processed_count counter");
+
+        let deployment_synced = DeploymentSyncedMetric::register(&registry, subgraph_hash);
+
         Self {
             block_trigger_count,
             block_processing_duration,
-            trigger_processing_duration,
             block_ops_transaction_duration,
             firehose_connection_errors,
             stopwatch,
+            deployment_status,
+            deployment_synced,
+            trigger_processing_duration,
             blocks_processed_secs,
             blocks_processed_count,
         }
@@ -114,6 +124,7 @@ impl SubgraphInstanceMetrics {
         registry.unregister(self.block_trigger_count.clone());
         registry.unregister(self.trigger_processing_duration.clone());
         registry.unregister(self.block_ops_transaction_duration.clone());
+        registry.unregister(Box::new(self.deployment_synced.inner.clone()));
     }
 }
 
@@ -153,4 +164,106 @@ pub struct RunnerMetrics {
     pub host: Arc<HostMetrics>,
     /// Sensors to measure the BlockStream metrics
     pub stream: Arc<BlockStreamMetrics>,
+}
+
+/// Reports the current indexing status of a deployment.
+#[derive(Clone)]
+pub struct DeploymentStatusMetric {
+    inner: IntGauge,
+}
+
+impl DeploymentStatusMetric {
+    const STATUS_STARTING: i64 = 1;
+    const STATUS_RUNNING: i64 = 2;
+    const STATUS_STOPPED: i64 = 3;
+    const STATUS_FAILED: i64 = 4;
+
+    /// Registers the metric.
+    pub fn register(registry: &MetricsRegistry, deployment: &DeploymentLocator) -> Self {
+        let deployment_status = registry
+            .new_int_gauge(
+                "deployment_status",
+                "Indicates the current indexing status of a deployment.\n\
+                 Possible values:\n\
+                 1 - graph-node is preparing to start indexing;\n\
+                 2 - deployment is being indexed;\n\
+                 3 - indexing is stopped by request;\n\
+                 4 - indexing failed;",
+                [("deployment", deployment.hash.as_str())],
+            )
+            .expect("failed to register `deployment_status` gauge");
+
+        Self {
+            inner: deployment_status,
+        }
+    }
+
+    /// Records that the graph-node is preparing to start indexing.
+    pub fn starting(&self) {
+        self.inner.set(Self::STATUS_STARTING);
+    }
+
+    /// Records that the deployment is being indexed.
+    pub fn running(&self) {
+        self.inner.set(Self::STATUS_RUNNING);
+    }
+
+    /// Records that the indexing is stopped by request.
+    pub fn stopped(&self) {
+        self.inner.set(Self::STATUS_STOPPED);
+    }
+
+    /// Records that the indexing failed.
+    pub fn failed(&self) {
+        self.inner.set(Self::STATUS_FAILED);
+    }
+}
+
+/// Indicates whether a deployment has reached the chain head since it was deployed.
+pub struct DeploymentSyncedMetric {
+    inner: IntGauge,
+
+    // If, for some reason, a deployment reports that it is synced, and then reports that it is not
+    // synced during an execution, this prevents the metric from reverting to the not synced state.
+    previously_synced: std::sync::OnceLock<()>,
+}
+
+impl DeploymentSyncedMetric {
+    const NOT_SYNCED: i64 = 0;
+    const SYNCED: i64 = 1;
+
+    /// Registers the metric.
+    pub fn register(registry: &MetricsRegistry, deployment_hash: &str) -> Self {
+        let metric = registry
+            .new_int_gauge(
+                "deployment_synced",
+                "Indicates whether a deployment has reached the chain head since it was deployed.\n\
+                 Possible values:\n\
+                 0 - deployment is not synced;\n\
+                 1 - deployment is synced;",
+                [("deployment", deployment_hash)],
+            )
+            .expect("failed to register `deployment_synced` gauge");
+
+        Self {
+            inner: metric,
+            previously_synced: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Records the current sync status of the deployment.
+    /// Will ignore all values after the first `true` is received.
+    pub fn record(&self, synced: bool) {
+        if self.previously_synced.get().is_some() {
+            return;
+        }
+
+        if synced {
+            self.inner.set(Self::SYNCED);
+            let _ = self.previously_synced.set(());
+            return;
+        }
+
+        self.inner.set(Self::NOT_SYNCED);
+    }
 }

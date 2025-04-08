@@ -13,9 +13,7 @@ graph = { path = "../graph" }
 graph-chain-arweave = { path = "../chain/arweave" }
 graph-chain-ethereum = { path = "../chain/ethereum" }
 graph-chain-near = { path = "../chain/near" }
-graph-chain-cosmos = { path = "../chain/cosmos" }
 graph-chain-substreams = { path = "../chain/substreams" }
-graph-chain-starknet = { path = "../chain/starknet" }
 graph-runtime-wasm = { path = "../runtime/wasm" }
 serde_yaml = { workspace = true }
 # Switch to crates.io once tower 0.5 is released
@@ -25,8 +23,4 @@ anyhow = "1.0"
 
 [dev-dependencies]
 tower-test = { git = "https://github.com/tower-rs/tower.git" }
-ipfs-api-backend-hyper = "0.6"
-ipfs-api = { version = "0.17.0", features = [
-    "with-hyper-rustls",
-], default-features = false }
-uuid = { version = "1.9.1", features = ["v4"] }
+wiremock = "0.6.1"

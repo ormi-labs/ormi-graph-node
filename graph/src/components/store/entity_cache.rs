@@ -1,4 +1,4 @@
-use anyhow::anyhow;
+use anyhow::{anyhow, bail};
 use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::fmt::{self, Debug};
@@ -8,7 +8,7 @@ use crate::cheap_clone::CheapClone;
 use crate::components::store::write::EntityModification;
 use crate::components::store::{self as s, Entity, EntityOperation};
 use crate::data::store::{EntityValidationError, Id, IdType, IntoEntityIterator};
-use crate::prelude::ENV_VARS;
+use crate::prelude::{CacheWeight, ENV_VARS};
 use crate::schema::{EntityKey, InputSchema};
 use crate::util::intern::Error as InternError;
 use crate::util::lfu_cache::{EvictStats, LfuCache};
@@ -16,6 +16,10 @@ use crate::util::lfu_cache::{EvictStats, LfuCache};
 use super::{BlockNumber, DerivedEntityQuery, LoadRelatedRequest, StoreError};
 
 pub type EntityLfuCache = LfuCache<EntityKey, Option<Arc<Entity>>>;
+
+// Number of VIDs that are reserved outside of the generated ones here.
+// Currently none is used, but lets reserve a few more.
+const RESERVED_VIDS: u32 = 100;
 
 /// The scope in which the `EntityCache` should perform a `get` operation
 pub enum GetScope {
@@ -105,6 +109,10 @@ pub struct EntityCache {
     /// generated IDs, the `EntityCache` needs to be newly instantiated for
     /// each block
     seq: u32,
+
+    // Sequence number of the next VID value for this block. The value written
+    // in the database consist of a block number and this SEQ number.
+    pub vid_seq: u32,
 }
 
 impl Debug for EntityCache {
@@ -132,6 +140,7 @@ impl EntityCache {
             schema: store.input_schema(),
             store,
             seq: 0,
+            vid_seq: RESERVED_VIDS,
         }
     }
 
@@ -152,6 +161,7 @@ impl EntityCache {
             schema: store.input_schema(),
             store,
             seq: 0,
+            vid_seq: RESERVED_VIDS,
         }
     }
 
@@ -197,9 +207,14 @@ impl EntityCache {
         };
 
         // Always test the cache consistency in debug mode. The test only
-        // makes sense when we were actually asked to read from the store
+        // makes sense when we were actually asked to read from the store.
+        // We need to remove the VID as the one from the DB  might come from
+        // a legacy subgraph that has VID autoincremented while this trait
+        // always creates it in a new style.
         debug_assert!(match scope {
-            GetScope::Store => entity == self.store.get(key).unwrap().map(Arc::new),
+            GetScope::Store => {
+                entity == self.store.get(key).unwrap().map(Arc::new)
+            }
             GetScope::InBlock => true,
         });
 
@@ -349,9 +364,42 @@ impl EntityCache {
     /// with existing data. The entity will be validated against the
     /// subgraph schema, and any errors will result in an `Err` being
     /// returned.
-    pub fn set(&mut self, key: EntityKey, entity: Entity) -> Result<(), anyhow::Error> {
+    pub fn set(
+        &mut self,
+        key: EntityKey,
+        entity: Entity,
+        block: BlockNumber,
+        write_capacity_remaining: Option<&mut usize>,
+    ) -> Result<(), anyhow::Error> {
         // check the validate for derived fields
         let is_valid = entity.validate(&key).is_ok();
+
+        if let Some(write_capacity_remaining) = write_capacity_remaining {
+            let weight = entity.weight();
+            if !self.current.contains_key(&key) && weight > *write_capacity_remaining {
+                return Err(anyhow!(
+                    "exceeded block write limit when writing entity `{}`",
+                    key.entity_id,
+                ));
+            }
+
+            *write_capacity_remaining -= weight;
+        }
+
+        // The next VID is based on a block number and a sequence within the block
+        let vid = ((block as i64) << 32) + self.vid_seq as i64;
+        self.vid_seq += 1;
+        let mut entity = entity;
+        let old_vid = entity.set_vid(vid).expect("the vid should be set");
+        // Make sure that there was no VID previously set for this entity.
+        if let Some(ovid) = old_vid {
+            bail!(
+                "VID: {} of entity: {} with ID: {} was already present when set in EntityCache",
+                ovid,
+                key.entity_type,
+                entity.id()
+            );
+        }
 
         self.entity_op(key.clone(), EntityOp::Update(entity));
 
@@ -489,7 +537,7 @@ impl EntityCache {
                 // Entity was removed and then updated, so it will be overwritten
                 (Some(current), EntityOp::Overwrite(data)) => {
                     let data = Arc::new(data);
-                    self.current.insert(key.clone(), Some(data.clone()));
+                    self.current.insert(key.clone(), Some(data.cheap_clone()));
                     if current != data {
                         Some(Overwrite {
                             key,

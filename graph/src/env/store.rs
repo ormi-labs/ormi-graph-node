@@ -49,13 +49,6 @@ pub struct EnvVarsStore {
     /// only as an emergency setting for the hosted service. Remove after
     /// 2022-07-01 if hosted service had no issues with it being `true`
     pub order_by_block_range: bool,
-    /// Whether to disable the notifications that feed GraphQL
-    /// subscriptions. When the flag is set, no updates
-    /// about entity changes will be sent to query nodes.
-    ///
-    /// Set by the flag `GRAPH_DISABLE_SUBSCRIPTION_NOTIFICATIONS`. Not set
-    /// by default.
-    pub disable_subscription_notifications: bool,
     /// Set by the environment variable `GRAPH_REMOVE_UNUSED_INTERVAL`
     /// (expressed in minutes). The default value is 360 minutes.
     pub remove_unused_interval: chrono::Duration,
@@ -87,6 +80,22 @@ pub struct EnvVarsStore {
     /// Set by `GRAPH_STORE_BATCH_TARGET_DURATION` (expressed in seconds).
     /// The default is 180s.
     pub batch_target_duration: Duration,
+
+    /// Cancel and reset a batch copy operation if it takes longer than
+    /// this. Set by `GRAPH_STORE_BATCH_TIMEOUT`. Unlimited by default
+    pub batch_timeout: Option<Duration>,
+
+    /// The number of workers to use for batch operations. If there are idle
+    /// connections, each subgraph copy operation will use up to this many
+    /// workers to copy tables in parallel. Defaults to 1 and must be at
+    /// least 1
+    pub batch_workers: usize,
+
+    /// How long to wait to get an additional connection for a batch worker.
+    /// This should just be big enough to allow the connection pool to
+    /// establish a connection. Set by `GRAPH_STORE_BATCH_WORKER_WAIT`.
+    /// Value is in ms and defaults to 2000ms
+    pub batch_worker_wait: Duration,
 
     /// Prune tables where we will remove at least this fraction of entity
     /// versions by rebuilding the table. Set by
@@ -120,6 +129,22 @@ pub struct EnvVarsStore {
     pub use_brin_for_all_query_types: bool,
     /// Temporary env var to disable certain lookups in the chain store
     pub disable_block_cache_for_lookup: bool,
+    /// Temporary env var to fall back to the old broken way of determining
+    /// the time of the last rollup from the POI table instead of the new
+    /// way that fixes
+    /// https://github.com/graphprotocol/graph-node/issues/5530 Remove this
+    /// and all code that is dead as a consequence once this has been vetted
+    /// sufficiently, probably after 2024-12-01
+    /// Defaults to `false`, i.e. using the new fixed behavior
+    pub last_rollup_from_poi: bool,
+    /// Safety switch to increase the number of columns used when
+    /// calculating the chunk size in `InsertQuery::chunk_size`. This can be
+    /// used to work around Postgres errors complaining 'number of
+    /// parameters must be between 0 and 65535' when inserting entities
+    pub insert_extra_cols: usize,
+    /// The number of rows to fetch from the foreign data wrapper in one go,
+    /// this will be set as the option 'fetch_size' on all foreign servers
+    pub fdw_fetch_size: usize,
 }
 
 // This does not print any values avoid accidentally leaking any sensitive env vars
@@ -129,9 +154,11 @@ impl fmt::Debug for EnvVarsStore {
     }
 }
 
-impl From<InnerStore> for EnvVarsStore {
-    fn from(x: InnerStore) -> Self {
-        Self {
+impl TryFrom<InnerStore> for EnvVarsStore {
+    type Error = anyhow::Error;
+
+    fn try_from(x: InnerStore) -> Result<Self, Self::Error> {
+        let vars = Self {
             chain_head_watcher_timeout: Duration::from_secs(x.chain_head_watcher_timeout_in_secs),
             query_stats_refresh_interval: Duration::from_secs(
                 x.query_stats_refresh_interval_in_secs,
@@ -150,7 +177,6 @@ impl From<InnerStore> for EnvVarsStore {
             typea_batch_size: x.typea_batch_size,
             typed_children_set_size: x.typed_children_set_size,
             order_by_block_range: x.order_by_block_range.0,
-            disable_subscription_notifications: x.disable_subscription_notifications.0,
             remove_unused_interval: chrono::Duration::minutes(
                 x.remove_unused_interval_in_minutes as i64,
             ),
@@ -160,6 +186,9 @@ impl From<InnerStore> for EnvVarsStore {
             connection_idle_timeout: Duration::from_secs(x.connection_idle_timeout_in_secs),
             write_queue_size: x.write_queue_size,
             batch_target_duration: Duration::from_secs(x.batch_target_duration_in_secs),
+            batch_timeout: x.batch_timeout_in_secs.map(Duration::from_secs),
+            batch_workers: x.batch_workers,
+            batch_worker_wait: Duration::from_millis(x.batch_worker_wait),
             rebuild_threshold: x.rebuild_threshold.0,
             delete_threshold: x.delete_threshold.0,
             history_slack_factor: x.history_slack_factor.0,
@@ -168,7 +197,21 @@ impl From<InnerStore> for EnvVarsStore {
             create_gin_indexes: x.create_gin_indexes,
             use_brin_for_all_query_types: x.use_brin_for_all_query_types,
             disable_block_cache_for_lookup: x.disable_block_cache_for_lookup,
+            last_rollup_from_poi: x.last_rollup_from_poi,
+            insert_extra_cols: x.insert_extra_cols,
+            fdw_fetch_size: x.fdw_fetch_size,
+        };
+        if let Some(timeout) = vars.batch_timeout {
+            if timeout < 2 * vars.batch_target_duration {
+                bail!(
+                    "GRAPH_STORE_BATCH_TIMEOUT must be greater than 2*GRAPH_STORE_BATCH_TARGET_DURATION"
+                );
+            }
         }
+        if vars.batch_workers < 1 {
+            bail!("GRAPH_STORE_BATCH_WORKERS must be at least 1");
+        }
+        Ok(vars)
     }
 }
 
@@ -192,8 +235,6 @@ pub struct InnerStore {
     typed_children_set_size: usize,
     #[envconfig(from = "ORDER_BY_BLOCK_RANGE", default = "true")]
     order_by_block_range: EnvVarBoolean,
-    #[envconfig(from = "GRAPH_DISABLE_SUBSCRIPTION_NOTIFICATIONS", default = "false")]
-    disable_subscription_notifications: EnvVarBoolean,
     #[envconfig(from = "GRAPH_REMOVE_UNUSED_INTERVAL", default = "360")]
     remove_unused_interval_in_minutes: u64,
     #[envconfig(from = "GRAPH_STORE_RECENT_BLOCKS_CACHE_CAPACITY", default = "10")]
@@ -213,6 +254,12 @@ pub struct InnerStore {
     write_queue_size: usize,
     #[envconfig(from = "GRAPH_STORE_BATCH_TARGET_DURATION", default = "180")]
     batch_target_duration_in_secs: u64,
+    #[envconfig(from = "GRAPH_STORE_BATCH_TIMEOUT")]
+    batch_timeout_in_secs: Option<u64>,
+    #[envconfig(from = "GRAPH_STORE_BATCH_WORKERS", default = "1")]
+    batch_workers: usize,
+    #[envconfig(from = "GRAPH_STORE_BATCH_WORKER_WAIT", default = "2000")]
+    batch_worker_wait: u64,
     #[envconfig(from = "GRAPH_STORE_HISTORY_REBUILD_THRESHOLD", default = "0.5")]
     rebuild_threshold: ZeroToOneF64,
     #[envconfig(from = "GRAPH_STORE_HISTORY_DELETE_THRESHOLD", default = "0.05")]
@@ -229,6 +276,12 @@ pub struct InnerStore {
     use_brin_for_all_query_types: bool,
     #[envconfig(from = "GRAPH_STORE_DISABLE_BLOCK_CACHE_FOR_LOOKUP", default = "false")]
     disable_block_cache_for_lookup: bool,
+    #[envconfig(from = "GRAPH_STORE_LAST_ROLLUP_FROM_POI", default = "false")]
+    last_rollup_from_poi: bool,
+    #[envconfig(from = "GRAPH_STORE_INSERT_EXTRA_COLS", default = "0")]
+    insert_extra_cols: usize,
+    #[envconfig(from = "GRAPH_STORE_FDW_FETCH_SIZE", default = "1000")]
+    fdw_fetch_size: usize,
 }
 
 #[derive(Clone, Copy, Debug)]

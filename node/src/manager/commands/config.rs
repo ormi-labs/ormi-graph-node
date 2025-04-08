@@ -1,11 +1,9 @@
 use std::{collections::BTreeMap, sync::Arc};
 
+use graph::components::network_provider::ChainName;
 use graph::{
     anyhow::{bail, Context},
-    components::{
-        adapter::{ChainId, MockIdentValidator},
-        subgraph::{Setting, Settings},
-    },
+    components::subgraph::{Setting, Settings},
     endpoint::EndpointMetrics,
     env::EnvVars,
     itertools::Itertools,
@@ -141,15 +139,8 @@ pub async fn provider(
 
     let metrics = Arc::new(EndpointMetrics::mock());
     let caps = caps_from_features(features)?;
-    let networks = Networks::from_config(
-        logger,
-        &config,
-        registry,
-        metrics,
-        Arc::new(MockIdentValidator),
-    )
-    .await?;
-    let network: ChainId = network.into();
+    let networks = Networks::from_config(logger, &config, registry, metrics, &[]).await?;
+    let network: ChainName = network.into();
     let adapters = networks.ethereum_rpcs(network.clone());
 
     let adapters = adapters.all_cheapest_with(&caps).await;

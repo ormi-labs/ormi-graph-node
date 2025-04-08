@@ -15,25 +15,20 @@ use graph::blockchain::{
     ChainIdentifier,
 };
 use graph::cheap_clone::CheapClone;
-use graph::components::adapter::ChainId;
+use graph::components::network_provider::ChainName;
 use graph::components::store::{BlockStore as _, ChainStore};
 use graph::data::store::NodeId;
 use graph::endpoint::EndpointMetrics;
 use graph::env::{EnvVars, ENV_VARS};
-use graph::firehose::{
-    FirehoseEndpoint, FirehoseGenesisDecoder, GenesisDecoder, SubgraphLimit,
-    SubstreamsGenesisDecoder,
-};
+use graph::firehose::{FirehoseEndpoint, SubgraphLimit};
 use graph::futures03::future::try_join_all;
-use graph::futures03::TryFutureExt;
-use graph::ipfs_client::IpfsClient;
 use graph::itertools::Itertools;
 use graph::log::factory::LoggerFactory;
 use graph::prelude::anyhow;
 use graph::prelude::MetricsRegistry;
-use graph::slog::{debug, error, info, o, Logger};
+use graph::slog::{debug, info, o, warn, Logger};
+use graph::tokio::time::timeout;
 use graph::url::Url;
-use graph::util::security::SafeDisplay;
 use graph_chain_ethereum::{self as ethereum, Transport};
 use graph_store_postgres::{BlockStore, ChainHeadUpdateListener};
 use std::cmp::Ordering;
@@ -53,73 +48,6 @@ pub enum ProviderNetworkStatus {
     },
 }
 
-pub fn create_ipfs_clients(logger: &Logger, ipfs_addresses: &Vec<String>) -> Vec<IpfsClient> {
-    // Parse the IPFS URL from the `--ipfs` command line argument
-    let ipfs_addresses: Vec<_> = ipfs_addresses
-        .iter()
-        .map(|uri| {
-            if uri.starts_with("http://") || uri.starts_with("https://") {
-                String::from(uri)
-            } else {
-                format!("http://{}", uri)
-            }
-        })
-        .collect();
-
-    ipfs_addresses
-        .into_iter()
-        .map(|ipfs_address| {
-            info!(
-                logger,
-                "Trying IPFS node at: {}",
-                SafeDisplay(&ipfs_address)
-            );
-
-            let ipfs_client = match IpfsClient::new(&ipfs_address) {
-                Ok(ipfs_client) => ipfs_client,
-                Err(e) => {
-                    error!(
-                        logger,
-                        "Failed to create IPFS client for `{}`: {}",
-                        SafeDisplay(&ipfs_address),
-                        e
-                    );
-                    panic!("Could not connect to IPFS");
-                }
-            };
-
-            // Test the IPFS client by getting the version from the IPFS daemon
-            let ipfs_test = ipfs_client.cheap_clone();
-            let ipfs_ok_logger = logger.clone();
-            let ipfs_err_logger = logger.clone();
-            let ipfs_address_for_ok = ipfs_address.clone();
-            let ipfs_address_for_err = ipfs_address;
-            graph::spawn(async move {
-                ipfs_test
-                    .test()
-                    .map_err(move |e| {
-                        error!(
-                            ipfs_err_logger,
-                            "Is there an IPFS node running at \"{}\"?",
-                            SafeDisplay(ipfs_address_for_err),
-                        );
-                        panic!("Failed to connect to IPFS: {}", e);
-                    })
-                    .map_ok(move |_| {
-                        info!(
-                            ipfs_ok_logger,
-                            "Successfully connected to IPFS node at: {}",
-                            SafeDisplay(ipfs_address_for_ok)
-                        );
-                    })
-                    .await
-            });
-
-            ipfs_client
-        })
-        .collect()
-}
-
 pub fn create_substreams_networks(
     logger: Logger,
     config: &Config,
@@ -132,11 +60,11 @@ pub fn create_substreams_networks(
         config.chains.ingestor,
     );
 
-    let mut networks_by_kind: BTreeMap<(BlockchainKind, ChainId), Vec<Arc<FirehoseEndpoint>>> =
+    let mut networks_by_kind: BTreeMap<(BlockchainKind, ChainName), Vec<Arc<FirehoseEndpoint>>> =
         BTreeMap::new();
 
     for (name, chain) in &config.chains.chains {
-        let name: ChainId = name.as_str().into();
+        let name: ChainName = name.as_str().into();
         for provider in &chain.providers {
             if let ProviderDetails::Substreams(ref firehose) = provider.details {
                 info!(
@@ -162,7 +90,7 @@ pub fn create_substreams_networks(
                         firehose.compression_enabled(),
                         SubgraphLimit::Unlimited,
                         endpoint_metrics.clone(),
-                        Box::new(SubstreamsGenesisDecoder {}),
+                        true,
                     )));
                 }
             }
@@ -193,11 +121,11 @@ pub fn create_firehose_networks(
         config.chains.ingestor,
     );
 
-    let mut networks_by_kind: BTreeMap<(BlockchainKind, ChainId), Vec<Arc<FirehoseEndpoint>>> =
+    let mut networks_by_kind: BTreeMap<(BlockchainKind, ChainName), Vec<Arc<FirehoseEndpoint>>> =
         BTreeMap::new();
 
     for (name, chain) in &config.chains.chains {
-        let name: ChainId = name.as_str().into();
+        let name: ChainName = name.as_str().into();
         for provider in &chain.providers {
             let logger = logger.cheap_clone();
             if let ProviderDetails::Firehose(ref firehose) = provider.details {
@@ -211,27 +139,6 @@ pub fn create_firehose_networks(
                 let parsed_networks = networks_by_kind
                     .entry((chain.protocol, name.clone()))
                     .or_insert_with(Vec::new);
-
-                let decoder: Box<dyn GenesisDecoder> = match chain.protocol {
-                    BlockchainKind::Arweave => {
-                        FirehoseGenesisDecoder::<graph_chain_arweave::Block>::new(logger)
-                    }
-                    BlockchainKind::Ethereum => {
-                        FirehoseGenesisDecoder::<graph_chain_ethereum::codec::Block>::new(logger)
-                    }
-                    BlockchainKind::Near => {
-                        FirehoseGenesisDecoder::<graph_chain_near::HeaderOnlyBlock>::new(logger)
-                    }
-                    BlockchainKind::Cosmos => {
-                        FirehoseGenesisDecoder::<graph_chain_cosmos::Block>::new(logger)
-                    }
-                    BlockchainKind::Substreams => {
-                        unreachable!("Substreams configuration should not be handled here");
-                    }
-                    BlockchainKind::Starknet => {
-                        FirehoseGenesisDecoder::<graph_chain_starknet::Block>::new(logger)
-                    }
-                };
 
                 // Create n FirehoseEndpoints where n is the size of the pool. If a
                 // subgraph limit is defined for this endpoint then each endpoint
@@ -251,7 +158,7 @@ pub fn create_firehose_networks(
                         firehose.compression_enabled(),
                         firehose.limit_for(&config.node),
                         endpoint_metrics.cheap_clone(),
-                        decoder.box_clone(),
+                        false,
                     )));
                 }
             }
@@ -432,10 +339,18 @@ pub async fn networks_as_chains(
         let chain_store = match store.chain_store(chain_id) {
             Some(c) => c,
             None => {
-                let ident = networks
-                    .chain_identifier(&logger, chain_id)
-                    .await
-                    .expect("must be able to get chain identity to create a store");
+                let ident = match timeout(
+                    config.genesis_validation_timeout,
+                    networks.chain_identifier(&logger, chain_id),
+                )
+                .await
+                {
+                    Ok(Ok(ident)) => ident,
+                    err => {
+                        warn!(&logger, "unable to fetch genesis for {}. Err: {:?}.falling back to the default value", chain_id, err);
+                        ChainIdentifier::default()
+                    }
+                };
                 store
                     .create_chain_store(chain_id, ident)
                     .expect("must be able to create store if one is not yet setup for the chain")
@@ -445,7 +360,7 @@ pub async fn networks_as_chains(
         async fn add_substreams<C: Blockchain>(
             networks: &Networks,
             config: &Arc<EnvVars>,
-            chain_id: ChainId,
+            chain_id: ChainName,
             blockchain_map: &mut BlockchainMap,
             logger_factory: LoggerFactory,
             chain_store: Arc<dyn ChainStore>,
@@ -520,11 +435,13 @@ pub async fn networks_as_chains(
                 };
 
                 let client = Arc::new(cc);
+                let eth_adapters = Arc::new(eth_adapters);
                 let adapter_selector = EthereumAdapterSelector::new(
                     logger_factory.clone(),
                     client.clone(),
                     metrics_registry.clone(),
                     chain_store.clone(),
+                    eth_adapters.clone(),
                 );
 
                 let call_cache = chain_store.cheap_clone();
@@ -542,7 +459,7 @@ pub async fn networks_as_chains(
                     Arc::new(EthereumBlockRefetcher {}),
                     Arc::new(adapter_selector),
                     Arc::new(EthereumRuntimeAdapterBuilder {}),
-                    Arc::new(eth_adapters.clone()),
+                    eth_adapters,
                     ENV_VARS.reorg_threshold,
                     polling_interval,
                     true,
@@ -590,60 +507,6 @@ pub async fn networks_as_chains(
                 )
                 .await;
             }
-            BlockchainKind::Cosmos => {
-                let firehose_endpoints = networks.firehose_endpoints(chain_id.clone());
-                blockchain_map.insert::<graph_chain_cosmos::Chain>(
-                    chain_id.clone(),
-                    Arc::new(
-                        BasicBlockchainBuilder {
-                            logger_factory: logger_factory.clone(),
-                            name: chain_id.clone(),
-                            chain_store: chain_store.cheap_clone(),
-                            firehose_endpoints,
-                            metrics_registry: metrics_registry.clone(),
-                        }
-                        .build(config)
-                        .await,
-                    ),
-                );
-                add_substreams::<graph_chain_cosmos::Chain>(
-                    networks,
-                    config,
-                    chain_id.clone(),
-                    blockchain_map,
-                    logger_factory.clone(),
-                    chain_store,
-                    metrics_registry.clone(),
-                )
-                .await;
-            }
-            BlockchainKind::Starknet => {
-                let firehose_endpoints = networks.firehose_endpoints(chain_id.clone());
-                blockchain_map.insert::<graph_chain_starknet::Chain>(
-                    chain_id.clone(),
-                    Arc::new(
-                        BasicBlockchainBuilder {
-                            logger_factory: logger_factory.clone(),
-                            name: chain_id.clone(),
-                            chain_store: chain_store.cheap_clone(),
-                            firehose_endpoints,
-                            metrics_registry: metrics_registry.clone(),
-                        }
-                        .build(config)
-                        .await,
-                    ),
-                );
-                add_substreams::<graph_chain_starknet::Chain>(
-                    networks,
-                    config,
-                    chain_id.clone(),
-                    blockchain_map,
-                    logger_factory.clone(),
-                    chain_store,
-                    metrics_registry.clone(),
-                )
-                .await;
-            }
             BlockchainKind::Substreams => {
                 let substreams_endpoints = networks.substreams_endpoints(chain_id.clone());
                 blockchain_map.insert::<graph_chain_substreams::Chain>(
@@ -669,7 +532,7 @@ pub async fn networks_as_chains(
 mod test {
     use crate::config::{Config, Opt};
     use crate::network_setup::{AdapterConfiguration, Networks};
-    use graph::components::adapter::{ChainId, MockIdentValidator};
+    use graph::components::network_provider::ChainName;
     use graph::endpoint::EndpointMetrics;
     use graph::log::logger;
     use graph::prelude::{tokio, MetricsRegistry};
@@ -702,17 +565,15 @@ mod test {
         let metrics = Arc::new(EndpointMetrics::mock());
         let config = Config::load(&logger, &opt).expect("can create config");
         let metrics_registry = Arc::new(MetricsRegistry::mock());
-        let ident_validator = Arc::new(MockIdentValidator);
 
-        let networks =
-            Networks::from_config(logger, &config, metrics_registry, metrics, ident_validator)
-                .await
-                .expect("can parse config");
+        let networks = Networks::from_config(logger, &config, metrics_registry, metrics, &[])
+            .await
+            .expect("can parse config");
         let mut network_names = networks
             .adapters
             .iter()
             .map(|a| a.chain_id())
-            .collect::<Vec<&ChainId>>();
+            .collect::<Vec<&ChainName>>();
         network_names.sort();
 
         let traces = NodeCapabilities {

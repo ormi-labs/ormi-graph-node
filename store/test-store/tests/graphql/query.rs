@@ -4,12 +4,12 @@ use graph::data::store::scalar::Timestamp;
 use graph::data::subgraph::schema::DeploymentCreate;
 use graph::data::subgraph::LATEST_VERSION;
 use graph::entity;
-use graph::prelude::{SubscriptionResult, Value};
+use graph::prelude::Value;
 use graph::schema::InputSchema;
 use std::iter::FromIterator;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use std::{
     collections::{BTreeSet, HashMap},
     marker::PhantomData,
@@ -18,7 +18,6 @@ use test_store::block_store::{
     FakeBlock, BLOCK_FOUR, BLOCK_ONE, BLOCK_THREE, BLOCK_TWO, GENESIS_BLOCK,
 };
 
-use graph::futures03::stream::StreamExt;
 use graph::{
     components::store::DeploymentLocator,
     data::graphql::{object, object_value},
@@ -28,17 +27,16 @@ use graph::{
         subgraph::SubgraphFeature,
     },
     prelude::{
-        lazy_static, o, q, r, serde_json, slog, BlockPtr, DeploymentHash, Entity, EntityOperation,
-        FutureExtension, GraphQlRunner as _, Logger, NodeId, Query, QueryError,
-        QueryExecutionError, QueryResult, QueryStoreManager, QueryVariables, SubgraphManifest,
-        SubgraphName, SubgraphStore, SubgraphVersionSwitchingMode, Subscription, SubscriptionError,
+        lazy_static, q, r, serde_json, BlockPtr, DeploymentHash, Entity, EntityOperation,
+        GraphQlRunner as _, NodeId, Query, QueryError, QueryExecutionError, QueryResult,
+        QueryVariables, SubgraphManifest, SubgraphName, SubgraphStore,
+        SubgraphVersionSwitchingMode,
     },
 };
-use graph_graphql::{prelude::*, subscription::execute_subscription};
+use graph_graphql::prelude::*;
 use test_store::{
-    deployment_state, execute_subgraph_query, execute_subgraph_query_with_deadline,
-    graphql_metrics, revert_block, run_test_sequentially, transact_errors, Store, LOAD_MANAGER,
-    LOGGER, METRICS_REGISTRY, STORE, SUBSCRIPTION_MANAGER,
+    deployment_state, execute_subgraph_query, execute_subgraph_query_with_deadline, revert_block,
+    run_test_sequentially, transact_errors, Store, LOAD_MANAGER, LOGGER, METRICS_REGISTRY, STORE,
 };
 
 /// Ids for the various entities that we create in `insert_entities` and
@@ -424,9 +422,12 @@ async fn insert_test_entities(
             .into_iter()
             .map(|(typename, entities)| {
                 let entity_type = schema.entity_type(typename).unwrap();
-                entities.into_iter().map(move |data| EntityOperation::Set {
-                    key: entity_type.key(data.id()),
-                    data,
+                entities.into_iter().map(move |mut data| {
+                    data.set_vid_if_empty();
+                    EntityOperation::Set {
+                        key: entity_type.key(data.id()),
+                        data,
+                    }
                 })
             })
             .flatten()
@@ -468,115 +469,118 @@ async fn insert_test_entities(
         (
             "Musician",
             vec![
-                entity! { is => id: "m1", name: "John", mainBand: "b1", bands: vec!["b1", "b2"], favoriteCount: 10, birthDate: timestamp.clone() },
-                entity! { is => id: "m2", name: "Lisa", mainBand: "b1", bands: vec!["b1"], favoriteCount: 100, birthDate: timestamp.clone() },
+                entity! { is => id: "m1", name: "John", mainBand: "b1", bands: vec!["b1", "b2"], favoriteCount: 10, birthDate: timestamp.clone(), vid: 0i64 },
+                entity! { is => id: "m2", name: "Lisa", mainBand: "b1", bands: vec!["b1"], favoriteCount: 100, birthDate: timestamp.clone(), vid: 1i64 },
             ],
         ),
-        ("Publisher", vec![entity! { is => id: pub1 }]),
+        ("Publisher", vec![entity! { is => id: pub1, vid: 0i64 }]),
         (
             "Band",
             vec![
-                entity! { is => id: "b1", name: "The Musicians", originalSongs: vec![s[1], s[2]] },
-                entity! { is => id: "b2", name: "The Amateurs",  originalSongs: vec![s[1], s[3], s[4]] },
+                entity! { is => id: "b1", name: "The Musicians", originalSongs: vec![s[1], s[2]], vid: 0i64 },
+                entity! { is => id: "b2", name: "The Amateurs",  originalSongs: vec![s[1], s[3], s[4]], vid: 1i64 },
             ],
         ),
         (
             "Song",
             vec![
-                entity! { is => id: s[1], sid: "s1", title: "Cheesy Tune",  publisher: pub1, writtenBy: "m1", media: vec![md[1], md[2]] },
-                entity! { is => id: s[2], sid: "s2", title: "Rock Tune",    publisher: pub1, writtenBy: "m2", media: vec![md[3], md[4]] },
-                entity! { is => id: s[3], sid: "s3", title: "Pop Tune",     publisher: pub1, writtenBy: "m1", media: vec![md[5]] },
-                entity! { is => id: s[4], sid: "s4", title: "Folk Tune",    publisher: pub1, writtenBy: "m3", media: vec![md[6]] },
+                entity! { is => id: s[1], sid: "s1", title: "Cheesy Tune",  publisher: pub1, writtenBy: "m1", media: vec![md[1], md[2]], vid: 0i64 },
+                entity! { is => id: s[2], sid: "s2", title: "Rock Tune",    publisher: pub1, writtenBy: "m2", media: vec![md[3], md[4]], vid: 1i64 },
+                entity! { is => id: s[3], sid: "s3", title: "Pop Tune",     publisher: pub1, writtenBy: "m1", media: vec![md[5]], vid: 2i64 },
+                entity! { is => id: s[4], sid: "s4", title: "Folk Tune",    publisher: pub1, writtenBy: "m3", media: vec![md[6]], vid: 3i64 },
             ],
         ),
         (
             "User",
             vec![
-                entity! { is => id: "u1", name: "User 1", latestSongReview: "r3", latestBandReview: "r1", latestReview: "r3" },
+                entity! { is => id: "u1", name: "User 1", latestSongReview: "r3", latestBandReview: "r1", latestReview: "r3", vid: 0i64 },
             ],
         ),
         (
             "SongStat",
             vec![
-                entity! { is => id: s[1], played: 10 },
-                entity! { is => id: s[2], played: 15 },
+                entity! { is => id: s[1], played: 10, vid: 0i64 },
+                entity! { is => id: s[2], played: 15, vid: 1i64 },
             ],
         ),
         (
             "BandReview",
             vec![
-                entity! { is => id: "r1", body: "Bad musicians",        band: "b1", author: "u1" },
-                entity! { is => id: "r2", body: "Good amateurs",        band: "b2", author: "u2" },
-                entity! { is => id: "r5", body: "Very Bad musicians",   band: "b1", author: "u3" },
+                entity! { is => id: "r1", body: "Bad musicians",        band: "b1", author: "u1", vid: 0i64 },
+                entity! { is => id: "r2", body: "Good amateurs",        band: "b2", author: "u2", vid: 1i64 },
+                entity! { is => id: "r5", body: "Very Bad musicians",   band: "b1", author: "u3", vid: 2i64 },
             ],
         ),
         (
             "SongReview",
             vec![
-                entity! { is => id: "r3", body: "Bad",                  song: s[2], author: "u1" },
-                entity! { is => id: "r4", body: "Good",                 song: s[3], author: "u2" },
-                entity! { is => id: "r6", body: "Very Bad",             song: s[2], author: "u3" },
+                entity! { is => id: "r3", body: "Bad",                  song: s[2], author: "u1", vid: 0i64 },
+                entity! { is => id: "r4", body: "Good",                 song: s[3], author: "u2", vid: 1i64 },
+                entity! { is => id: "r6", body: "Very Bad",             song: s[2], author: "u3", vid: 2i64 },
             ],
         ),
         (
             "User",
             vec![
-                entity! { is => id: "u1", name: "Baden",        latestSongReview: "r3", latestBandReview: "r1", latestReview: "r1" },
-                entity! { is => id: "u2", name: "Goodwill",     latestSongReview: "r4", latestBandReview: "r2", latestReview: "r2" },
+                entity! { is => id: "u1", name: "Baden",        latestSongReview: "r3", latestBandReview: "r1", latestReview: "r1", vid: 0i64 },
+                entity! { is => id: "u2", name: "Goodwill",     latestSongReview: "r4", latestBandReview: "r2", latestReview: "r2", vid: 1i64 },
             ],
         ),
         (
             "AnonymousUser",
             vec![
-                entity! { is => id: "u3", name: "Anonymous 3",  latestSongReview: "r6", latestBandReview: "r5", latestReview: "r5" },
+                entity! { is => id: "u3", name: "Anonymous 3",  latestSongReview: "r6", latestBandReview: "r5", latestReview: "r5", vid: 0i64 },
             ],
         ),
         (
             "Photo",
             vec![
-                entity! { is => id: md[1],   title: "Cheesy Tune Single Cover",  author: "u1" },
-                entity! { is => id: md[3],   title: "Rock Tune Single Cover",    author: "u1" },
-                entity! { is => id: md[5],   title: "Pop Tune Single Cover",     author: "u1" },
+                entity! { is => id: md[1],   title: "Cheesy Tune Single Cover",  author: "u1", vid: 0i64 },
+                entity! { is => id: md[3],   title: "Rock Tune Single Cover",    author: "u1", vid: 1i64 },
+                entity! { is => id: md[5],   title: "Pop Tune Single Cover",     author: "u1", vid: 2i64 },
             ],
         ),
         (
             "Video",
             vec![
-                entity! { is => id: md[2],   title: "Cheesy Tune Music Video",   author: "u2" },
-                entity! { is => id: md[4],   title: "Rock Tune Music Video",     author: "u2" },
-                entity! { is => id: md[6],   title: "Folk Tune Music Video",     author: "u2" },
+                entity! { is => id: md[2],   title: "Cheesy Tune Music Video",   author: "u2", vid: 0i64 },
+                entity! { is => id: md[4],   title: "Rock Tune Music Video",     author: "u2", vid: 1i64 },
+                entity! { is => id: md[6],   title: "Folk Tune Music Video",     author: "u2", vid: 2i64 },
             ],
         ),
         (
             "Album",
-            vec![entity! { is => id: "rl1",   title: "Pop and Folk",    songs: vec![s[3], s[4]] }],
+            vec![
+                entity! { is => id: "rl1",   title: "Pop and Folk",    songs: vec![s[3], s[4]], vid: 0i64 },
+            ],
         ),
         (
             "Single",
             vec![
-                entity! { is => id: "rl2",  title: "Rock",           songs: vec![s[2]] },
-                entity! { is => id: "rl3",  title: "Cheesy",         songs: vec![s[1]] },
-                entity! { is => id: "rl4",  title: "Silence",        songs: Vec::<graph::prelude::Value>::new() },
+                entity! { is => id: "rl2",  title: "Rock",           songs: vec![s[2]], vid: 0i64 },
+                entity! { is => id: "rl3",  title: "Cheesy",         songs: vec![s[1]], vid: 1i64 },
+                entity! { is => id: "rl4",  title: "Silence",        songs: Vec::<graph::prelude::Value>::new(), vid: 2i64 },
             ],
         ),
         (
             "Plays",
             vec![
-                entity! { is => id: 1i64, timestamp: ts0, song: s[1], user: "u1"},
-                entity! { is => id: 2i64, timestamp: ts0, song: s[1], user: "u2"},
-                entity! { is => id: 3i64, timestamp: ts0, song: s[2], user: "u1"},
-                entity! { is => id: 4i64, timestamp: ts0, song: s[1], user: "u1"},
-                entity! { is => id: 5i64, timestamp: ts0, song: s[1], user: "u1"},
+                entity! { is => id: 1i64, timestamp: ts0, song: s[1], user: "u1", vid: 0i64 },
+                entity! { is => id: 2i64, timestamp: ts0, song: s[1], user: "u2", vid: 1i64 },
+                entity! { is => id: 3i64, timestamp: ts0, song: s[2], user: "u1", vid: 2i64 },
+                entity! { is => id: 4i64, timestamp: ts0, song: s[1], user: "u1", vid: 3i64 },
+                entity! { is => id: 5i64, timestamp: ts0, song: s[1], user: "u1", vid: 4i64 },
             ],
         ),
     ];
+
     let entities0 = insert_ops(&manifest.schema, entities0);
 
     let entities1 = vec![(
         "Musician",
         vec![
-            entity! { is => id: "m3", name: "Tom", mainBand: "b2", bands: vec!["b1", "b2"], favoriteCount: 5, birthDate: timestamp.clone() },
-            entity! { is => id: "m4", name: "Valerie", bands: Vec::<String>::new(), favoriteCount: 20, birthDate: timestamp.clone() },
+            entity! { is => id: "m3", name: "Tom", mainBand: "b2", bands: vec!["b1", "b2"], favoriteCount: 5, birthDate: timestamp.clone(), vid: 2i64 },
+            entity! { is => id: "m4", name: "Valerie", bands: Vec::<String>::new(), favoriteCount: 20, birthDate: timestamp.clone(), vid: 3i64 },
         ],
     )];
     let entities1 = insert_ops(&manifest.schema, entities1);
@@ -609,7 +613,6 @@ async fn execute_query_document_with_variables(
     let runner = Arc::new(GraphQlRunner::new(
         &LOGGER,
         STORE.clone(),
-        SUBSCRIPTION_MANAGER.clone(),
         LOAD_MANAGER.clone(),
         METRICS_REGISTRY.clone(),
     ));
@@ -720,7 +723,6 @@ where
                 let runner = Arc::new(GraphQlRunner::new(
                     &LOGGER,
                     STORE.clone(),
-                    SUBSCRIPTION_MANAGER.clone(),
                     LOAD_MANAGER.clone(),
                     METRICS_REGISTRY.clone(),
                 ));
@@ -737,43 +739,6 @@ where
             test(result, id_type);
         }
     })
-}
-
-/// Helper to run a subscription
-async fn run_subscription(
-    store: &Arc<Store>,
-    query: &str,
-    max_complexity: Option<u64>,
-) -> Result<SubscriptionResult, SubscriptionError> {
-    let deployment = setup_readonly(store.as_ref()).await;
-    let logger = Logger::root(slog::Discard, o!());
-    let query_store = store
-        .query_store(
-            QueryTarget::Deployment(deployment.hash.clone(), Default::default()),
-            true,
-        )
-        .await
-        .unwrap();
-
-    let query = Query::new(q::parse_query(query).unwrap().into_static(), None, false);
-    let options = SubscriptionExecutionOptions {
-        logger: logger.clone(),
-        store: query_store.clone(),
-        subscription_manager: SUBSCRIPTION_MANAGER.clone(),
-        timeout: None,
-        max_complexity,
-        max_depth: 100,
-        max_first: std::u32::MAX,
-        max_skip: std::u32::MAX,
-        graphql_metrics: graphql_metrics(),
-        load_manager: LOAD_MANAGER.clone(),
-    };
-    let schema = STORE
-        .subgraph_store()
-        .api_schema(&deployment.hash, &Default::default())
-        .unwrap();
-
-    execute_subscription(Subscription { query }, schema, options)
 }
 
 #[test]
@@ -1853,58 +1818,6 @@ fn query_complexity() {
 }
 
 #[test]
-fn query_complexity_subscriptions() {
-    run_test_sequentially(|store| async move {
-        const QUERY1: &str = "subscription {
-                musicians(orderBy: id) {
-                    name
-                    bands(first: 100, orderBy: id) {
-                        name
-                        members(first: 100, orderBy: id) {
-                            name
-                        }
-                    }
-                }
-            }";
-        let max_complexity = Some(1_010_100);
-
-        // This query is exactly at the maximum complexity.
-        // FIXME: Not collecting the stream because that will hang the test.
-        let _ignore_stream = run_subscription(&store, QUERY1, max_complexity)
-            .await
-            .unwrap();
-
-        const QUERY2: &str = "subscription {
-                musicians(orderBy: id) {
-                    name
-                    t1: bands(first: 100, orderBy: id) {
-                        name
-                        members(first: 100, orderBy: id) {
-                            name
-                        }
-                    }
-                    t2: bands(first: 200, orderBy: id) {
-                      name
-                      members(first: 100, orderBy: id) {
-                          name
-                      }
-                  }
-                }
-            }";
-
-        let result = run_subscription(&store, QUERY2, max_complexity).await;
-
-        match result {
-            Err(SubscriptionError::GraphQLError(e)) => match &e[0] {
-                QueryExecutionError::TooComplex(3_030_100, _) => (), // Expected
-                e => panic!("did not catch complexity: {:?}", e),
-            },
-            _ => panic!("did not catch complexity"),
-        }
-    })
-}
-
-#[test]
 fn instant_timeout() {
     run_test_sequentially(|store| async move {
         let deployment = setup_readonly(store.as_ref()).await;
@@ -2129,38 +2042,6 @@ fn cannot_filter_by_derved_relationship_fields() {
             }
             e => panic!("expected a runtime/validation error, got {:?}", e),
         };
-    })
-}
-
-#[test]
-fn subscription_gets_result_even_without_events() {
-    run_test_sequentially(|store| async move {
-        const QUERY: &str = "subscription {
-            musicians(orderBy: id, first: 2) {
-              name
-            }
-          }";
-
-        // Execute the subscription and expect at least one result to be
-        // available in the result stream
-        let stream = run_subscription(&store, QUERY, None).await.unwrap();
-        let results: Vec<_> = stream
-            .take(1)
-            .collect()
-            .timeout(Duration::from_secs(3))
-            .await
-            .unwrap();
-
-        assert_eq!(results.len(), 1);
-        let result = Arc::try_unwrap(results.into_iter().next().unwrap()).unwrap();
-        let data = extract_data!(result).unwrap();
-        let exp = object! {
-            musicians: vec![
-                object! { name: "John" },
-                object! { name: "Lisa" }
-            ]
-        };
-        assert_eq!(data, exp);
     })
 }
 

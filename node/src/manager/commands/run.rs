@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::chain::create_ipfs_clients;
 use crate::config::Config;
 use crate::manager::PanicSubscriptionManager;
 use crate::network_setup::Networks;
@@ -10,8 +9,8 @@ use crate::store_builder::StoreBuilder;
 use crate::MetricsContext;
 use graph::anyhow::bail;
 use graph::cheap_clone::CheapClone;
-use graph::components::adapter::IdentValidator;
 use graph::components::link_resolver::{ArweaveClient, FileSizeLimit};
+use graph::components::network_provider::ChainIdentifierStore;
 use graph::components::store::DeploymentLocator;
 use graph::components::subgraph::Settings;
 use graph::endpoint::EndpointMetrics;
@@ -59,14 +58,15 @@ pub async fn run(
     let logger_factory = LoggerFactory::new(logger.clone(), None, metrics_ctx.registry.clone());
 
     // FIXME: Hard-coded IPFS config, take it from config file instead?
-    let ipfs_clients: Vec<_> = create_ipfs_clients(&logger, &ipfs_url);
-    let ipfs_client = ipfs_clients.first().cloned().expect("Missing IPFS client");
+    let ipfs_client = graph::ipfs::new_ipfs_client(&ipfs_url, &logger).await?;
+
     let ipfs_service = ipfs_service(
-        ipfs_client,
+        ipfs_client.cheap_clone(),
         env_vars.mappings.max_ipfs_file_bytes,
         env_vars.mappings.ipfs_timeout,
         env_vars.mappings.ipfs_request_limit,
     );
+
     let arweave_resolver = Arc::new(ArweaveClient::new(
         logger.cheap_clone(),
         arweave_url.parse().expect("invalid arweave url"),
@@ -88,18 +88,38 @@ pub async fn run(
 
     // Convert the clients into a link resolver. Since we want to get past
     // possible temporary DNS failures, make the resolver retry
-    let link_resolver = Arc::new(IpfsResolver::new(ipfs_clients, env_vars.cheap_clone()));
+    let link_resolver = Arc::new(IpfsResolver::new(ipfs_client, env_vars.cheap_clone()));
 
     let chain_head_update_listener = store_builder.chain_head_update_listener();
     let network_store = store_builder.network_store(config.chain_ids());
     let block_store = network_store.block_store();
-    let ident_validator: Arc<dyn IdentValidator> = network_store.block_store();
+
+    let mut provider_checks: Vec<Arc<dyn graph::components::network_provider::ProviderCheck>> =
+        Vec::new();
+
+    if env_vars.genesis_validation_enabled {
+        let store: Arc<dyn ChainIdentifierStore> = network_store.block_store();
+
+        provider_checks.push(Arc::new(
+            graph::components::network_provider::GenesisHashCheck::new(store),
+        ));
+    }
+
+    provider_checks.push(Arc::new(
+        graph::components::network_provider::ExtendedBlocksCheck::new(
+            env_vars
+                .firehose_disable_extended_blocks_for_chains
+                .iter()
+                .map(|x| x.as_str().into()),
+        ),
+    ));
+
     let networks = Networks::from_config(
         logger.cheap_clone(),
         &config,
         metrics_registry.cheap_clone(),
         endpoint_metrics,
-        ident_validator,
+        &provider_checks,
     )
     .await
     .expect("unable to parse network configuration");

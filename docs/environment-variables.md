@@ -53,6 +53,13 @@ those.
   be used if the store uses more than one shard.
 - `GRAPH_ETHEREUM_GENESIS_BLOCK_NUMBER`: Specify genesis block number. If the flag
   is not set, the default value will be `0`.
+- `GRAPH_ETH_GET_LOGS_MAX_CONTRACTS`: Maximum number of contracts to query in a single `eth_getLogs` request.
+  Defaults to 2000.
+
+## Firehose configuration
+
+- `GRAPH_NODE_FIREHOSE_MAX_DECODE_SIZE`: Maximum size of a message that can be
+  decoded by the firehose. Defaults to 25MB.
 
 ## Running mapping handlers
 
@@ -105,18 +112,10 @@ those.
   result is checked while the response is being constructed, so that
   execution does not take more memory than what is configured. The default
   value for both is unlimited.
-- `GRAPH_GRAPHQL_MAX_OPERATIONS_PER_CONNECTION`: maximum number of GraphQL
-  operations per WebSocket connection. Any operation created after the limit
-  will return an error to the client. Default: 1000.
 - `GRAPH_GRAPHQL_HTTP_PORT` : Port for the GraphQL HTTP server
-- `GRAPH_GRAPHQL_WS_PORT` : Port for the GraphQL WebSocket server
 - `GRAPH_SQL_STATEMENT_TIMEOUT`: the maximum number of seconds an
   individual SQL query is allowed to take during GraphQL
   execution. Default: unlimited
-- `GRAPH_DISABLE_SUBSCRIPTION_NOTIFICATIONS`: disables the internal
-  mechanism that is used to trigger updates on GraphQL subscriptions. When
-  this variable is set to any value, `graph-node` will still accept GraphQL
-  subscriptions, but they won't receive any updates.
 - `ENABLE_GRAPHQL_VALIDATIONS`: enables GraphQL validations, based on the GraphQL specification.
   This will validate and ensure every query executes follows the execution
   rules. Default: `false`
@@ -178,11 +177,10 @@ those.
   query, and the `query_id` of the GraphQL query that caused the SQL
   query. These SQL queries are marked with `component: GraphQlRunner` There
   are additional SQL queries that get logged when `sql` is given. These are
-  queries caused by mappings when processing blocks for a subgraph, and
-  queries caused by subscriptions. If `cache` is present in addition to
-  `gql`, also logs information for each toplevel GraphQL query field
-  whether that could be retrieved from cache or not. Defaults to no
-  logging.
+  queries caused by mappings when processing blocks for a subgraph. If
+  `cache` is present in addition to `gql`, also logs information for each
+  toplevel GraphQL query field whether that could be retrieved from cache
+  or not. Defaults to no logging.
 - `GRAPH_LOG_TIME_FORMAT`: Custom log time format.Default value is `%b %d %H:%M:%S%.3f`. More information [here](https://docs.rs/chrono/latest/chrono/#formatting-and-parsing).
 - `STORE_CONNECTION_POOL_SIZE`: How many simultaneous connections to allow to the store.
   Due to implementation details, this value may not be strictly adhered to. Defaults to 10.
@@ -225,6 +223,18 @@ those.
   copying or grafting should take. This limits how long transactions for
   such long running operations will be, and therefore helps control bloat
   in other tables. Value is in seconds and defaults to 180s.
+- `GRAPH_STORE_BATCH_TIMEOUT`: How long a batch operation during copying or
+  grafting is allowed to take at most. This is meant to guard against
+  batches that are catastrophically big and should be set to a small
+  multiple of `GRAPH_STORE_BATCH_TARGET_DURATION`, like 10 times that
+  value, and needs to be at least 2 times that value when set. If this
+  timeout is hit, the batch size is reset to 1 so we can be sure that
+  batches stay below `GRAPH_STORE_BATCH_TARGET_DURATION` and the smaller
+  batch is retried. Value is in seconds and defaults to unlimited.
+- `GRAPH_STORE_BATCH_WORKERS`: The number of workers to use for batch
+    operations. If there are idle connectiosn, each subgraph copy operation
+    will use up to this many workers to copy tables in parallel. Defaults
+    to 1 and must be at least 1
 - `GRAPH_START_BLOCK`: block hash:block number where the forked subgraph will start indexing at.
 - `GRAPH_FORK_BASE`: api url for where the graph node will fork from, use `https://api.thegraph.com/subgraphs/id/`
   for the hosted service.
@@ -251,8 +261,17 @@ those.
 - `GRAPH_STORE_WRITE_BATCH_SIZE`: how many changes to accumulate during
   syncing in kilobytes before a write has to happen. The default is 10_000
   which corresponds to 10MB. Setting this to 0 disables write batching.
-- `GRAPH_MIN_HISTORY_BLOCKS`: Specifies the minimum number of blocks to 
-retain for subgraphs with historyBlocks set to auto. The default value is 2 times the reorg threshold.
+- `GRAPH_MIN_HISTORY_BLOCKS`: Specifies the minimum number of blocks to
+  retain for subgraphs with historyBlocks set to auto. The default value is 2 times the reorg threshold.
 - `GRAPH_ETHEREUM_BLOCK_RECEIPTS_CHECK_TIMEOUT`: Timeout for checking
   `eth_getBlockReceipts` support during chain startup, if this times out
   individual transaction receipts will be fetched instead. Defaults to 10s.
+- `GRAPH_POSTPONE_ATTRIBUTE_INDEX_CREATION`: During the coping of a subgraph
+  postponing creation of certain indexes (btree, attribute based ones), would
+  speed up syncing
+- `GRAPH_STORE_INSERT_EXTRA_COLS`: Makes it possible to work around bugs in
+  the subgraph writing code that manifest as Postgres errors saying 'number
+  of parameters must be between 0 and 65535' Such errors are always
+  graph-node bugs, but since it is hard to work around them, setting this
+  variable to something like 10 makes it possible to work around such a bug
+  while it is being fixed (default: 0)

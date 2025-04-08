@@ -142,11 +142,7 @@ where
             ens_lookup,
         ));
 
-        let host_fns = data_source
-            .as_onchain()
-            .map(|ds| runtime_adapter.host_fns(ds))
-            .transpose()?
-            .unwrap_or_default();
+        let host_fns = runtime_adapter.host_fns(&data_source).unwrap_or_default();
 
         Ok(RuntimeHost {
             host_fns: Arc::new(host_fns),
@@ -366,6 +362,7 @@ impl<C: Blockchain> RuntimeHostTrait<C> for RuntimeHost<C> {
         match self.data_source() {
             DataSource::Onchain(_) => None,
             DataSource::Offchain(ds) => ds.done_at(),
+            DataSource::Subgraph(_) => None,
         }
     }
 
@@ -373,6 +370,7 @@ impl<C: Blockchain> RuntimeHostTrait<C> for RuntimeHost<C> {
         match self.data_source() {
             DataSource::Onchain(_) => {}
             DataSource::Offchain(ds) => ds.set_done_at(block),
+            DataSource::Subgraph(_) => {}
         }
     }
 

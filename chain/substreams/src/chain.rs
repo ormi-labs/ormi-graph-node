@@ -4,10 +4,10 @@ use anyhow::Error;
 use graph::blockchain::client::ChainClient;
 use graph::blockchain::{
     BasicBlockchainBuilder, BlockIngestor, BlockTime, EmptyNodeCapabilities, NoopDecoderHook,
-    NoopRuntimeAdapter,
+    NoopRuntimeAdapter, TriggerFilterWrapper,
 };
-use graph::components::adapter::ChainId;
-use graph::components::store::DeploymentCursorTracker;
+use graph::components::network_provider::ChainName;
+use graph::components::store::{DeploymentCursorTracker, SourceableStore};
 use graph::env::EnvVars;
 use graph::prelude::{BlockHash, CheapClone, Entity, LoggerFactory, MetricsRegistry};
 use graph::schema::EntityKey;
@@ -67,7 +67,7 @@ impl blockchain::Block for Block {
 pub struct Chain {
     chain_store: Arc<dyn ChainStore>,
     block_stream_builder: Arc<dyn BlockStreamBuilder<Self>>,
-    chain_id: ChainId,
+    chain_id: ChainName,
 
     pub(crate) logger_factory: LoggerFactory,
     pub(crate) client: Arc<ChainClient<Self>>,
@@ -81,7 +81,7 @@ impl Chain {
         metrics_registry: Arc<MetricsRegistry>,
         chain_store: Arc<dyn ChainStore>,
         block_stream_builder: Arc<dyn BlockStreamBuilder<Self>>,
-        chain_id: ChainId,
+        chain_id: ChainName,
     ) -> Self {
         Self {
             logger_factory,
@@ -140,7 +140,8 @@ impl Blockchain for Chain {
         deployment: DeploymentLocator,
         store: impl DeploymentCursorTracker,
         _start_blocks: Vec<BlockNumber>,
-        filter: Arc<Self::TriggerFilter>,
+        _source_subgraph_stores: Vec<Arc<dyn SourceableStore>>,
+        filter: Arc<TriggerFilterWrapper<Self>>,
         _unified_api_version: UnifiedMappingApiVersion,
     ) -> Result<Box<dyn BlockStream<Self>>, Error> {
         self.block_stream_builder
@@ -150,7 +151,7 @@ impl Blockchain for Chain {
                 deployment,
                 store.firehose_cursor(),
                 store.block_ptr(),
-                filter,
+                filter.chain_filter.clone(),
             )
             .await
     }

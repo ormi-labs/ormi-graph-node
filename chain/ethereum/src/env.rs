@@ -33,6 +33,9 @@ pub struct EnvVars {
     /// Set by the environment variable `ETHEREUM_BLOCK_BATCH_SIZE`. The
     /// default value is 10 blocks.
     pub block_batch_size: usize,
+    /// Set by the environment variable `ETHEREUM_BLOCK_PTR_BATCH_SIZE`. The
+    /// default value is 10 blocks.
+    pub block_ptr_batch_size: usize,
     /// Maximum number of blocks to request in each chunk.
     ///
     /// Set by the environment variable `GRAPH_ETHEREUM_MAX_BLOCK_RANGE_SIZE`.
@@ -88,6 +91,10 @@ pub struct EnvVars {
     /// This is a comma separated list of chain ids for which the gas field will not be set
     /// when calling `eth_call`.
     pub eth_call_no_gas: Vec<String>,
+    /// Set by the flag `GRAPH_ETHEREUM_FORCE_RPC_FOR_BLOCK_PTRS`. On by default.
+    /// When enabled, forces the use of RPC instead of Firehose for loading block pointers by numbers.
+    /// This is used in composable subgraphs. Firehose can be slow for loading block pointers by numbers.
+    pub force_rpc_for_block_ptrs: bool,
 }
 
 // This does not print any values avoid accidentally leaking any sensitive env vars
@@ -116,6 +123,7 @@ impl From<Inner> for EnvVars {
             trace_stream_step_size: x.trace_stream_step_size,
             max_event_only_range: x.max_event_only_range,
             block_batch_size: x.block_batch_size,
+            block_ptr_batch_size: x.block_ptr_batch_size,
             max_block_range_size: x.max_block_range_size,
             json_rpc_timeout: Duration::from_secs(x.json_rpc_timeout_in_secs),
             block_receipts_check_timeout: Duration::from_secs(
@@ -137,6 +145,7 @@ impl From<Inner> for EnvVars {
                 .filter(|s| !s.is_empty())
                 .map(str::to_string)
                 .collect(),
+            force_rpc_for_block_ptrs: x.force_rpc_for_block_ptrs.0,
         }
     }
 }
@@ -160,6 +169,8 @@ struct Inner {
     max_event_only_range: BlockNumber,
     #[envconfig(from = "ETHEREUM_BLOCK_BATCH_SIZE", default = "10")]
     block_batch_size: usize,
+    #[envconfig(from = "ETHEREUM_BLOCK_PTR_BATCH_SIZE", default = "100")]
+    block_ptr_batch_size: usize,
     #[envconfig(from = "GRAPH_ETHEREUM_MAX_BLOCK_RANGE_SIZE", default = "2000")]
     max_block_range_size: BlockNumber,
     #[envconfig(from = "GRAPH_ETHEREUM_JSON_RPC_TIMEOUT", default = "180")]
@@ -184,6 +195,8 @@ struct Inner {
     target_triggers_per_block_range: u64,
     #[envconfig(from = "GRAPH_ETHEREUM_GENESIS_BLOCK_NUMBER", default = "0")]
     genesis_block_number: u64,
-    #[envconfig(from = "GRAPH_ETH_CALL_NO_GAS", default = "421613")]
+    #[envconfig(from = "GRAPH_ETH_CALL_NO_GAS", default = "421613,421614")]
     eth_call_no_gas: String,
+    #[envconfig(from = "GRAPH_ETHEREUM_FORCE_RPC_FOR_BLOCK_PTRS", default = "true")]
+    force_rpc_for_block_ptrs: EnvVarBoolean,
 }

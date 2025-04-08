@@ -13,7 +13,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, bail, Context};
+use anyhow::{anyhow, bail, Context, Result};
 use graph::futures03::StreamExt;
 use graph::prelude::serde_json::{json, Value};
 use graph::prelude::web3::types::U256;
@@ -95,6 +95,7 @@ impl TestResult {
 struct TestCase {
     name: String,
     test: TestFn,
+    source_subgraph: Option<String>,
 }
 
 impl TestCase {
@@ -102,20 +103,84 @@ impl TestCase {
     where
         T: Future<Output = Result<(), anyhow::Error>> + Send + 'static,
     {
-        fn force_boxed<T>(f: fn(TestContext) -> T) -> TestFn
-        where
-            T: Future<Output = Result<(), anyhow::Error>> + Send + 'static,
-        {
-            Box::new(move |ctx| Box::pin(f(ctx)))
-        }
-
         Self {
             name: name.to_string(),
-            test: force_boxed(test),
+            test: Box::new(move |ctx| Box::pin(test(ctx))),
+            source_subgraph: None,
         }
     }
 
+    fn new_with_source_subgraph<T>(
+        name: &str,
+        test: fn(TestContext) -> T,
+        source_subgraph: &str,
+    ) -> Self
+    where
+        T: Future<Output = Result<(), anyhow::Error>> + Send + 'static,
+    {
+        let mut test_case = Self::new(name, test);
+        test_case.source_subgraph = Some(source_subgraph.to_string());
+        test_case
+    }
+
+    fn new_with_multiple_source_subgraphs<T>(
+        name: &str,
+        test: fn(TestContext) -> T,
+        source_subgraphs: Vec<&str>,
+    ) -> Self
+    where
+        T: Future<Output = Result<(), anyhow::Error>> + Send + 'static,
+    {
+        let mut test_case = Self::new(name, test);
+        test_case.source_subgraph = Some(source_subgraphs.join(","));
+        test_case
+    }
+
+    async fn deploy_and_wait(
+        &self,
+        subgraph_name: &str,
+        contracts: &[Contract],
+    ) -> Result<Subgraph> {
+        status!(&self.name, "Deploying subgraph");
+        let subgraph_name = match Subgraph::deploy(&subgraph_name, contracts).await {
+            Ok(name) => name,
+            Err(e) => {
+                error!(&self.name, "Deploy failed");
+                return Err(anyhow!(e.context("Deploy failed")));
+            }
+        };
+
+        status!(&self.name, "Waiting for subgraph to become ready");
+        let subgraph = match Subgraph::wait_ready(&subgraph_name).await {
+            Ok(subgraph) => subgraph,
+            Err(e) => {
+                error!(&self.name, "Subgraph never synced or failed");
+                return Err(anyhow!(e.context("Subgraph never synced or failed")));
+            }
+        };
+
+        if subgraph.healthy {
+            status!(&self.name, "Subgraph ({}) is synced", subgraph.deployment);
+        } else {
+            status!(&self.name, "Subgraph ({}) has failed", subgraph.deployment);
+        }
+
+        Ok(subgraph)
+    }
+
     async fn run(self, contracts: &[Contract]) -> TestResult {
+        // If a subgraph has subgraph datasources, deploy them first
+        if let Some(_subgraphs) = &self.source_subgraph {
+            if let Err(e) = self.deploy_multiple_sources(contracts).await {
+                error!(&self.name, "source subgraph deployment failed");
+                return TestResult {
+                    name: self.name.clone(),
+                    subgraph: None,
+                    status: TestStatus::Err(e),
+                };
+            }
+        }
+
         status!(&self.name, "Deploying subgraph");
         let subgraph_name = match Subgraph::deploy(&self.name, contracts).await {
             Ok(name) => name,
@@ -173,6 +238,20 @@ impl TestCase {
             subgraph: Some(subgraph2),
             status,
         }
+    }
+
+    async fn deploy_multiple_sources(&self, contracts: &[Contract]) -> Result<()> {
+        if let Some(sources) = &self.source_subgraph {
+            for source in sources.split(",") {
+                let subgraph = self.deploy_and_wait(source, contracts).await?;
+                status!(
+                    source,
+                    "source subgraph deployed with hash {}",
+                    subgraph.deployment
+                );
+            }
+        }
+        Ok(())
     }
 }
 
@@ -432,6 +511,46 @@ async fn test_eth_api(ctx: TestContext) -> anyhow::Result<()> {
         "Balance should be right",
         &subgraph,
         "{ foo(id: \"1\") { id balance hasCode1 hasCode2 } }",
+        expected_response,
+    )
+    .await?;
+
+    Ok(())
+}
+
+async fn subgraph_data_sources(ctx: TestContext) -> anyhow::Result<()> {
+    let subgraph = ctx.subgraph;
+    assert!(subgraph.healthy);
+    let expected_response = json!({
+        "mirrorBlocks": [
+            { "id": "1-v1", "number": "1", "testMessage": null },
+            { "id": "1-v2", "number": "1", "testMessage": null },
+            { "id": "1-v3", "number": "1", "testMessage": "1-message" },
+            { "id": "2-v1", "number": "2", "testMessage": null },
+            { "id": "2-v2", "number": "2", "testMessage": null },
+            { "id": "2-v3", "number": "2", "testMessage": "2-message" },
+            { "id": "3-v1", "number": "3", "testMessage": null },
+            { "id": "3-v2", "number": "3", "testMessage": null },
+            { "id": "3-v3", "number": "3", "testMessage": "3-message" },
+        ]
+    });
+
+    query_succeeds(
+        "Query all blocks with testMessage",
+        &subgraph,
+        "{ mirrorBlocks(where: {number_lte: 3}, orderBy: number) { id, number, testMessage } }",
+        expected_response,
+    )
+    .await?;
+
+    let expected_response = json!({
+        "mirrorBlock": { "id": "1-v3", "number": "1", "testMessage": "1-message" },
+    });
+
+    query_succeeds(
+        "Query specific block with testMessage",
+        &subgraph,
+        "{ mirrorBlock(id: \"1-v3\") { id, number, testMessage } }",
         expected_response,
     )
     .await?;
@@ -769,11 +888,41 @@ async fn test_missing(_sg: Subgraph) -> anyhow::Result<()> {
     Err(anyhow!("This test is missing"))
 }
 
+async fn test_multiple_subgraph_datasources(ctx: TestContext) -> anyhow::Result<()> {
+    let subgraph = ctx.subgraph;
+    assert!(subgraph.healthy);
+
+    // Test querying data aggregated from multiple sources
+    let exp = json!({
+        "aggregatedDatas": [
+            {
+                "id": "0",
+                "sourceA": "from source A",
+                "sourceB": "from source B",
+                "first": "sourceA"
+            },
+        ]
+    });
+
+    query_succeeds(
+        "should aggregate data from multiple sources",
+        &subgraph,
+        "{ aggregatedDatas(first: 1) { id sourceA sourceB first } }",
+        exp,
+    )
+    .await?;
+
+    Ok(())
+}
+
 /// The main test entrypoint.
 #[tokio::test]
 async fn integration_tests() -> anyhow::Result<()> {
     // Test "api-version-v0-0-4" was commented out in the original; what's
     // up with that?
+
+    let test_name_to_run = std::env::var("TEST_CASE").ok();
+
     let cases = vec![
         TestCase::new("ganache-reverts", test_ganache_reverts),
         TestCase::new("host-exports", test_host_exports),
@@ -787,7 +936,27 @@ async fn integration_tests() -> anyhow::Result<()> {
         TestCase::new("timestamp", test_timestamp),
         TestCase::new("ethereum-api-tests", test_eth_api),
         TestCase::new("topic-filter", test_topic_filters),
+        TestCase::new_with_source_subgraph(
+            "subgraph-data-sources",
+            subgraph_data_sources,
+            "source-subgraph",
+        ),
+        TestCase::new_with_multiple_source_subgraphs(
+            "multiple-subgraph-datasources",
+            test_multiple_subgraph_datasources,
+            vec!["source-subgraph-a", "source-subgraph-b"],
+        ),
     ];
+
+    // Filter the test cases if a specific test name is provided
+    let cases_to_run: Vec<_> = if let Some(test_name) = test_name_to_run {
+        cases
+            .into_iter()
+            .filter(|case| case.name == test_name)
+            .collect()
+    } else {
+        cases
+    };
 
     let contracts = Contract::deploy_all().await?;
 
@@ -801,7 +970,7 @@ async fn integration_tests() -> anyhow::Result<()> {
     status!("graph-node", "Starting graph-node");
     let mut graph_node_child_command = CONFIG.spawn_graph_node().await?;
 
-    let stream = tokio_stream::iter(cases)
+    let stream = tokio_stream::iter(cases_to_run)
         .map(|case| case.run(&contracts))
         .buffered(CONFIG.num_parallel_tests);
 

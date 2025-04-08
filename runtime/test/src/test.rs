@@ -1,21 +1,21 @@
 use graph::blockchain::BlockTime;
 use graph::components::metrics::gas::GasMetrics;
+use graph::components::store::*;
 use graph::data::store::{scalar, Id, IdType};
 use graph::data::subgraph::*;
 use graph::data::value::Word;
+use graph::ipfs::test_utils::add_files_to_local_ipfs_node_for_testing;
 use graph::prelude::web3::types::U256;
 use graph::runtime::gas::GasCounter;
 use graph::runtime::{AscIndexId, AscType, HostExportError};
 use graph::runtime::{AscPtr, ToAscObj};
 use graph::schema::{EntityType, InputSchema};
-use graph::{components::store::*, ipfs_client::IpfsClient};
 use graph::{entity, prelude::*};
 use graph_chain_ethereum::DataSource;
 use graph_runtime_wasm::asc_abi::class::{Array, AscBigInt, AscEntity, AscString, Uint8Array};
 use graph_runtime_wasm::{
     host_exports, ExperimentalFeatures, MappingContext, ValidModule, WasmInstance,
 };
-
 use semver::Version;
 use std::collections::{BTreeMap, HashMap};
 use std::str::FromStr;
@@ -226,7 +226,7 @@ impl WasmInstanceExt for WasmInstance {
     fn invoke_export1_val_void<V: wasmtime::WasmTy>(&mut self, f: &str, v: V) -> Result<(), Error> {
         let func = self
             .get_func(f)
-            .typed(&self.store.as_context())
+            .typed::<V, ()>(&self.store.as_context())
             .unwrap()
             .clone();
         func.call(&mut self.store.as_context_mut(), v)?;
@@ -418,8 +418,8 @@ async fn test_ipfs_cat(api_version: Version) {
     std::thread::spawn(move || {
         let _runtime_guard = runtime.enter();
 
-        let ipfs = IpfsClient::localhost();
-        let hash = graph::block_on(ipfs.add("42".into())).unwrap().hash;
+        let fut = add_files_to_local_ipfs_node_for_testing(["42".as_bytes().to_vec()]);
+        let hash = graph::block_on(fut).unwrap()[0].hash.to_owned();
 
         let mut module = graph::block_on(test_module(
             "ipfsCat",
@@ -455,8 +455,9 @@ async fn test_ipfs_block() {
     std::thread::spawn(move || {
         let _runtime_guard = runtime.enter();
 
-        let ipfs = IpfsClient::localhost();
-        let hash = graph::block_on(ipfs.add("42".into())).unwrap().hash;
+        let fut = add_files_to_local_ipfs_node_for_testing(["42".as_bytes().to_vec()]);
+        let hash = graph::block_on(fut).unwrap()[0].hash.to_owned();
+
         let mut module = graph::block_on(test_module(
             "ipfsBlock",
             mock_data_source(
@@ -476,13 +477,13 @@ async fn test_ipfs_block() {
 // The user_data value we use with calls to ipfs_map
 const USER_DATA: &str = "user_data";
 
-fn make_thing(id: &str, value: &str) -> (String, EntityModification) {
+fn make_thing(id: &str, value: &str, vid: i64) -> (String, EntityModification) {
     const DOCUMENT: &str = " type Thing @entity { id: String!, value: String!, extra: String }";
     lazy_static! {
         static ref SCHEMA: InputSchema = InputSchema::raw(DOCUMENT, "doesntmatter");
         static ref THING_TYPE: EntityType = SCHEMA.entity_type("Thing").unwrap();
     }
-    let data = entity! { SCHEMA => id: id, value: value, extra: USER_DATA };
+    let data = entity! { SCHEMA => id: id, value: value, extra: USER_DATA, vid: vid };
     let key = THING_TYPE.parse_key(id).unwrap();
     (
         format!("{{ \"id\": \"{}\", \"value\": \"{}\"}}", id, value),
@@ -493,15 +494,16 @@ fn make_thing(id: &str, value: &str) -> (String, EntityModification) {
 const BAD_IPFS_HASH: &str = "bad-ipfs-hash";
 
 async fn run_ipfs_map(
-    ipfs: IpfsClient,
     subgraph_id: &'static str,
     json_string: String,
     api_version: Version,
-) -> Result<Vec<EntityModification>, anyhow::Error> {
+) -> Result<Vec<EntityModification>, Error> {
     let hash = if json_string == BAD_IPFS_HASH {
         "Qm".to_string()
     } else {
-        ipfs.add(json_string.into()).await.unwrap().hash
+        add_files_to_local_ipfs_node_for_testing([json_string.as_bytes().to_vec()]).await?[0]
+            .hash
+            .to_owned()
     };
 
     // Ipfs host functions use `block_on` which must be called from a sync context,
@@ -525,7 +527,7 @@ async fn run_ipfs_map(
         // Invoke the callback
         let func = instance
             .get_func("ipfsMap")
-            .typed(&instance.store.as_context())
+            .typed::<(u32, u32), ()>(&instance.store.as_context())
             .unwrap()
             .clone();
         func.call(
@@ -548,14 +550,12 @@ async fn run_ipfs_map(
 }
 
 async fn test_ipfs_map(api_version: Version, json_error_msg: &str) {
-    let ipfs = IpfsClient::localhost();
     let subgraph_id = "ipfsMap";
 
     // Try it with two valid objects
-    let (str1, thing1) = make_thing("one", "eins");
-    let (str2, thing2) = make_thing("two", "zwei");
+    let (str1, thing1) = make_thing("one", "eins", 100);
+    let (str2, thing2) = make_thing("two", "zwei", 100);
     let ops = run_ipfs_map(
-        ipfs.clone(),
         subgraph_id,
         format!("{}\n{}", str1, str2),
         api_version.clone(),
@@ -567,14 +567,9 @@ async fn test_ipfs_map(api_version: Version, json_error_msg: &str) {
 
     // Valid JSON, but not what the callback expected; it will
     // fail on an assertion
-    let err = run_ipfs_map(
-        ipfs.clone(),
-        subgraph_id,
-        format!("{}\n[1,2]", str1),
-        api_version.clone(),
-    )
-    .await
-    .unwrap_err();
+    let err = run_ipfs_map(subgraph_id, format!("{}\n[1,2]", str1), api_version.clone())
+        .await
+        .unwrap_err();
     assert!(
         format!("{:#}", err).contains("JSON value is not an object."),
         "{:#}",
@@ -582,32 +577,21 @@ async fn test_ipfs_map(api_version: Version, json_error_msg: &str) {
     );
 
     // Malformed JSON
-    let err = run_ipfs_map(
-        ipfs.clone(),
-        subgraph_id,
-        format!("{}\n[", str1),
-        api_version.clone(),
-    )
-    .await
-    .unwrap_err();
+    let err = run_ipfs_map(subgraph_id, format!("{}\n[", str1), api_version.clone())
+        .await
+        .unwrap_err();
     assert!(format!("{err:?}").contains("EOF while parsing a list"));
 
     // Empty input
-    let ops = run_ipfs_map(
-        ipfs.clone(),
-        subgraph_id,
-        "".to_string(),
-        api_version.clone(),
-    )
-    .await
-    .expect("call failed for emoty string");
+    let ops = run_ipfs_map(subgraph_id, "".to_string(), api_version.clone())
+        .await
+        .expect("call failed for emoty string");
     assert_eq!(0, ops.len());
 
     // Missing entry in the JSON object
     let errmsg = format!(
         "{:#}",
         run_ipfs_map(
-            ipfs.clone(),
             subgraph_id,
             "{\"value\": \"drei\"}".to_string(),
             api_version.clone(),
@@ -618,15 +602,10 @@ async fn test_ipfs_map(api_version: Version, json_error_msg: &str) {
     assert!(errmsg.contains(json_error_msg));
 
     // Bad IPFS hash.
-    let err = run_ipfs_map(
-        ipfs.clone(),
-        subgraph_id,
-        BAD_IPFS_HASH.to_string(),
-        api_version.clone(),
-    )
-    .await
-    .unwrap_err();
-    assert!(format!("{err:?}").contains("500 Internal Server Error"));
+    let err = run_ipfs_map(subgraph_id, BAD_IPFS_HASH.to_string(), api_version.clone())
+        .await
+        .unwrap_err();
+    assert!(format!("{err:?}").contains("invalid CID"));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1022,8 +1001,8 @@ async fn test_entity_store(api_version: Version) {
 
     let schema = store.input_schema(&deployment.hash).unwrap();
 
-    let alex = entity! { schema => id: "alex", name: "Alex" };
-    let steve = entity! { schema => id: "steve", name: "Steve" };
+    let alex = entity! { schema => id: "alex", name: "Alex", vid: 0i64 };
+    let steve = entity! { schema => id: "steve", name: "Steve", vid: 1i64 };
     let user_type = schema.entity_type("User").unwrap();
     test_store::insert_entities(
         &deployment,
@@ -1718,4 +1697,72 @@ async fn test_store_ts() {
         err,
         "Cannot get entity of type `Stats`. The type must be an @entity type",
     );
+}
+
+async fn test_yaml_parsing(api_version: Version, gas_used: u64) {
+    let mut module = test_module(
+        "yamlParsing",
+        mock_data_source(
+            &wasm_file_path("yaml_parsing.wasm", api_version.clone()),
+            api_version.clone(),
+        ),
+        api_version,
+    )
+    .await;
+
+    let mut test = |input: &str, expected: &str| {
+        let ptr: AscPtr<AscString> = module.invoke_export1("handleYaml", input.as_bytes());
+        let resp: String = module.asc_get(ptr).unwrap();
+        assert_eq!(resp, expected, "failed on input: {input}");
+    };
+
+    // Test invalid YAML;
+    test("{a: 1, - b: 2}", "error");
+
+    // Test size limit;
+    test(&"x".repeat(10_000_0001), "error");
+
+    // Test nulls;
+    test("null", "(0) null");
+
+    // Test booleans;
+    test("false", "(1) false");
+    test("true", "(1) true");
+
+    // Test numbers;
+    test("12345", "(2) 12345");
+    test("12345.6789", "(2) 12345.6789");
+
+    // Test strings;
+    test("aa bb cc", "(3) aa bb cc");
+    test("\"aa bb cc\"", "(3) aa bb cc");
+
+    // Test arrays;
+    test("[1, 2, 3, 4]", "(4) [(2) 1, (2) 2, (2) 3, (2) 4]");
+    test("- 1\n- 2\n- 3\n- 4", "(4) [(2) 1, (2) 2, (2) 3, (2) 4]");
+
+    // Test objects;
+    test("{a: 1, b: 2, c: 3}", "(5) {a: (2) 1, b: (2) 2, c: (2) 3}");
+    test("a: 1\nb: 2\nc: 3", "(5) {a: (2) 1, b: (2) 2, c: (2) 3}");
+
+    // Test tagged values;
+    test("!AA bb cc", "(6) !AA (3) bb cc");
+
+    // Test nesting;
+    test(
+        "aa:\n  bb:\n    - cc: !DD ee",
+        "(5) {aa: (5) {bb: (4) [(5) {cc: (6) !DD (3) ee}]}}",
+    );
+
+    assert_eq!(module.gas_used(), gas_used, "gas used");
+}
+
+#[tokio::test]
+async fn yaml_parsing_v0_0_4() {
+    test_yaml_parsing(API_VERSION_0_0_4, 10462217077171).await;
+}
+
+#[tokio::test]
+async fn yaml_parsing_v0_0_5() {
+    test_yaml_parsing(API_VERSION_0_0_5, 10462245390665).await;
 }

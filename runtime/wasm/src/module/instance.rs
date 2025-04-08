@@ -92,7 +92,7 @@ impl WasmInstance {
         self.instance
             .get_func(self.store.as_context_mut(), handler_name)
             .with_context(|| format!("function {} not found", handler_name))?
-            .typed(self.store.as_context_mut())?
+            .typed::<(u32, u32), ()>(self.store.as_context_mut())?
             .call(
                 self.store.as_context_mut(),
                 (value?.wasm_ptr(), user_data?.wasm_ptr()),
@@ -467,6 +467,9 @@ impl WasmInstance {
         link!("json.toU64", json_to_u64, ptr);
         link!("json.toF64", json_to_f64, ptr);
         link!("json.toBigInt", json_to_big_int, ptr);
+
+        link!("yaml.fromBytes", yaml_from_bytes, ptr);
+        link!("yaml.try_fromBytes", yaml_try_from_bytes, ptr);
 
         link!("crypto.keccak256", crypto_keccak_256, ptr);
 

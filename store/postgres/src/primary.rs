@@ -32,11 +32,15 @@ use diesel::{
 use graph::{
     components::store::DeploymentLocator,
     constraint_violation,
-    data::store::scalar::ToPrimitive,
-    data::subgraph::{status, DeploymentFeatures},
+    data::{
+        store::scalar::ToPrimitive,
+        subgraph::{status, DeploymentFeatures},
+    },
     prelude::{
-        anyhow, serde_json, DeploymentHash, EntityChange, EntityChangeOperation, NodeId,
-        StoreError, SubgraphName, SubgraphVersionSwitchingMode,
+        anyhow,
+        chrono::{DateTime, Utc},
+        serde_json, AssignmentChange, DeploymentHash, NodeId, StoreError, SubgraphName,
+        SubgraphVersionSwitchingMode,
     },
 };
 use graph::{
@@ -175,7 +179,8 @@ table! {
         latest_ethereum_block_hash -> Nullable<Binary>,
         latest_ethereum_block_number -> Nullable<Integer>,
         failed -> Bool,
-        synced -> Bool,
+        synced_at -> Nullable<Timestamptz>,
+        synced_at_block_number -> Nullable<Int4>,
     }
 }
 
@@ -228,7 +233,8 @@ pub struct UnusedDeployment {
     pub latest_ethereum_block_hash: Option<Vec<u8>>,
     pub latest_ethereum_block_number: Option<i32>,
     pub failed: bool,
-    pub synced: bool,
+    pub synced_at: Option<DateTime<Utc>>,
+    pub synced_at_block_number: Option<i32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, AsExpression, FromSqlRow)]
@@ -260,6 +266,13 @@ impl Namespace {
         Namespace(format!("prune{id}"))
     }
 
+    /// A namespace that is not a deployment namespace. This is used for
+    /// special namespaces we use. No checking is done on `s` and the caller
+    /// must ensure it's a valid namespace name
+    pub fn special(s: impl Into<String>) -> Self {
+        Namespace(s.into())
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -285,6 +298,12 @@ impl ToSql<Text, Pg> for Namespace {
 }
 
 impl Borrow<str> for Namespace {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Borrow<str> for &Namespace {
     fn borrow(&self) -> &str {
         &self.0
     }
@@ -778,7 +797,7 @@ impl<'a> Connection<'a> {
 
     /// Delete all assignments for deployments that are neither the current nor the
     /// pending version of a subgraph and return the deployment id's
-    fn remove_unused_assignments(&mut self) -> Result<Vec<EntityChange>, StoreError> {
+    fn remove_unused_assignments(&mut self) -> Result<Vec<AssignmentChange>, StoreError> {
         use deployment_schemas as ds;
         use subgraph as s;
         use subgraph_deployment_assignment as a;
@@ -815,12 +834,7 @@ impl<'a> Connection<'a> {
             .into_iter()
             .map(|(id, hash)| {
                 DeploymentHash::new(hash)
-                    .map(|hash| {
-                        EntityChange::for_assignment(
-                            DeploymentLocator::new(id.into(), hash),
-                            EntityChangeOperation::Removed,
-                        )
-                    })
+                    .map(|hash| AssignmentChange::removed(DeploymentLocator::new(id.into(), hash)))
                     .map_err(|id| {
                         StoreError::ConstraintViolation(format!(
                             "invalid id `{}` for deployment assignment",
@@ -839,7 +853,7 @@ impl<'a> Connection<'a> {
     pub fn promote_deployment(
         &mut self,
         id: &DeploymentHash,
-    ) -> Result<Vec<EntityChange>, StoreError> {
+    ) -> Result<Vec<AssignmentChange>, StoreError> {
         use subgraph as s;
         use subgraph_version as v;
 
@@ -914,7 +928,7 @@ impl<'a> Connection<'a> {
         node_id: NodeId,
         mode: SubgraphVersionSwitchingMode,
         exists_and_synced: F,
-    ) -> Result<Vec<EntityChange>, StoreError>
+    ) -> Result<Vec<AssignmentChange>, StoreError>
     where
         F: Fn(&DeploymentHash) -> Result<bool, StoreError>,
     {
@@ -1022,13 +1036,16 @@ impl<'a> Connection<'a> {
         // Clean up any assignments we might have displaced
         let mut changes = self.remove_unused_assignments()?;
         if new_assignment {
-            let change = EntityChange::for_assignment(site.into(), EntityChangeOperation::Set);
+            let change = AssignmentChange::set(site.into());
             changes.push(change);
         }
         Ok(changes)
     }
 
-    pub fn remove_subgraph(&mut self, name: SubgraphName) -> Result<Vec<EntityChange>, StoreError> {
+    pub fn remove_subgraph(
+        &mut self,
+        name: SubgraphName,
+    ) -> Result<Vec<AssignmentChange>, StoreError> {
         use subgraph as s;
         use subgraph_version as v;
 
@@ -1050,7 +1067,7 @@ impl<'a> Connection<'a> {
         }
     }
 
-    pub fn pause_subgraph(&mut self, site: &Site) -> Result<Vec<EntityChange>, StoreError> {
+    pub fn pause_subgraph(&mut self, site: &Site) -> Result<Vec<AssignmentChange>, StoreError> {
         use subgraph_deployment_assignment as a;
 
         let conn = self.conn.as_mut();
@@ -1061,8 +1078,7 @@ impl<'a> Connection<'a> {
         match updates {
             0 => Err(StoreError::DeploymentNotFound(site.deployment.to_string())),
             1 => {
-                let change =
-                    EntityChange::for_assignment(site.into(), EntityChangeOperation::Removed);
+                let change = AssignmentChange::removed(site.into());
                 Ok(vec![change])
             }
             _ => {
@@ -1073,7 +1089,7 @@ impl<'a> Connection<'a> {
         }
     }
 
-    pub fn resume_subgraph(&mut self, site: &Site) -> Result<Vec<EntityChange>, StoreError> {
+    pub fn resume_subgraph(&mut self, site: &Site) -> Result<Vec<AssignmentChange>, StoreError> {
         use subgraph_deployment_assignment as a;
 
         let conn = self.conn.as_mut();
@@ -1084,7 +1100,7 @@ impl<'a> Connection<'a> {
         match updates {
             0 => Err(StoreError::DeploymentNotFound(site.deployment.to_string())),
             1 => {
-                let change = EntityChange::for_assignment(site.into(), EntityChangeOperation::Set);
+                let change = AssignmentChange::set(site.into());
                 Ok(vec![change])
             }
             _ => {
@@ -1099,7 +1115,7 @@ impl<'a> Connection<'a> {
         &mut self,
         site: &Site,
         node: &NodeId,
-    ) -> Result<Vec<EntityChange>, StoreError> {
+    ) -> Result<Vec<AssignmentChange>, StoreError> {
         use subgraph_deployment_assignment as a;
 
         let conn = self.conn.as_mut();
@@ -1109,7 +1125,7 @@ impl<'a> Connection<'a> {
         match updates {
             0 => Err(StoreError::DeploymentNotFound(site.deployment.to_string())),
             1 => {
-                let change = EntityChange::for_assignment(site.into(), EntityChangeOperation::Set);
+                let change = AssignmentChange::set(site.into());
                 Ok(vec![change])
             }
             _ => {
@@ -1236,7 +1252,7 @@ impl<'a> Connection<'a> {
         &mut self,
         site: &Site,
         node: &NodeId,
-    ) -> Result<Vec<EntityChange>, StoreError> {
+    ) -> Result<Vec<AssignmentChange>, StoreError> {
         use subgraph_deployment_assignment as a;
 
         let conn = self.conn.as_mut();
@@ -1244,11 +1260,11 @@ impl<'a> Connection<'a> {
             .values((a::id.eq(site.id), a::node_id.eq(node.as_str())))
             .execute(conn)?;
 
-        let change = EntityChange::for_assignment(site.into(), EntityChangeOperation::Set);
+        let change = AssignmentChange::set(site.into());
         Ok(vec![change])
     }
 
-    pub fn unassign_subgraph(&mut self, site: &Site) -> Result<Vec<EntityChange>, StoreError> {
+    pub fn unassign_subgraph(&mut self, site: &Site) -> Result<Vec<AssignmentChange>, StoreError> {
         use subgraph_deployment_assignment as a;
 
         let conn = self.conn.as_mut();
@@ -1259,8 +1275,7 @@ impl<'a> Connection<'a> {
         match delete_count {
             0 => Ok(vec![]),
             1 => {
-                let change =
-                    EntityChange::for_assignment(site.into(), EntityChangeOperation::Removed);
+                let change = AssignmentChange::removed(site.into());
                 Ok(vec![change])
             }
             _ => {
@@ -1676,7 +1691,8 @@ impl<'a> Connection<'a> {
                     u::latest_ethereum_block_hash.eq(latest_hash),
                     u::latest_ethereum_block_number.eq(latest_number),
                     u::failed.eq(detail.failed),
-                    u::synced.eq(detail.synced),
+                    u::synced_at.eq(detail.synced_at),
+                    u::synced_at_block_number.eq(detail.synced_at_block_number.clone()),
                 ))
                 .execute(self.conn.as_mut())?;
         }
@@ -1752,10 +1768,10 @@ impl<'a> Connection<'a> {
 
         Ok(s::table
             .inner_join(
-                v::table.on(v::subgraph
+                v::table.on(v::id
                     .nullable()
                     .eq(s::current_version)
-                    .or(v::subgraph.nullable().eq(s::pending_version))),
+                    .or(v::id.nullable().eq(s::pending_version))),
             )
             .filter(v::deployment.eq(site.deployment.as_str()))
             .select(s::name)
@@ -1830,6 +1846,20 @@ pub struct Mirror {
 }
 
 impl Mirror {
+    // The tables that we mirror
+    //
+    // `chains` needs to be mirrored before `deployment_schemas` because
+    // of the fk constraint on `deployment_schemas.network`. We don't
+    // care much about mirroring `active_copies` but it has a fk
+    // constraint on `deployment_schemas` and is tiny, therefore it's
+    // easiest to just mirror it
+    pub(crate) const PUBLIC_TABLES: [&str; 3] = ["chains", "deployment_schemas", "active_copies"];
+    pub(crate) const SUBGRAPHS_TABLES: [&str; 3] = [
+        "subgraph_deployment_assignment",
+        "subgraph",
+        "subgraph_version",
+    ];
+
     pub fn new(pools: &HashMap<Shard, ConnectionPool>) -> Mirror {
         let primary = pools
             .get(&PRIMARY_SHARD)
@@ -1886,18 +1916,6 @@ impl Mirror {
         conn: &mut PgConnection,
         handle: &CancelHandle,
     ) -> Result<(), StoreError> {
-        // `chains` needs to be mirrored before `deployment_schemas` because
-        // of the fk constraint on `deployment_schemas.network`. We don't
-        // care much about mirroring `active_copies` but it has a fk
-        // constraint on `deployment_schemas` and is tiny, therefore it's
-        // easiest to just mirror it
-        const PUBLIC_TABLES: [&str; 3] = ["chains", "deployment_schemas", "active_copies"];
-        const SUBGRAPHS_TABLES: [&str; 3] = [
-            "subgraph_deployment_assignment",
-            "subgraph",
-            "subgraph_version",
-        ];
-
         fn run_query(conn: &mut PgConnection, query: String) -> Result<(), StoreError> {
             conn.batch_execute(&query).map_err(StoreError::from)
         }
@@ -1929,11 +1947,11 @@ impl Mirror {
 
         // Truncate all tables at once, otherwise truncation can fail
         // because of foreign key constraints
-        let tables = PUBLIC_TABLES
+        let tables = Self::PUBLIC_TABLES
             .iter()
             .map(|name| (NAMESPACE_PUBLIC, name))
             .chain(
-                SUBGRAPHS_TABLES
+                Self::SUBGRAPHS_TABLES
                     .iter()
                     .map(|name| (NAMESPACE_SUBGRAPHS, name)),
             )
@@ -1944,7 +1962,7 @@ impl Mirror {
         check_cancel()?;
 
         // Repopulate `PUBLIC_TABLES` by copying their data wholesale
-        for table_name in PUBLIC_TABLES {
+        for table_name in Self::PUBLIC_TABLES {
             copy_table(
                 conn,
                 ForeignServer::PRIMARY_PUBLIC,

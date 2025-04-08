@@ -1,12 +1,13 @@
 use std::collections::HashMap;
+use std::ops::Range;
 
 use anyhow::Error;
 use async_trait::async_trait;
 use web3::types::{Address, H256};
 
 use super::*;
-use crate::blockchain::block_stream::FirehoseCursor;
-use crate::blockchain::{BlockTime, ChainIdentifier};
+use crate::blockchain::block_stream::{EntitySourceOperation, FirehoseCursor};
+use crate::blockchain::{BlockTime, ChainIdentifier, ExtendedBlockPtr};
 use crate::components::metrics::stopwatch::StopwatchMetrics;
 use crate::components::server::index_node::VersionInfo;
 use crate::components::subgraph::SubgraphVersionSwitchingMode;
@@ -24,10 +25,7 @@ pub trait SubscriptionManager: Send + Sync + 'static {
     /// Subscribe to changes for specific subgraphs and entities.
     ///
     /// Returns a stream of store events that match the input arguments.
-    fn subscribe(&self, entities: BTreeSet<SubscriptionFilter>) -> StoreEventStreamBox;
-
-    /// If the payload is not required, use for a more efficient subscription mechanism backed by a watcher.
-    fn subscribe_no_payload(&self, entities: BTreeSet<SubscriptionFilter>) -> UnitStream;
+    fn subscribe(&self) -> StoreEventStreamBox;
 }
 
 /// Subgraph forking is the process of lazily fetching entities
@@ -185,6 +183,11 @@ pub trait SubgraphStore: Send + Sync + 'static {
         manifest_idx_and_name: Arc<Vec<(u32, String)>>,
     ) -> Result<Arc<dyn WritableStore>, StoreError>;
 
+    async fn sourceable(
+        self: Arc<Self>,
+        deployment: DeploymentId,
+    ) -> Result<Arc<dyn SourceableStore>, StoreError>;
+
     /// Initiate a graceful shutdown of the writable that a previous call to
     /// `writable` might have started
     async fn stop_subgraph(&self, deployment: &DeploymentLocator) -> Result<(), StoreError>;
@@ -287,6 +290,44 @@ impl<T: ?Sized + DeploymentCursorTracker> DeploymentCursorTracker for Arc<T> {
     }
 }
 
+#[async_trait]
+pub trait SourceableStore: Sync + Send + 'static {
+    /// Returns all versions of entities of the given entity_type that were
+    /// changed in the given block_range.
+    fn get_range(
+        &self,
+        entity_types: Vec<EntityType>,
+        causality_region: CausalityRegion,
+        block_range: Range<BlockNumber>,
+    ) -> Result<BTreeMap<BlockNumber, Vec<EntitySourceOperation>>, StoreError>;
+
+    fn input_schema(&self) -> InputSchema;
+
+    /// Get a pointer to the most recently processed block in the subgraph.
+    async fn block_ptr(&self) -> Result<Option<BlockPtr>, StoreError>;
+}
+
+// This silly impl is needed until https://github.com/rust-lang/rust/issues/65991 is stable.
+#[async_trait]
+impl<T: ?Sized + SourceableStore> SourceableStore for Arc<T> {
+    fn get_range(
+        &self,
+        entity_types: Vec<EntityType>,
+        causality_region: CausalityRegion,
+        block_range: Range<BlockNumber>,
+    ) -> Result<BTreeMap<BlockNumber, Vec<EntitySourceOperation>>, StoreError> {
+        (**self).get_range(entity_types, causality_region, block_range)
+    }
+
+    fn input_schema(&self) -> InputSchema {
+        (**self).input_schema()
+    }
+
+    async fn block_ptr(&self) -> Result<Option<BlockPtr>, StoreError> {
+        (**self).block_ptr().await
+    }
+}
+
 /// A view of the store for indexing. All indexing-related operations need
 /// to go through this trait. Methods in this trait will never return a
 /// `StoreError::DatabaseUnavailable`. Instead, they will retry the
@@ -324,8 +365,6 @@ pub trait WritableStore: ReadStore + DeploymentCursorTracker {
     /// Set subgraph status to failed with the given error as the cause.
     async fn fail_subgraph(&self, error: SubgraphError) -> Result<(), StoreError>;
 
-    async fn supports_proof_of_indexing(&self) -> Result<bool, StoreError>;
-
     /// Transact the entity changes from a single block atomically into the store, and update the
     /// subgraph block pointer to `block_ptr_to`, and update the firehose cursor to `firehose_cursor`
     ///
@@ -350,7 +389,7 @@ pub trait WritableStore: ReadStore + DeploymentCursorTracker {
     ) -> Result<(), StoreError>;
 
     /// Force synced status, used for testing.
-    fn deployment_synced(&self) -> Result<(), StoreError>;
+    fn deployment_synced(&self, block_ptr: BlockPtr) -> Result<(), StoreError>;
 
     /// Return true if the deployment with the given id is fully synced, and return false otherwise.
     /// Cheap, cached operation.
@@ -398,12 +437,9 @@ pub trait QueryStoreManager: Send + Sync + 'static {
     /// which deployment will be queried. It is not possible to use the id of the
     /// metadata subgraph, though the resulting store can be used to query
     /// metadata about the deployment `id` (but not metadata about other deployments).
-    ///
-    /// If `for_subscription` is true, the main replica will always be used.
     async fn query_store(
         &self,
         target: QueryTarget,
-        for_subscription: bool,
     ) -> Result<Arc<dyn QueryStore + Send + Sync>, QueryExecutionError>;
 }
 
@@ -477,6 +513,12 @@ pub trait ChainStore: Send + Sync + 'static {
         self: Arc<Self>,
         hashes: Vec<BlockHash>,
     ) -> Result<Vec<serde_json::Value>, Error>;
+
+    /// Returns the blocks present in the store for the given block numbers.
+    async fn block_ptrs_by_numbers(
+        self: Arc<Self>,
+        numbers: Vec<BlockNumber>,
+    ) -> Result<BTreeMap<BlockNumber, Vec<ExtendedBlockPtr>>, Error>;
 
     /// Get the `offset`th ancestor of `block_hash`, where offset=0 means the block matching
     /// `block_hash` and offset=1 means its parent. If `root` is passed, short-circuit upon finding
@@ -613,7 +655,7 @@ pub trait QueryStore: Send + Sync {
         block_hash: &BlockHash,
     ) -> Result<Option<(BlockNumber, Option<u64>, Option<BlockHash>)>, StoreError>;
 
-    fn wait_stats(&self) -> Result<PoolWaitStats, StoreError>;
+    fn wait_stats(&self) -> PoolWaitStats;
 
     /// Find the current state for the subgraph deployment `id` and
     /// return details about it needed for executing queries
@@ -626,7 +668,7 @@ pub trait QueryStore: Send + Sync {
     fn network_name(&self) -> &str;
 
     /// A permit should be acquired before starting query execution.
-    async fn query_permit(&self) -> Result<QueryPermit, StoreError>;
+    async fn query_permit(&self) -> QueryPermit;
 
     /// Report the name of the shard in which the subgraph is stored. This
     /// should only be used for reporting and monitoring
@@ -641,7 +683,7 @@ pub trait QueryStore: Send + Sync {
 #[async_trait]
 pub trait StatusStore: Send + Sync + 'static {
     /// A permit should be acquired before starting query execution.
-    async fn query_permit(&self) -> Result<QueryPermit, StoreError>;
+    async fn query_permit(&self) -> QueryPermit;
 
     fn status(&self, filter: status::Filter) -> Result<Vec<status::Info>, StoreError>;
 

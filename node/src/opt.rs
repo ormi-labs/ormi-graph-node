@@ -106,7 +106,7 @@ pub struct Opt {
         long,
         value_name = "HOST:PORT",
         env = "IPFS",
-        help = "HTTP addresses of IPFS nodes"
+        help = "HTTP addresses of IPFS servers (RPC, Gateway)"
     )]
     pub ipfs: Vec<String>,
     #[clap(
@@ -132,14 +132,6 @@ pub struct Opt {
         help = "Port for the index node server"
     )]
     pub index_node_port: u16,
-    #[clap(
-        long,
-        default_value = "8001",
-        value_name = "PORT",
-        help = "Port for the GraphQL WebSocket server",
-        env = "GRAPH_GRAPHQL_WS_PORT"
-    )]
-    pub ws_port: u16,
     #[clap(
         long,
         default_value = "8020",
@@ -231,6 +223,13 @@ pub struct Opt {
         help = "Base URL for forking subgraphs"
     )]
     pub fork_base: Option<String>,
+    #[clap(
+        long,
+        default_value = "8050",
+        value_name = "GRAPHMAN_PORT",
+        help = "Port for the graphman GraphQL server"
+    )]
+    pub graphman_port: u16,
 }
 
 impl From<Opt> for config::Opt {
