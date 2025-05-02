@@ -382,7 +382,14 @@ where
             let (blocks, to) = self
                 .adapter
                 .scan_triggers(&self.logger, from, to, &self.filter)
-                .await?;
+                .await.map_err(|err| {
+                error!(
+                    ctx.logger,
+                    "Error scanning triggers";
+                    "error" => %err
+                );
+                err
+            })?;
             let range_size = to - from + 1;
 
             // If the target block (`to`) is within the reorg threshold, indicating no non-null finalized blocks are
@@ -390,6 +397,12 @@ where
             // ensuring the target block range becomes finalized. It effectively minimizes the risk of chain reorg
             // affecting the processing by waiting for a more stable set of blocks.
             if to > head_ptr.number - reorg_threshold {
+                trace!(
+                    ctx.logger,
+                    "Reorg threshold reached, retrying";
+                    "to" => to,
+                    "head_ptr" => head_ptr.number
+                );
                 return Ok(ReconciliationStep::Retry);
             }
 
