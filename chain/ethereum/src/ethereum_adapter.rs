@@ -479,7 +479,27 @@ impl EthereumAdapter {
                             Err(anyhow!("{}", string_err))
                         }
                     }
-                    Ok(logs) => Ok(Some((logs, (end + 1, step)))),
+                    Ok(logs) => {
+                        for (i, log) in logs.iter().enumerate() {
+                            let Some(num) = log.block_number else {
+                                continue;
+                            };
+
+                            if (num.as_u64() as i32) < start || (num.as_u64() as i32) > end {
+                                warn!(
+                                    logger,
+                                    "Log #{} for filter {} has block number {} which is outside of the requested range [{}, {}]. Full log: {:?}",
+                                    i,
+                                    filter,
+                                    num,
+                                    start,
+                                    end,
+                                    log
+                                )
+                            }
+                        }
+                        Ok(Some((logs, (end + 1, step))))
+                    },
                 }
             }
         })
