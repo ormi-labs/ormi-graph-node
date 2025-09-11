@@ -18,7 +18,9 @@ use graph::{
 use itertools::Itertools;
 
 use crate::{
-    catalog, deployment,
+    catalog,
+    copy::BATCH_STATEMENT_TIMEOUT,
+    deployment,
     relational::{Table, VID_COLUMN},
     vid_batcher::{VidBatcher, VidRange},
 };
@@ -27,6 +29,8 @@ use super::{
     index::{load_indexes_from_table, CreateIndex, IndexList},
     Catalog, Layout, Namespace,
 };
+
+pub use status::{Phase, PruneState, PruneTableState, Viewer};
 
 /// Utility to copy relevant data out of a source table and into a new
 /// destination table and replace the source table with the destination
@@ -90,6 +94,7 @@ impl TablePair {
         &self,
         conn: &mut PgConnection,
         reporter: &mut dyn PruneReporter,
+        tracker: &status::Tracker,
         earliest_block: BlockNumber,
         final_block: BlockNumber,
         cancel: &CancelHandle,
@@ -99,18 +104,18 @@ impl TablePair {
         // Determine the last vid that we need to copy
         let range = VidRange::for_prune(conn, &self.src, earliest_block, final_block)?;
         let mut batcher = VidBatcher::load(conn, &self.src_nsp, &self.src, range)?;
+        tracker.start_copy_final(conn, &self.src, range)?;
 
         while !batcher.finished() {
-            let (_, rows) = batcher.step(|start, end| {
-                conn.transaction(|conn| {
-                    // Page through all rows in `src` in batches of `batch_size`
-                    // and copy the ones that are visible to queries at block
-                    // heights between `earliest_block` and `final_block`, but
-                    // whose block_range does not extend past `final_block`
-                    // since they could still be reverted while we copy.
-                    // The conditions on `block_range` are expressed redundantly
-                    // to make more indexes useable
-                    sql_query(format!(
+            let rows = batch_with_timeout(conn, &mut batcher, |conn, start, end| {
+                // Page through all rows in `src` in batches of `batch_size`
+                // and copy the ones that are visible to queries at block
+                // heights between `earliest_block` and `final_block`, but
+                // whose block_range does not extend past `final_block`
+                // since they could still be reverted while we copy.
+                // The conditions on `block_range` are expressed redundantly
+                // to make more indexes useable
+                sql_query(format!(
                     "/* controller=prune,phase=final,start_vid={start},batch_size={batch_size} */ \
                      insert into {dst}({column_list}) \
                      select {column_list} from {src} \
@@ -124,19 +129,20 @@ impl TablePair {
                     dst = self.dst.qualified_name,
                     batch_size = end - start + 1,
                 ))
-                    .bind::<Integer, _>(earliest_block)
-                    .bind::<Integer, _>(final_block)
-                    .bind::<BigInt, _>(start)
-                    .bind::<BigInt, _>(end)
-                    .execute(conn)
-                    .map_err(StoreError::from)
-                })
+                .bind::<Integer, _>(earliest_block)
+                .bind::<Integer, _>(final_block)
+                .bind::<BigInt, _>(start)
+                .bind::<BigInt, _>(end)
+                .execute(conn)
+                .map_err(StoreError::from)
             })?;
+            let rows = rows.unwrap_or(0);
+            tracker.finish_batch(conn, &self.src, rows as i64, &batcher)?;
             cancel.check_cancel()?;
 
             reporter.prune_batch(
                 self.src.name.as_str(),
-                rows.unwrap_or(0),
+                rows,
                 PrunePhase::CopyFinal,
                 batcher.finished(),
             );
@@ -151,6 +157,7 @@ impl TablePair {
         &self,
         conn: &mut PgConnection,
         reporter: &mut dyn PruneReporter,
+        tracker: &status::Tracker,
         final_block: BlockNumber,
     ) -> Result<(), StoreError> {
         let column_list = self.column_list();
@@ -158,16 +165,16 @@ impl TablePair {
         // Determine the last vid that we need to copy
         let range = VidRange::for_prune(conn, &self.src, final_block + 1, BLOCK_NUMBER_MAX)?;
         let mut batcher = VidBatcher::load(conn, &self.src.nsp, &self.src, range)?;
+        tracker.start_copy_nonfinal(conn, &self.src, range)?;
 
         while !batcher.finished() {
-            let (_, rows) = batcher.step(|start, end| {
+            let rows = batch_with_timeout(conn, &mut batcher, |conn, start, end| {
                 // Page through all the rows in `src` in batches of
                 // `batch_size` that are visible to queries at block heights
                 // starting right after `final_block`. The conditions on
                 // `block_range` are expressed redundantly to make more
                 // indexes useable
-                conn.transaction(|conn| {
-                    sql_query(format!(
+                sql_query(format!(
                         "/* controller=prune,phase=nonfinal,start_vid={start},batch_size={batch_size} */ \
                      insert into {dst}({column_list}) \
                      select {column_list} from {src} \
@@ -184,12 +191,14 @@ impl TablePair {
                     .bind::<BigInt, _>(end)
                     .execute(conn)
                     .map_err(StoreError::from)
-                })
             })?;
+            let rows = rows.unwrap_or(0);
+
+            tracker.finish_batch(conn, &self.src, rows as i64, &batcher)?;
 
             reporter.prune_batch(
                 self.src.name.as_str(),
-                rows.unwrap_or(0),
+                rows,
                 PrunePhase::CopyNonfinal,
                 batcher.finished(),
             );
@@ -204,8 +213,6 @@ impl TablePair {
         let src_nsp = &self.src_nsp;
         let dst_nsp = &self.dst_nsp;
 
-        let vid_seq = format!("{}_{VID_COLUMN}_seq", self.src.name);
-
         let mut query = String::new();
 
         // What we are about to do would get blocked by autovacuum on our
@@ -218,10 +225,13 @@ impl TablePair {
         // Make sure the vid sequence continues from where it was in case
         // that we use autoincrementing order of the DB
         if !self.src.object.has_vid_seq() {
+            let vid_seq = catalog::seq_name(&self.src.name, VID_COLUMN);
+
             writeln!(
                 query,
                 "select setval('{dst_nsp}.{vid_seq}', nextval('{src_nsp}.{vid_seq}'));"
             )?;
+            writeln!(query, "drop sequence {src_nsp}.{vid_seq} cascade;")?;
         }
 
         writeln!(query, "drop table {src_qname};")?;
@@ -257,7 +267,7 @@ impl Layout {
             reporter.finish_analyze_table(table.name.as_str());
             cancel.check_cancel()?;
         }
-        let stats = catalog::stats(conn, &self.site)?;
+        let stats = self.catalog.stats(conn)?;
 
         let analyzed: Vec<_> = tables.iter().map(|table| table.name.as_str()).collect();
         reporter.finish_analyze(&stats, &analyzed);
@@ -351,37 +361,56 @@ impl Layout {
     /// also block queries to the deployment, often for extended periods of
     /// time. The rebuild strategy never blocks reads, it only ever blocks
     /// writes.
+    ///
+    /// This method will only return an `Err` if storing pruning status
+    /// fails, e.g. because the database is not available. All errors that
+    /// happen during pruning itself will be stored in the `prune_state`
+    /// table and this method will return `Ok`
     pub fn prune(
-        &self,
+        self: Arc<Self>,
         logger: &Logger,
         reporter: &mut dyn PruneReporter,
         conn: &mut PgConnection,
         req: &PruneRequest,
         cancel: &CancelHandle,
     ) -> Result<(), CancelableError<StoreError>> {
+        let tracker = status::Tracker::new(conn, self.clone())?;
+
+        let res = self.prune_inner(logger, reporter, conn, req, cancel, &tracker);
+
+        match res {
+            Ok(_) => {
+                tracker.finish(conn)?;
+            }
+            Err(e) => {
+                // If we get an error, we need to set the error in the
+                // database and finish the tracker
+                let err = e.to_string();
+                tracker.error(conn, &err)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn prune_inner(
+        self: Arc<Self>,
+        logger: &Logger,
+        reporter: &mut dyn PruneReporter,
+        conn: &mut PgConnection,
+        req: &PruneRequest,
+        cancel: &CancelHandle,
+        tracker: &status::Tracker,
+    ) -> Result<(), CancelableError<StoreError>> {
         reporter.start(req);
-
         let stats = self.version_stats(conn, reporter, true, cancel)?;
-
         let prunable_tables: Vec<_> = self.prunable_tables(&stats, req).into_iter().collect();
-
-        // create a shadow namespace where we will put the copies of our
-        // tables, but only create it in the database if we really need it
+        tracker.start(conn, req, &prunable_tables)?;
         let dst_nsp = Namespace::prune(self.site.id);
         let mut recreate_dst_nsp = true;
-
-        // Go table by table; note that the subgraph writer can write in
-        // between the execution of the `with_lock` block below, and might
-        // therefore work with tables where some are pruned and some are not
-        // pruned yet. That does not affect correctness since we make no
-        // assumption about where the subgraph head is. If the subgraph
-        // advances during this loop, we might have an unnecessarily
-        // pessimistic but still safe value for `final_block`. We do assume
-        // that `final_block` is far enough from the subgraph head that it
-        // stays final even if a revert happens during this loop, but that
-        // is the definition of 'final'
         for (table, strat) in &prunable_tables {
             reporter.start_table(table.name.as_str());
+            tracker.start_table(conn, table)?;
             match strat {
                 PruningStrategy::Rebuild => {
                     if recreate_dst_nsp {
@@ -401,6 +430,7 @@ impl Layout {
                     pair.copy_final_entities(
                         conn,
                         reporter,
+                        tracker,
                         req.earliest_block,
                         req.final_block,
                         cancel,
@@ -410,7 +440,7 @@ impl Layout {
                     // see also: deployment-lock-for-update
                     reporter.start_switch();
                     deployment::with_lock(conn, &self.site, |conn| -> Result<_, StoreError> {
-                        pair.copy_nonfinal_entities(conn, reporter, req.final_block)?;
+                        pair.copy_nonfinal_entities(conn, reporter, tracker, req.final_block)?;
                         cancel.check_cancel().map_err(CancelableError::from)?;
 
                         conn.transaction(|conn| pair.switch(logger, conn))?;
@@ -426,8 +456,10 @@ impl Layout {
                     let range = VidRange::for_prune(conn, &table, 0, req.earliest_block)?;
                     let mut batcher = VidBatcher::load(conn, &self.site.namespace, &table, range)?;
 
+                    tracker.start_delete(conn, table, range, &batcher)?;
                     while !batcher.finished() {
-                        let (_, rows) = batcher.step(|start, end| {sql_query(format!(
+                        let rows = batch_with_timeout(conn, &mut batcher, |conn, start, end| {
+                            sql_query(format!(
                             "/* controller=prune,phase=delete,start_vid={start},batch_size={batch_size} */ \
                              delete from {qname} \
                                           where coalesce(upper(block_range), 2147483647) <= $1 \
@@ -438,11 +470,15 @@ impl Layout {
                         .bind::<Integer, _>(req.earliest_block)
                         .bind::<BigInt, _>(start)
                         .bind::<BigInt, _>(end)
-                        .execute(conn).map_err(StoreError::from)})?;
+                        .execute(conn).map_err(StoreError::from)
+                        })?;
+                        let rows = rows.unwrap_or(0);
+
+                        tracker.finish_batch(conn, table, -(rows as i64), &batcher)?;
 
                         reporter.prune_batch(
                             table.name.as_str(),
-                            rows.unwrap_or(0),
+                            rows,
                             PrunePhase::Delete,
                             batcher.finished(),
                         );
@@ -450,22 +486,503 @@ impl Layout {
                 }
             }
             reporter.finish_table(table.name.as_str());
+            tracker.finish_table(conn, table)?;
         }
-        // Get rid of the temporary prune schema if we actually created it
         if !recreate_dst_nsp {
             catalog::drop_schema(conn, dst_nsp.as_str())?;
         }
-
         for (table, _) in &prunable_tables {
             catalog::set_last_pruned_block(conn, &self.site, &table.name, req.earliest_block)?;
         }
-
-        // Analyze the new tables
         let tables = prunable_tables.iter().map(|(table, _)| *table).collect();
         self.analyze_tables(conn, reporter, tables, cancel)?;
-
         reporter.finish();
-
         Ok(())
+    }
+}
+
+/// Perform a step with the `batcher`. If that step takes longer than
+/// `BATCH_STATEMENT_TIMEOUT`, kill the query and reset the batch size of
+/// the batcher to 1 and perform a step with that size which we assume takes
+/// less than `BATCH_STATEMENT_TIMEOUT`.
+///
+/// Doing this serves as a safeguard against very bad batch size estimations
+/// so that batches never take longer than `BATCH_SIZE_TIMEOUT`
+fn batch_with_timeout<F, T>(
+    conn: &mut PgConnection,
+    batcher: &mut VidBatcher,
+    query: F,
+) -> Result<Option<T>, StoreError>
+where
+    F: Fn(&mut PgConnection, i64, i64) -> Result<T, StoreError>,
+{
+    let res = batcher
+        .step(|start, end| {
+            conn.transaction(|conn| {
+                if let Some(timeout) = BATCH_STATEMENT_TIMEOUT.as_ref() {
+                    conn.batch_execute(timeout)?;
+                }
+                query(conn, start, end)
+            })
+        })
+        .map(|(_, res)| res);
+
+    if !matches!(res, Err(StoreError::StatementTimeout)) {
+        return res;
+    }
+
+    batcher.set_batch_size(1);
+    batcher
+        .step(|start, end| conn.transaction(|conn| query(conn, start, end)))
+        .map(|(_, res)| res)
+}
+
+mod status {
+    use std::sync::Arc;
+
+    use chrono::{DateTime, Utc};
+    use diesel::{
+        deserialize::FromSql,
+        dsl::insert_into,
+        pg::{Pg, PgValue},
+        query_builder::QueryFragment,
+        serialize::{Output, ToSql},
+        sql_types::Text,
+        table, update, AsChangeset, Connection, ExpressionMethods as _, OptionalExtension,
+        PgConnection, QueryDsl as _, RunQueryDsl as _,
+    };
+    use graph::{
+        components::store::{PruneRequest, PruningStrategy, StoreResult},
+        env::ENV_VARS,
+        prelude::StoreError,
+    };
+
+    use crate::{
+        relational::{Layout, Table},
+        vid_batcher::{VidBatcher, VidRange},
+        ConnectionPool,
+    };
+
+    table! {
+        subgraphs.prune_state(vid) {
+            vid -> Integer,
+            // Deployment id (sgd)
+            id -> Integer,
+            run -> Integer,
+            // The first block in the subgraph when the prune started
+            first_block -> Integer,
+            final_block -> Integer,
+            latest_block -> Integer,
+            // The amount of history configured
+            history_blocks -> Integer,
+
+            started_at -> Timestamptz,
+            finished_at -> Nullable<Timestamptz>,
+            errored_at -> Nullable<Timestamptz>,
+            error -> Nullable<Text>,
+        }
+    }
+
+    table! {
+        subgraphs.prune_table_state(vid) {
+            vid -> Integer,
+            // Deployment id (sgd)
+            id -> Integer,
+            run -> Integer,
+            table_name -> Text,
+
+            strategy -> Char,
+            // see enum Phase
+            phase -> Text,
+
+            start_vid -> Nullable<BigInt>,
+            final_vid -> Nullable<BigInt>,
+            nonfinal_vid -> Nullable<BigInt>,
+            rows -> Nullable<BigInt>,
+
+            next_vid -> Nullable<BigInt>,
+            batch_size -> Nullable<BigInt>,
+
+            started_at -> Nullable<Timestamptz>,
+            finished_at -> Nullable<Timestamptz>,
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, AsExpression, FromSqlRow)]
+    #[diesel(sql_type = Text)]
+    pub enum Phase {
+        Queued,
+        Started,
+        /// Only used when strategy is Rebuild
+        CopyFinal,
+        /// Only used when strategy is Rebuild
+        CopyNonfinal,
+        /// Only used when strategy is Delete
+        Delete,
+        Done,
+        /// Not a real phase, indicates that the database has an invalid
+        /// value
+        Unknown,
+    }
+
+    impl Phase {
+        pub fn from_str(phase: &str) -> Self {
+            use Phase::*;
+            match phase {
+                "queued" => Queued,
+                "started" => Started,
+                "copy_final" => CopyFinal,
+                "copy_nonfinal" => CopyNonfinal,
+                "delete" => Delete,
+                "done" => Done,
+                _ => Unknown,
+            }
+        }
+
+        pub fn as_str(&self) -> &str {
+            use Phase::*;
+            match self {
+                Queued => "queued",
+                Started => "started",
+                CopyFinal => "copy_final",
+                CopyNonfinal => "copy_nonfinal",
+                Delete => "delete",
+                Done => "done",
+                Unknown => "*unknown*",
+            }
+        }
+    }
+
+    impl ToSql<diesel::sql_types::Text, Pg> for Phase {
+        fn to_sql<'b>(&'b self, out: &mut Output<'b, '_, Pg>) -> diesel::serialize::Result {
+            let phase = self.as_str();
+            <str as ToSql<Text, Pg>>::to_sql(phase, &mut out.reborrow())
+        }
+    }
+
+    impl FromSql<Text, Pg> for Phase {
+        fn from_sql(bytes: PgValue) -> diesel::deserialize::Result<Self> {
+            Ok(Phase::from_str(std::str::from_utf8(bytes.as_bytes())?))
+        }
+    }
+
+    /// Information about one pruning run for a deployment
+    #[derive(Queryable)]
+    pub struct PruneState {
+        pub vid: i32,
+        pub id: i32,
+        pub run: i32,
+        pub first_block: i32,
+        pub final_block: i32,
+        pub latest_block: i32,
+        pub history_blocks: i32,
+
+        pub started_at: DateTime<Utc>,
+        pub finished_at: Option<DateTime<Utc>>,
+
+        pub errored_at: Option<DateTime<Utc>>,
+        pub error: Option<String>,
+    }
+
+    /// Per-table information about the pruning run for a deployment
+    #[derive(Queryable)]
+    pub struct PruneTableState {
+        pub vid: i32,
+        pub id: i32,
+        pub run: i32,
+        pub table_name: String,
+
+        // 'r' for rebuild or 'd' for delete
+        pub strategy: String,
+        pub phase: Phase,
+
+        pub start_vid: Option<i64>,
+        pub final_vid: Option<i64>,
+        pub nonfinal_vid: Option<i64>,
+        pub rows: Option<i64>,
+
+        pub next_vid: Option<i64>,
+        pub batch_size: Option<i64>,
+
+        pub started_at: Option<DateTime<Utc>>,
+        pub finished_at: Option<DateTime<Utc>>,
+    }
+
+    /// A helper to persist pruning progress in the database
+    pub(super) struct Tracker {
+        layout: Arc<Layout>,
+        run: i32,
+    }
+
+    impl Tracker {
+        pub(super) fn new(conn: &mut PgConnection, layout: Arc<Layout>) -> StoreResult<Self> {
+            use prune_state as ps;
+            let run = ps::table
+                .filter(ps::id.eq(layout.site.id))
+                .order(ps::run.desc())
+                .select(ps::run)
+                .get_result::<i32>(conn)
+                .optional()
+                .map_err(StoreError::from)?
+                .unwrap_or(0)
+                + 1;
+
+            // Delete old prune state. Keep the initial run and the last
+            // `prune_keep_history` runs (including this one)
+            diesel::delete(ps::table)
+                .filter(ps::id.eq(layout.site.id))
+                .filter(ps::run.gt(1))
+                .filter(ps::run.lt(run - (ENV_VARS.store.prune_keep_history as i32 - 1)))
+                .execute(conn)
+                .map_err(StoreError::from)?;
+
+            Ok(Tracker { layout, run })
+        }
+
+        pub(super) fn start(
+            &self,
+            conn: &mut PgConnection,
+            req: &PruneRequest,
+            prunable_tables: &[(&Arc<Table>, PruningStrategy)],
+        ) -> StoreResult<()> {
+            use prune_state as ps;
+            use prune_table_state as pts;
+
+            conn.transaction(|conn| {
+                insert_into(ps::table)
+                    .values((
+                        ps::id.eq(self.layout.site.id),
+                        ps::run.eq(self.run),
+                        ps::first_block.eq(req.first_block),
+                        ps::final_block.eq(req.final_block),
+                        ps::latest_block.eq(req.latest_block),
+                        ps::history_blocks.eq(req.history_blocks),
+                        ps::started_at.eq(diesel::dsl::now),
+                    ))
+                    .execute(conn)?;
+
+                for (table, strat) in prunable_tables {
+                    let strat = match strat {
+                        PruningStrategy::Rebuild => "r",
+                        PruningStrategy::Delete => "d",
+                    };
+                    insert_into(pts::table)
+                        .values((
+                            pts::id.eq(self.layout.site.id),
+                            pts::run.eq(self.run),
+                            pts::table_name.eq(table.name.as_str()),
+                            pts::strategy.eq(strat),
+                            pts::phase.eq(Phase::Queued),
+                        ))
+                        .execute(conn)?;
+                }
+                Ok(())
+            })
+        }
+
+        pub(crate) fn start_table(
+            &self,
+            conn: &mut PgConnection,
+            table: &Table,
+        ) -> StoreResult<()> {
+            use prune_table_state as pts;
+
+            self.update_table_state(
+                conn,
+                table,
+                (
+                    pts::started_at.eq(diesel::dsl::now),
+                    pts::phase.eq(Phase::Started),
+                ),
+            )?;
+
+            Ok(())
+        }
+
+        pub(crate) fn start_copy_final(
+            &self,
+            conn: &mut PgConnection,
+            table: &Table,
+            range: VidRange,
+        ) -> StoreResult<()> {
+            use prune_table_state as pts;
+
+            let values = (
+                pts::phase.eq(Phase::CopyFinal),
+                pts::start_vid.eq(range.min),
+                pts::next_vid.eq(range.min),
+                pts::final_vid.eq(range.max),
+                pts::rows.eq(0),
+            );
+
+            self.update_table_state(conn, table, values)
+        }
+
+        pub(crate) fn start_copy_nonfinal(
+            &self,
+            conn: &mut PgConnection,
+            table: &Table,
+            range: VidRange,
+        ) -> StoreResult<()> {
+            use prune_table_state as pts;
+
+            let values = (
+                pts::phase.eq(Phase::CopyNonfinal),
+                pts::start_vid.eq(range.min),
+                pts::next_vid.eq(range.min),
+                pts::nonfinal_vid.eq(range.max),
+            );
+            self.update_table_state(conn, table, values)
+        }
+
+        pub(crate) fn finish_batch(
+            &self,
+            conn: &mut PgConnection,
+            src: &Table,
+            rows: i64,
+            batcher: &VidBatcher,
+        ) -> StoreResult<()> {
+            use prune_table_state as pts;
+
+            let values = (
+                pts::next_vid.eq(batcher.next_vid()),
+                pts::batch_size.eq(batcher.batch_size() as i64),
+                pts::rows.eq(pts::rows + rows),
+            );
+
+            self.update_table_state(conn, src, values)
+        }
+
+        pub(crate) fn finish_table(
+            &self,
+            conn: &mut PgConnection,
+            table: &Table,
+        ) -> StoreResult<()> {
+            use prune_table_state as pts;
+
+            let values = (
+                pts::finished_at.eq(diesel::dsl::now),
+                pts::phase.eq(Phase::Done),
+            );
+
+            self.update_table_state(conn, table, values)
+        }
+
+        pub(crate) fn start_delete(
+            &self,
+            conn: &mut PgConnection,
+            table: &Table,
+            range: VidRange,
+            batcher: &VidBatcher,
+        ) -> StoreResult<()> {
+            use prune_table_state as pts;
+
+            let values = (
+                pts::phase.eq(Phase::Delete),
+                pts::start_vid.eq(range.min),
+                pts::final_vid.eq(range.max),
+                pts::nonfinal_vid.eq(range.max),
+                pts::rows.eq(0),
+                pts::next_vid.eq(range.min),
+                pts::batch_size.eq(batcher.batch_size() as i64),
+            );
+
+            self.update_table_state(conn, table, values)
+        }
+
+        fn update_table_state<V, C>(
+            &self,
+            conn: &mut PgConnection,
+            table: &Table,
+            values: V,
+        ) -> StoreResult<()>
+        where
+            V: AsChangeset<Target = prune_table_state::table, Changeset = C>,
+            C: QueryFragment<diesel::pg::Pg>,
+        {
+            use prune_table_state as pts;
+
+            update(pts::table)
+                .filter(pts::id.eq(self.layout.site.id))
+                .filter(pts::run.eq(self.run))
+                .filter(pts::table_name.eq(table.name.as_str()))
+                .set(values)
+                .execute(conn)?;
+            Ok(())
+        }
+
+        pub(crate) fn finish(&self, conn: &mut PgConnection) -> StoreResult<()> {
+            use prune_state as ps;
+
+            update(ps::table)
+                .filter(ps::id.eq(self.layout.site.id))
+                .filter(ps::run.eq(self.run))
+                .set((ps::finished_at.eq(diesel::dsl::now),))
+                .execute(conn)?;
+            Ok(())
+        }
+
+        pub(crate) fn error(&self, conn: &mut PgConnection, err: &str) -> StoreResult<()> {
+            use prune_state as ps;
+
+            update(ps::table)
+                .filter(ps::id.eq(self.layout.site.id))
+                .filter(ps::run.eq(self.run))
+                .set((
+                    ps::finished_at.eq(diesel::dsl::now),
+                    ps::errored_at.eq(diesel::dsl::now),
+                    ps::error.eq(err),
+                ))
+                .execute(conn)?;
+            Ok(())
+        }
+    }
+
+    /// A helper to read pruning progress from the database
+    pub struct Viewer {
+        pool: ConnectionPool,
+        layout: Arc<Layout>,
+    }
+
+    impl Viewer {
+        pub fn new(pool: ConnectionPool, layout: Arc<Layout>) -> Self {
+            Self { pool, layout }
+        }
+
+        pub fn runs(&self) -> StoreResult<Vec<usize>> {
+            use prune_state as ps;
+
+            let mut conn = self.pool.get()?;
+            let runs = ps::table
+                .filter(ps::id.eq(self.layout.site.id))
+                .select(ps::run)
+                .order(ps::run.asc())
+                .load::<i32>(&mut conn)
+                .map_err(StoreError::from)?;
+            let runs = runs.into_iter().map(|run| run as usize).collect::<Vec<_>>();
+            Ok(runs)
+        }
+
+        pub fn state(&self, run: usize) -> StoreResult<Option<(PruneState, Vec<PruneTableState>)>> {
+            use prune_state as ps;
+            use prune_table_state as pts;
+
+            let mut conn = self.pool.get()?;
+
+            let ptss = pts::table
+                .filter(pts::id.eq(self.layout.site.id))
+                .filter(pts::run.eq(run as i32))
+                .order(pts::table_name.asc())
+                .load::<PruneTableState>(&mut conn)
+                .map_err(StoreError::from)?;
+
+            ps::table
+                .filter(ps::id.eq(self.layout.site.id))
+                .filter(ps::run.eq(run as i32))
+                .first::<PruneState>(&mut conn)
+                .optional()
+                .map_err(StoreError::from)
+                .map(|state| state.map(|state| (state, ptss)))
+        }
     }
 }

@@ -3,8 +3,6 @@
 //! different databases/shards.
 
 #[macro_use]
-extern crate derive_more;
-#[macro_use]
 extern crate diesel;
 #[macro_use]
 extern crate diesel_migrations;
@@ -17,7 +15,6 @@ mod block_store;
 mod catalog;
 mod chain_head_listener;
 mod chain_store;
-pub mod connection_pool;
 mod copy;
 mod deployment;
 mod deployment_store;
@@ -27,6 +24,7 @@ mod fork;
 mod functions;
 mod jobs;
 mod notification_listener;
+mod pool;
 mod primary;
 pub mod query_store;
 mod relational;
@@ -63,6 +61,7 @@ pub use self::chain_store::{ChainStore, ChainStoreMetrics, Storage};
 pub use self::detail::DeploymentDetail;
 pub use self::jobs::register as register_jobs;
 pub use self::notification_listener::NotificationSender;
+pub use self::pool::{ConnectionPool, ForeignServer, PoolCoordinator, PoolRole};
 pub use self::primary::{db_version, UnusedDeployment};
 pub use self::store::Store;
 pub use self::store_events::SubscriptionManager;
@@ -73,7 +72,7 @@ pub use self::subgraph_store::{unused, DeploymentPlacer, Shard, SubgraphStore, P
 pub mod command_support {
     pub mod catalog {
         pub use crate::block_store::primary as block_store;
-        pub use crate::catalog::{account_like, stats};
+        pub use crate::catalog::{account_like, Catalog};
         pub use crate::copy::{copy_state, copy_table_state};
         pub use crate::primary::{
             active_copies, deployment_schemas, ens_names, subgraph, subgraph_deployment_assignment,
@@ -86,5 +85,6 @@ pub mod command_support {
     }
     pub use crate::deployment::{on_sync, OnSync};
     pub use crate::primary::Namespace;
+    pub use crate::relational::prune::{Phase, PruneState, PruneTableState, Viewer};
     pub use crate::relational::{Catalog, Column, ColumnType, Layout, SqlName};
 }

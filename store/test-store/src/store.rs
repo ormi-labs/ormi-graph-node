@@ -25,10 +25,9 @@ use graph_graphql::prelude::{
 use graph_graphql::test_support::GraphQLMetrics;
 use graph_node::config::{Config, Opt};
 use graph_node::store_builder::StoreBuilder;
-use graph_store_postgres::layout_for_tests::FAKE_NETWORK_SHARED;
-use graph_store_postgres::{connection_pool::ConnectionPool, Shard, SubscriptionManager};
 use graph_store_postgres::{
-    BlockStore as DieselBlockStore, DeploymentPlacer, SubgraphStore as DieselSubgraphStore,
+    layout_for_tests::FAKE_NETWORK_SHARED, BlockStore as DieselBlockStore, ConnectionPool,
+    DeploymentPlacer, Shard, SubgraphStore as DieselSubgraphStore, SubscriptionManager,
     PRIMARY_SHARD,
 };
 use hex_literal::hex;
@@ -637,7 +636,7 @@ fn build_store() -> (Arc<Store>, ConnectionPool, Config, Arc<SubscriptionManager
             );
             match store.block_store().chain_store(NETWORK_NAME) {
                 Some(cs) => {
-                    cs.set_chain_identifier(&ChainIdentifier {
+                    cs.set_chain_identifier_for_tests(&ChainIdentifier {
                         net_version: NETWORK_VERSION.to_string(),
                         genesis_block_hash: GENESIS_PTR.hash.clone(),
                     })

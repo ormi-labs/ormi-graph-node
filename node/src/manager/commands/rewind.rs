@@ -10,8 +10,8 @@ use graph::components::store::{BlockStore as _, ChainStore as _, DeploymentLocat
 use graph::env::ENV_VARS;
 use graph::prelude::{anyhow, BlockNumber, BlockPtr};
 use graph_store_postgres::command_support::catalog::{self as store_catalog};
-use graph_store_postgres::{connection_pool::ConnectionPool, Store};
 use graph_store_postgres::{BlockStore, NotificationSender};
+use graph_store_postgres::{ConnectionPool, Store};
 
 async fn block_ptr(
     store: Arc<BlockStore>,
@@ -133,13 +133,13 @@ pub async fn run(
         let deployment_details = deployment_store.deployment_details_for_id(locator)?;
         let block_number_to = block_ptr_to.as_ref().map(|b| b.number).unwrap_or(0);
 
-        if block_number_to < deployment_details.earliest_block_number + ENV_VARS.reorg_threshold {
+        if block_number_to < deployment_details.earliest_block_number + ENV_VARS.reorg_threshold() {
             bail!(
                 "The block number {} is not safe to rewind to for deployment {}. The earliest block number of this deployment is {}. You can only safely rewind to block number {}",
                 block_ptr_to.as_ref().map(|b| b.number).unwrap_or(0),
                 locator,
                 deployment_details.earliest_block_number,
-                deployment_details.earliest_block_number + ENV_VARS.reorg_threshold
+                deployment_details.earliest_block_number + ENV_VARS.reorg_threshold()
             );
         }
     }

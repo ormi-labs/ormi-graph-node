@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use graph::prelude::NodeId;
-use graph_store_postgres::connection_pool::ConnectionPool;
+use graph_store_postgres::ConnectionPool;
 use graph_store_postgres::NotificationSender;
 use graphman::commands::deployment::reassign::{
     load_deployment, reassign_deployment, ReassignResult,
@@ -16,14 +16,27 @@ pub fn run(
     node: &NodeId,
 ) -> Result<()> {
     let deployment = load_deployment(primary_pool.clone(), &deployment)?;
+    let curr_node = deployment.assigned_node(primary_pool.clone())?;
+    let reassign_msg = match &curr_node {
+        Some(curr_node) => format!(
+            "Reassigning deployment {} (was {})",
+            deployment.locator(),
+            curr_node
+        ),
+        None => format!("Reassigning deployment {}", deployment.locator()),
+    };
+    println!("{}", reassign_msg);
 
-    println!("Reassigning deployment {}", deployment.locator());
-
-    let reassign_result =
-        reassign_deployment(primary_pool, notification_sender, &deployment, node)?;
+    let reassign_result = reassign_deployment(
+        primary_pool,
+        notification_sender,
+        &deployment,
+        node,
+        curr_node,
+    )?;
 
     match reassign_result {
-        ReassignResult::EmptyResponse => {
+        ReassignResult::Ok => {
             println!(
                 "Deployment {} assigned to node {}",
                 deployment.locator(),

@@ -11,8 +11,8 @@ use std::sync::Arc;
 use lazy_static::lazy_static;
 
 use crate::{
-    connection_pool::ConnectionPool,
     notification_listener::{JsonNotification, NotificationListener, SafeChannelName},
+    pool::ConnectionPool,
     NotificationSender,
 };
 use graph::blockchain::ChainHeadUpdateListener as ChainHeadUpdateListenerTrait;
@@ -40,7 +40,6 @@ impl Watcher {
         }
     }
 
-    #[allow(dead_code)]
     fn send(&self) {
         // Unwrap: `self` holds a receiver.
         self.sender.send(()).unwrap()

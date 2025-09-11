@@ -16,7 +16,7 @@ mod query_tests;
 
 pub(crate) mod dsl;
 pub(crate) mod index;
-mod prune;
+pub(crate) mod prune;
 mod rollup;
 pub(crate) mod value;
 
@@ -32,12 +32,11 @@ use graph::blockchain::block_stream::{EntityOperationKind, EntitySourceOperation
 use graph::blockchain::BlockTime;
 use graph::cheap_clone::CheapClone;
 use graph::components::store::write::{RowGroup, WriteChunk};
-use graph::components::subgraph::PoICausalityRegion;
-use graph::constraint_violation;
 use graph::data::graphql::TypeExt as _;
 use graph::data::query::Trace;
 use graph::data::value::Word;
 use graph::data_source::CausalityRegion;
+use graph::internal_error;
 use graph::prelude::{q, EntityQuery, StopwatchMetrics, ENV_VARS};
 use graph::schema::{
     EntityKey, EntityType, Field, FulltextConfig, FulltextDefinition, InputSchema,
@@ -69,7 +68,7 @@ use crate::{
     },
 };
 use graph::components::store::{AttributeNames, DerivedEntityQuery};
-use graph::data::store::{Id, IdList, IdType, BYTES_SCALAR};
+use graph::data::store::{IdList, IdType, BYTES_SCALAR};
 use graph::data::subgraph::schema::POI_TABLE;
 use graph::prelude::{
     anyhow, info, BlockNumber, DeploymentHash, Entity, EntityOperation, Logger,
@@ -78,7 +77,7 @@ use graph::prelude::{
 
 use crate::block_range::{BoundSide, BLOCK_COLUMN, BLOCK_RANGE_COLUMN};
 pub use crate::catalog::Catalog;
-use crate::connection_pool::ForeignServer;
+use crate::ForeignServer;
 use crate::{catalog, deployment};
 
 use self::rollup::Rollup;
@@ -504,7 +503,7 @@ impl Layout {
             let key =
                 entity_type.key_in(entity_data.id(), CausalityRegion::from_entity(&entity_data));
             if entities.contains_key(&key) {
-                return Err(constraint_violation!(
+                return Err(internal_error!(
                     "duplicate entity {}[{}] in result set, block = {}",
                     key.entity_type,
                     key.entity_id,
@@ -911,7 +910,7 @@ impl Layout {
                 .map(|id| id.to_string())
                 .collect::<Vec<_>>()
                 .join(", ");
-            return Err(constraint_violation!(
+            return Err(internal_error!(
                 "entities of type `{}` can not be updated since they are immutable. Entity ids are [{}]",
                 group.entity_type,
                 ids
@@ -969,7 +968,7 @@ impl Layout {
 
         let table = self.table_for_entity(&group.entity_type)?;
         if table.immutable {
-            return Err(constraint_violation!(
+            return Err(internal_error!(
                 "entities of type `{}` can not be deleted since they are immutable. Entity ids are [{}]",
                 table.object, group.ids().join(", ")
             ));
@@ -1113,32 +1112,6 @@ impl Layout {
         Ok(Arc::new(layout))
     }
 
-    pub(crate) fn block_time(
-        &self,
-        conn: &mut PgConnection,
-        block: BlockNumber,
-    ) -> Result<Option<BlockTime>, StoreError> {
-        let block_time_name = self.input_schema.poi_block_time();
-        let poi_type = self.input_schema.poi_type();
-        let id = Id::String(Word::from(PoICausalityRegion::from_network(
-            &self.site.network,
-        )));
-        let key = poi_type.key(id);
-
-        let block_time = self
-            .find(conn, &key, block)?
-            .and_then(|entity| {
-                entity.get(&block_time_name).map(|value| {
-                    value
-                        .as_int8()
-                        .ok_or_else(|| constraint_violation!("block_time must have type Int8"))
-                })
-            })
-            .transpose()?
-            .map(|value| BlockTime::since_epoch(value, 0));
-        Ok(block_time)
-    }
-
     /// Find the time of the last rollup for the subgraph. We do this by
     /// looking for the maximum timestamp in any aggregation table and
     /// adding a little bit more than the corresponding interval to it. This
@@ -1165,11 +1138,11 @@ impl Layout {
             let source_type = mapping.source_type(schema);
             let source_table = tables
                 .get(&source_type)
-                .ok_or_else(|| constraint_violation!("Table for {source_type} is missing"))?;
+                .ok_or_else(|| internal_error!("Table for {source_type} is missing"))?;
             let agg_type = mapping.agg_type(schema);
             let agg_table = tables
                 .get(&agg_type)
-                .ok_or_else(|| constraint_violation!("Table for {agg_type} is missing"))?;
+                .ok_or_else(|| internal_error!("Table for {agg_type} is missing"))?;
             let aggregation = mapping.aggregation(schema);
             let rollup = Rollup::new(
                 mapping.interval,
@@ -1639,9 +1612,9 @@ impl Table {
     ) -> Result<Table, StoreError> {
         SqlName::check_valid_identifier(defn.as_str(), "object")?;
 
-        let object_type = defn.object_type().map_err(|_| {
-            constraint_violation!("The type `{}` is not an object type", defn.as_str())
-        })?;
+        let object_type = defn
+            .object_type()
+            .map_err(|_| internal_error!("The type `{}` is not an object type", defn.as_str()))?;
 
         let table_name = SqlName::from(defn.as_str());
         let columns = object_type

@@ -11,19 +11,21 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::time::{Duration, Instant};
+use std::time::{self, Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use graph::futures03::StreamExt;
+use graph::itertools::Itertools;
 use graph::prelude::serde_json::{json, Value};
 use graph::prelude::web3::types::U256;
 use graph_tests::contract::Contract;
-use graph_tests::helpers::{run_checked, TestFile};
 use graph_tests::subgraph::Subgraph;
 use graph_tests::{error, status, CONFIG};
-use tokio::process::{Child, Command};
+use tokio::process::Child;
 use tokio::task::JoinError;
 use tokio::time::sleep;
+
+const SUBGRAPH_LAST_GRAFTING_BLOCK: i32 = 3;
 
 type TestFn = Box<
     dyn FnOnce(TestContext) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>>
@@ -31,25 +33,25 @@ type TestFn = Box<
         + Send,
 >;
 
-struct TestContext {
-    subgraph: Subgraph,
-    contracts: Vec<Contract>,
+pub struct TestContext {
+    pub subgraph: Subgraph,
+    pub contracts: Vec<Contract>,
 }
 
-enum TestStatus {
+pub enum TestStatus {
     Ok,
     Err(anyhow::Error),
     Panic(JoinError),
 }
 
-struct TestResult {
-    name: String,
-    subgraph: Option<Subgraph>,
-    status: TestStatus,
+pub struct TestResult {
+    pub name: String,
+    pub subgraph: Option<Subgraph>,
+    pub status: TestStatus,
 }
 
 impl TestResult {
-    fn success(&self) -> bool {
+    pub fn success(&self) -> bool {
         match self.status {
             TestStatus::Ok => true,
             _ => false,
@@ -62,7 +64,7 @@ impl TestResult {
         }
     }
 
-    fn print(&self) {
+    pub fn print(&self) {
         // ANSI escape sequences; see the comment in macros.rs about better colorization
         const GREEN: &str = "\x1b[1;32m";
         const RED: &str = "\x1b[1;31m";
@@ -92,14 +94,44 @@ impl TestResult {
     }
 }
 
-struct TestCase {
-    name: String,
-    test: TestFn,
-    source_subgraph: Option<String>,
+#[derive(Debug, Clone)]
+pub enum SourceSubgraph {
+    Subgraph(String),
+    WithAlias((String, String)), // (alias, test_name)
+}
+
+impl SourceSubgraph {
+    pub fn from_str(s: &str) -> Self {
+        if let Some((alias, subgraph)) = s.split_once(':') {
+            Self::WithAlias((alias.to_string(), subgraph.to_string()))
+        } else {
+            Self::Subgraph(s.to_string())
+        }
+    }
+
+    pub fn test_name(&self) -> &str {
+        match self {
+            Self::Subgraph(name) => name,
+            Self::WithAlias((_, name)) => name,
+        }
+    }
+
+    pub fn alias(&self) -> Option<&str> {
+        match self {
+            Self::Subgraph(_) => None,
+            Self::WithAlias((alias, _)) => Some(alias),
+        }
+    }
+}
+
+pub struct TestCase {
+    pub name: String,
+    pub test: TestFn,
+    pub source_subgraph: Option<Vec<SourceSubgraph>>,
 }
 
 impl TestCase {
-    fn new<T>(name: &str, test: fn(TestContext) -> T) -> Self
+    pub fn new<T>(name: &str, test: fn(TestContext) -> T) -> Self
     where
         T: Future<Output = Result<(), anyhow::Error>> + Send + 'static,
     {
@@ -110,20 +142,16 @@ impl TestCase {
         }
     }
 
-    fn new_with_source_subgraph<T>(
-        name: &str,
-        test: fn(TestContext) -> T,
-        source_subgraph: &str,
-    ) -> Self
+    fn new_with_grafting<T>(name: &str, test: fn(TestContext) -> T, base_subgraph: &str) -> Self
     where
         T: Future<Output = Result<(), anyhow::Error>> + Send + 'static,
     {
         let mut test_case = Self::new(name, test);
-        test_case.source_subgraph = Some(source_subgraph.to_string());
+        test_case.source_subgraph = Some(vec![SourceSubgraph::from_str(base_subgraph)]);
         test_case
     }
 
-    fn new_with_multiple_source_subgraphs<T>(
+    pub fn new_with_source_subgraphs<T>(
         name: &str,
         test: fn(TestContext) -> T,
         source_subgraphs: Vec<&str>,
@@ -132,7 +160,12 @@ impl TestCase {
         T: Future<Output = Result<(), anyhow::Error>> + Send + 'static,
     {
         let mut test_case = Self::new(name, test);
-        test_case.source_subgraph = Some(source_subgraphs.join(","));
+        test_case.source_subgraph = Some(
+            source_subgraphs
+                .into_iter()
+                .map(SourceSubgraph::from_str)
+                .collect(),
+        );
         test_case
     }
 
@@ -168,32 +201,37 @@ impl TestCase {
         Ok(subgraph)
     }
 
-    async fn run(self, contracts: &[Contract]) -> TestResult {
-        // If a subgraph has subgraph datasources, deploy them first
+    pub async fn prepare(&self, contracts: &[Contract]) -> anyhow::Result<String> {
+        // If a subgraph has subgraph datasources, prepare them first
         if let Some(_subgraphs) = &self.source_subgraph {
-            if let Err(e) = self.deploy_multiple_sources(contracts).await {
-                error!(&self.name, "source subgraph deployment failed");
-                return TestResult {
-                    name: self.name.clone(),
-                    subgraph: None,
-                    status: TestStatus::Err(e),
-                };
+            if let Err(e) = self.prepare_multiple_sources(contracts).await {
+                error!(&self.name, "source subgraph deployment failed: {:?}", e);
+                return Err(e);
             }
         }
 
-        status!(&self.name, "Deploying subgraph");
-        let subgraph_name = match Subgraph::deploy(&self.name, contracts).await {
+        status!(&self.name, "Preparing subgraph");
+        let (_, subgraph_name, _) = match Subgraph::prepare(&self.name, contracts).await {
             Ok(name) => name,
             Err(e) => {
-                error!(&self.name, "Deploy failed");
-                return TestResult {
-                    name: self.name.clone(),
-                    subgraph: None,
-                    status: TestStatus::Err(e.context("Deploy failed")),
-                };
+                error!(&self.name, "Prepare failed: {:?}", e);
+                return Err(e);
             }
         };
-        status!(&self.name, "Waiting for subgraph to become ready");
+
+        Ok(subgraph_name)
+    }
+
+    pub async fn check_health_and_test(
+        self,
+        contracts: &[Contract],
+        subgraph_name: String,
+    ) -> TestResult {
+        status!(
+            &self.name,
+            "Waiting for subgraph ({}) to become ready",
+            subgraph_name
+        );
         let subgraph = match Subgraph::wait_ready(&subgraph_name).await {
             Ok(subgraph) => subgraph,
             Err(e) => {
@@ -205,6 +243,7 @@ impl TestCase {
                 };
             }
         };
+
         if subgraph.healthy {
             status!(&self.name, "Subgraph ({}) is synced", subgraph.deployment);
         } else {
@@ -240,13 +279,51 @@ impl TestCase {
         }
     }
 
+    async fn run(self, contracts: &[Contract]) -> TestResult {
+        // If a subgraph has subgraph datasources, deploy them first
+        if let Some(_subgraphs) = &self.source_subgraph {
+            if let Err(e) = self.deploy_multiple_sources(contracts).await {
+                error!(&self.name, "source subgraph deployment failed");
+                return TestResult {
+                    name: self.name.clone(),
+                    subgraph: None,
+                    status: TestStatus::Err(e),
+                };
+            }
+        }
+
+        status!(&self.name, "Deploying subgraph");
+        let subgraph_name = match Subgraph::deploy(&self.name, contracts).await {
+            Ok(name) => name,
+            Err(e) => {
+                error!(&self.name, "Deploy failed");
+                return TestResult {
+                    name: self.name.clone(),
+                    subgraph: None,
+                    status: TestStatus::Err(e.context("Deploy failed")),
+                };
+            }
+        };
+
+        self.check_health_and_test(contracts, subgraph_name).await
+    }
+
+    async fn prepare_multiple_sources(&self, contracts: &[Contract]) -> Result<()> {
+        if let Some(sources) = &self.source_subgraph {
+            for source in sources {
+                let _ = Subgraph::prepare(source.test_name(), contracts).await?;
+            }
+        }
+        Ok(())
+    }
+
     async fn deploy_multiple_sources(&self, contracts: &[Contract]) -> Result<()> {
         if let Some(sources) = &self.source_subgraph {
-            for source in sources.split(",") {
-                let subgraph = self.deploy_and_wait(source, contracts).await?;
+            for source in sources {
+                let subgraph = self.deploy_and_wait(source.test_name(), contracts).await?;
                 status!(
-                    source,
-                    "source subgraph deployed with hash {}",
+                    source.test_name(),
+                    "Source subgraph deployed with hash {}",
                     subgraph.deployment
                 );
             }
@@ -328,7 +405,7 @@ async fn test_int8(ctx: TestContext) -> anyhow::Result<()> {
 * the `cases` variable in `integration_tests`.
 */
 
-async fn test_timestamp(ctx: TestContext) -> anyhow::Result<()> {
+pub async fn test_timestamp(ctx: TestContext) -> anyhow::Result<()> {
     let subgraph = ctx.subgraph;
     assert!(subgraph.healthy);
 
@@ -356,7 +433,7 @@ async fn test_timestamp(ctx: TestContext) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn test_block_handlers(ctx: TestContext) -> anyhow::Result<()> {
+pub async fn test_block_handlers(ctx: TestContext) -> anyhow::Result<()> {
     let subgraph = ctx.subgraph;
     assert!(subgraph.healthy);
 
@@ -456,9 +533,8 @@ async fn test_block_handlers(ctx: TestContext) -> anyhow::Result<()> {
     .await?;
 
     // test subgraphFeatures endpoint returns handlers correctly
-    let subgraph_features = subgraph
-        .index_with_vars(
-            "query GetSubgraphFeatures($deployment: String!) {
+    let subgraph_features = Subgraph::query_with_vars(
+        "query GetSubgraphFeatures($deployment: String!) {
           subgraphFeatures(subgraphId: $deployment) {
             specVersion
             apiVersion
@@ -468,9 +544,9 @@ async fn test_block_handlers(ctx: TestContext) -> anyhow::Result<()> {
             handlers
           }
         }",
-            json!({ "deployment": subgraph.deployment }),
-        )
-        .await?;
+        json!({ "deployment": subgraph.deployment }),
+    )
+    .await?;
     let handlers = &subgraph_features["data"]["subgraphFeatures"]["handlers"];
     assert!(
         handlers.is_array(),
@@ -518,7 +594,7 @@ async fn test_eth_api(ctx: TestContext) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn subgraph_data_sources(ctx: TestContext) -> anyhow::Result<()> {
+pub async fn subgraph_data_sources(ctx: TestContext) -> anyhow::Result<()> {
     let subgraph = ctx.subgraph;
     assert!(subgraph.healthy);
     let expected_response = json!({
@@ -647,7 +723,7 @@ async fn test_topic_filters(ctx: TestContext) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn test_ganache_reverts(ctx: TestContext) -> anyhow::Result<()> {
+async fn test_reverted_calls_are_indexed(ctx: TestContext) -> anyhow::Result<()> {
     let subgraph = ctx.subgraph;
     assert!(subgraph.healthy);
 
@@ -697,9 +773,8 @@ async fn test_non_fatal_errors(ctx: TestContext) -> anyhow::Result<()> {
         }
       }";
 
-    let resp = subgraph
-        .index_with_vars(query, json!({ "deployment" : subgraph.deployment }))
-        .await?;
+    let resp =
+        Subgraph::query_with_vars(query, json!({ "deployment" : subgraph.deployment })).await?;
     let subgraph_features = &resp["data"]["subgraphFeatures"];
     let exp = json!({
       "specVersion": "0.0.4",
@@ -796,6 +871,82 @@ async fn test_remove_then_update(ctx: TestContext) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn test_subgraph_grafting(ctx: TestContext) -> anyhow::Result<()> {
+    async fn get_block_hash(block_number: i32) -> Option<String> {
+        const FETCH_BLOCK_HASH: &str = r#"
+        query blockHashFromNumber($network: String!, $blockNumber: Int!) {
+            hash: blockHashFromNumber(
+              network: $network,
+              blockNumber: $blockNumber,
+            ) } "#;
+        let vars = json!({
+            "network": "test",
+            "blockNumber": block_number
+        });
+
+        let resp = Subgraph::query_with_vars(FETCH_BLOCK_HASH, vars)
+            .await
+            .unwrap();
+        assert_eq!(None, resp.get("errors"));
+        resp["data"]["hash"].as_str().map(|s| s.to_owned())
+    }
+
+    let subgraph = ctx.subgraph;
+
+    assert!(subgraph.healthy);
+
+    let block_hashes: Vec<&str> = vec![
+        "e26fccbd24dcc76074b432becf29cad3bcba11a8467a7b770fad109c2b5d14c2",
+        "249dbcbee975c22f8c9cc937536945ca463568c42d8933a3f54129dec352e46b",
+        "408675f81c409dede08d0eeb2b3420a73b067c4fa8c5f0fc49ce369289467c33",
+    ];
+
+    let pois: Vec<&str> = vec![
+        "0x606c1ed77564ef9ab077e0438da9f3c6af79a991603aecf74650971a88d05b65",
+        "0xbb21d5cf5fd62892159f95211da4a02f0dfa1b43d68aeb64baa52cc67fbb6c8e",
+        "0x5a01b371017c924e8cedd62a76cf8dcf05987f80d2b91aaf3fb57872ab75887f",
+    ];
+
+    for i in 1..4 {
+        let block_hash = get_block_hash(i).await.unwrap();
+        // We need to make sure that the preconditions for POI are fulfiled
+        // namely that the blockchain produced the proper block hashes for the
+        // blocks of which we will check the POI.
+        assert_eq!(block_hash, block_hashes[(i - 1) as usize]);
+
+        const FETCH_POI: &str = r#"
+        query proofOfIndexing($subgraph: String!, $blockNumber: Int!, $blockHash: String!, $indexer: String!) {
+            proofOfIndexing(
+              subgraph: $subgraph,
+              blockNumber: $blockNumber,
+              blockHash: $blockHash,
+              indexer: $indexer
+            ) } "#;
+
+        let zero_addr = "0000000000000000000000000000000000000000";
+        let vars = json!({
+            "subgraph": subgraph.deployment,
+            "blockNumber": i,
+            "blockHash": block_hash,
+            "indexer": zero_addr,
+        });
+        let resp = Subgraph::query_with_vars(FETCH_POI, vars).await?;
+        assert_eq!(None, resp.get("errors"));
+        assert!(resp["data"]["proofOfIndexing"].is_string());
+        let poi = resp["data"]["proofOfIndexing"].as_str().unwrap();
+        // Check the expected value of the POI. The transition from the old legacy
+        // hashing to the new one is done in the block #2 anything before that
+        // should not change as the legacy code will not be updated. Any change
+        // after that might indicate a change in the way new POI is now calculated.
+        // Change on the block #2 would mean a change in the transitioning
+        // from the old to the new algorithm hence would be reflected only
+        // subgraphs that are grafting from pre 0.0.5 to 0.0.6 or newer.
+        assert_eq!(poi, pois[(i - 1) as usize]);
+    }
+
+    Ok(())
+}
+
 async fn test_poi_for_failed_subgraph(ctx: TestContext) -> anyhow::Result<()> {
     let subgraph = ctx.subgraph;
     const INDEXING_STATUS: &str = r#"
@@ -829,9 +980,9 @@ async fn test_poi_for_failed_subgraph(ctx: TestContext) -> anyhow::Result<()> {
     }
 
     async fn fetch_status(subgraph: &Subgraph) -> anyhow::Result<Status> {
-        let resp = subgraph
-            .index_with_vars(INDEXING_STATUS, json!({ "subgraphName": subgraph.name }))
-            .await?;
+        let resp =
+            Subgraph::query_with_vars(INDEXING_STATUS, json!({ "subgraphName": subgraph.name }))
+                .await?;
         assert_eq!(None, resp.get("errors"));
         let statuses = &resp["data"]["statuses"];
         assert_eq!(1, statuses.as_array().unwrap().len());
@@ -877,7 +1028,7 @@ async fn test_poi_for_failed_subgraph(ctx: TestContext) -> anyhow::Result<()> {
         "blockNumber": block_number,
         "blockHash": status.latest_block["hash"],
     });
-    let resp = subgraph.index_with_vars(FETCH_POI, vars).await?;
+    let resp = Subgraph::query_with_vars(FETCH_POI, vars).await?;
     assert_eq!(None, resp.get("errors"));
     assert!(resp["data"]["proofOfIndexing"].is_string());
     Ok(())
@@ -888,9 +1039,11 @@ async fn test_missing(_sg: Subgraph) -> anyhow::Result<()> {
     Err(anyhow!("This test is missing"))
 }
 
-async fn test_multiple_subgraph_datasources(ctx: TestContext) -> anyhow::Result<()> {
+pub async fn test_multiple_subgraph_datasources(ctx: TestContext) -> anyhow::Result<()> {
     let subgraph = ctx.subgraph;
     assert!(subgraph.healthy);
+
+    println!("subgraph: {:?}", subgraph);
 
     // Test querying data aggregated from multiple sources
     let exp = json!({
@@ -915,16 +1068,251 @@ async fn test_multiple_subgraph_datasources(ctx: TestContext) -> anyhow::Result<
     Ok(())
 }
 
+/// Test the declared calls functionality as of spec version 1.2.0.
+/// Note that we don't have a way to test that the actual call is made as
+/// a declared call since graph-node does not expose that information
+/// to mappings. This test assures though that the declared call machinery
+/// does not have any errors.
+async fn test_declared_calls_basic(ctx: TestContext) -> anyhow::Result<()> {
+    #[track_caller]
+    fn assert_call_result(call_results: &[Value], label: &str, exp_success: bool, exp_value: &str) {
+        let Some(call_result) = call_results.iter().find(|c| c["label"] == json!(label)) else {
+            panic!(
+                "Expected call result with label '{}', but none found",
+                label
+            );
+        };
+        let Some(act_success) = call_result["success"].as_bool() else {
+            panic!(
+                "Expected call result with label '{}' to have a boolean 'success' field, but got: {:?}",
+                label, call_result["success"]
+            );
+        };
+
+        if exp_success {
+            assert!(
+                act_success,
+                "Expected call result with label '{}' to be successful",
+                label
+            );
+            let Some(act_value) = call_result["value"].as_str() else {
+                panic!(
+                "Expected call result with label '{}' to have a string 'value' field, but got: {:?}",
+                label, call_result["value"]
+            );
+            };
+            assert_eq!(
+                exp_value, act_value,
+                "Expected call result with label '{}' to have value '{}', but got '{}'",
+                label, exp_value, act_value
+            );
+        } else {
+            assert!(
+                !act_success,
+                "Expected call result with label '{}' to have failed",
+                label
+            );
+        }
+    }
+
+    let subgraph = ctx.subgraph;
+    assert!(subgraph.healthy);
+
+    // Query the results
+    const QUERY: &'static str = "{
+        transferCalls(first: 1, orderBy: blockNumber) {
+            id
+            from
+            to
+            value
+            balanceFromBefore
+            balanceToBefore
+            totalSupply
+            constantValue
+            sumResult
+            metadataFrom
+            revertCallSucceeded
+        }
+        callResults(orderBy: label) {
+            label
+            success
+            value
+            error
+        }
+    }";
+
+    let Some((transfer_calls, call_results)) = subgraph
+        .polling_query(QUERY, &["transferCalls", "callResults"])
+        .await?
+        .into_iter()
+        .collect_tuple()
+    else {
+        panic!("Expected exactly two arrays from polling_query")
+    };
+
+    // Validate basic functionality
+    assert!(
+        !transfer_calls.is_empty(),
+        "Should have at least one transfer call"
+    );
+    assert!(!call_results.is_empty(), "Should have call results");
+
+    let transfer_call = &transfer_calls[0];
+
+    // Validate declared calls worked
+    assert_eq!(
+        transfer_call["constantValue"],
+        json!("42"),
+        "Constant value should be 42"
+    );
+    assert_eq!(
+        transfer_call["sumResult"],
+        json!("200"),
+        "Sum result should be 200 (100 + 100)"
+    );
+    assert_eq!(
+        transfer_call["revertCallSucceeded"],
+        json!(false),
+        "Revert call should have failed"
+    );
+    assert_eq!(
+        transfer_call["totalSupply"],
+        json!("3000"),
+        "Total supply should be 3000"
+    );
+
+    assert_call_result(&call_results, "balance_from", true, "900");
+    assert_call_result(&call_results, "balance_to", true, "1100");
+    assert_call_result(&call_results, "constant_value", true, "42");
+    assert_call_result(&call_results, "metadata_from", true, "Test Asset 1");
+    assert_call_result(&call_results, "sum_values", true, "200");
+    assert_call_result(&call_results, "total_supply", true, "3000");
+    assert_call_result(&call_results, "will_revert", false, "*ignored*");
+
+    Ok(())
+}
+
+async fn test_declared_calls_struct_fields(ctx: TestContext) -> anyhow::Result<()> {
+    let subgraph = ctx.subgraph;
+    assert!(subgraph.healthy);
+
+    // Wait a moment for indexing
+    sleep(Duration::from_secs(2)).await;
+
+    // Query the results
+    const QUERY: &'static str = "{
+        assetTransferCalls(first: 1, orderBy: blockNumber) {
+            id
+            assetAddr
+            assetAmount
+            assetActive
+            owner
+            metadata
+            amountCalc
+        }
+        complexAssetCalls(first: 1, orderBy: blockNumber) {
+            id
+            baseAssetAddr
+            baseAssetAmount
+            baseAssetOwner
+            baseAssetMetadata
+            baseAssetAmountCalc
+        }
+        structFieldTests(orderBy: testType) {
+            testType
+            fieldName
+            success
+            result
+            error
+        }
+    }";
+
+    let Some((asset_transfers, complex_assets, struct_tests)) = subgraph
+        .polling_query(
+            QUERY,
+            &[
+                "assetTransferCalls",
+                "complexAssetCalls",
+                "structFieldTests",
+            ],
+        )
+        .await?
+        .into_iter()
+        .collect_tuple()
+    else {
+        panic!("Expected exactly three arrays from polling_query")
+    };
+
+    // Validate struct field access
+    assert!(
+        !asset_transfers.is_empty(),
+        "Should have asset transfer calls"
+    );
+    assert!(
+        !complex_assets.is_empty(),
+        "Should have complex asset calls"
+    );
+    assert!(!struct_tests.is_empty(), "Should have struct field tests");
+
+    let asset_transfer = &asset_transfers[0];
+
+    // Validate struct field values
+    assert_eq!(
+        asset_transfer["assetAddr"],
+        json!("0x1111111111111111111111111111111111111111")
+    );
+    assert_eq!(asset_transfer["assetAmount"], json!("150"));
+    assert_eq!(asset_transfer["assetActive"], json!(true));
+    assert_eq!(asset_transfer["amountCalc"], json!("300")); // 150 + 150
+
+    // Validate complex asset (nested struct access)
+    let complex_asset = &complex_assets[0];
+    assert_eq!(
+        complex_asset["baseAssetAddr"],
+        json!("0x4444444444444444444444444444444444444444")
+    );
+    assert_eq!(complex_asset["baseAssetAmount"], json!("250"));
+    assert_eq!(complex_asset["baseAssetAmountCalc"], json!("349")); // 250 + 99
+
+    // Validate that struct field tests include both successful calls
+    let successful_tests: Vec<_> = struct_tests
+        .iter()
+        .filter(|t| t["success"] == json!(true))
+        .collect();
+    assert!(
+        !successful_tests.is_empty(),
+        "Should have successful struct field tests"
+    );
+
+    Ok(())
+}
+
+async fn wait_for_blockchain_block(block_number: i32) -> bool {
+    // Wait up to 5 minutes for the expected block to appear
+    const STATUS_WAIT: Duration = Duration::from_secs(300);
+    const REQUEST_REPEATING: Duration = time::Duration::from_secs(1);
+    let start = Instant::now();
+    while start.elapsed() < STATUS_WAIT {
+        let latest_block = Contract::latest_block().await;
+        if let Some(latest_block) = latest_block {
+            if let Some(number) = latest_block.number {
+                if number >= block_number.into() {
+                    return true;
+                }
+            }
+        }
+        tokio::time::sleep(REQUEST_REPEATING).await;
+    }
+    false
+}
+
 /// The main test entrypoint.
 #[tokio::test]
 async fn integration_tests() -> anyhow::Result<()> {
-    // Test "api-version-v0-0-4" was commented out in the original; what's
-    // up with that?
-
     let test_name_to_run = std::env::var("TEST_CASE").ok();
 
     let cases = vec![
-        TestCase::new("ganache-reverts", test_ganache_reverts),
+        TestCase::new("reverted-calls", test_reverted_calls_are_indexed),
         TestCase::new("host-exports", test_host_exports),
         TestCase::new("non-fatal-errors", test_non_fatal_errors),
         TestCase::new("overloaded-functions", test_overloaded_functions),
@@ -936,15 +1324,21 @@ async fn integration_tests() -> anyhow::Result<()> {
         TestCase::new("timestamp", test_timestamp),
         TestCase::new("ethereum-api-tests", test_eth_api),
         TestCase::new("topic-filter", test_topic_filters),
-        TestCase::new_with_source_subgraph(
+        TestCase::new_with_grafting("grafted", test_subgraph_grafting, "base"),
+        TestCase::new_with_source_subgraphs(
             "subgraph-data-sources",
             subgraph_data_sources,
-            "source-subgraph",
+            vec!["source-subgraph"],
         ),
-        TestCase::new_with_multiple_source_subgraphs(
+        TestCase::new_with_source_subgraphs(
             "multiple-subgraph-datasources",
             test_multiple_subgraph_datasources,
             vec!["source-subgraph-a", "source-subgraph-b"],
+        ),
+        TestCase::new("declared-calls-basic", test_declared_calls_basic),
+        TestCase::new(
+            "declared-calls-struct-fields",
+            test_declared_calls_struct_fields,
         ),
     ];
 
@@ -958,13 +1352,15 @@ async fn integration_tests() -> anyhow::Result<()> {
         cases
     };
 
+    // Here we wait for a block in the blockchain in order not to influence
+    // block hashes for all the blocks until the end of the grafting tests.
+    // Currently the last used block for grafting test is the block 3.
+    assert!(wait_for_blockchain_block(SUBGRAPH_LAST_GRAFTING_BLOCK).await);
+
     let contracts = Contract::deploy_all().await?;
 
     status!("setup", "Resetting database");
     CONFIG.reset_database();
-
-    status!("setup", "Initializing yarn workspace");
-    yarn_workspace().await?;
 
     // Spawn graph-node.
     status!("graph-node", "Starting graph-node");
@@ -1010,17 +1406,8 @@ async fn integration_tests() -> anyhow::Result<()> {
     }
 }
 
-async fn stop_graph_node(child: &mut Child) -> anyhow::Result<()> {
+pub async fn stop_graph_node(child: &mut Child) -> anyhow::Result<()> {
     child.kill().await.context("Failed to kill graph-node")?;
 
-    Ok(())
-}
-
-async fn yarn_workspace() -> anyhow::Result<()> {
-    // We shouldn't really have to do this since we use the bundled version
-    // of graph-cli, but that gets very unhappy if the workspace isn't
-    // initialized
-    let wsp = TestFile::new("integration-tests");
-    run_checked(Command::new("yarn").arg("install").current_dir(&wsp.path)).await?;
     Ok(())
 }

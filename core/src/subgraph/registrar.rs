@@ -119,10 +119,7 @@ where
                 assignment_event_stream
                     .compat()
                     .map_err(SubgraphAssignmentProviderError::Unknown)
-                    .map_err(CancelableError::Error)
-                    .cancelable(&assignment_event_stream_cancel_handle, || {
-                        Err(CancelableError::Cancel)
-                    })
+                    .cancelable(&assignment_event_stream_cancel_handle)
                     .compat()
                     .for_each(move |assignment_event| {
                         assert_eq!(assignment_event.node_id(), &node_id);
@@ -281,6 +278,7 @@ where
         start_block_override: Option<BlockPtr>,
         graft_block_override: Option<BlockPtr>,
         history_blocks: Option<i32>,
+        ignore_graft_base: bool,
     ) -> Result<DeploymentLocator, SubgraphRegistrarError> {
         // We don't have a location for the subgraph yet; that will be
         // assigned when we deploy for real. For logging purposes, make up a
@@ -289,19 +287,33 @@ where
             .logger_factory
             .subgraph_logger(&DeploymentLocator::new(DeploymentId(0), hash.clone()));
 
-        let raw: serde_yaml::Mapping = {
-            let file_bytes = self
-                .resolver
-                .cat(&logger, &hash.to_ipfs_link())
-                .await
-                .map_err(|e| {
-                    SubgraphRegistrarError::ResolveError(
-                        SubgraphManifestResolveError::ResolveError(e),
-                    )
-                })?;
+        let resolver: Arc<dyn LinkResolver> = Arc::from(
+            self.resolver
+                .for_manifest(&hash.to_string())
+                .map_err(SubgraphRegistrarError::Unknown)?,
+        );
 
-            serde_yaml::from_slice(&file_bytes)
-                .map_err(|e| SubgraphRegistrarError::ResolveError(e.into()))?
+        let raw = {
+            let mut raw: serde_yaml::Mapping = {
+                let file_bytes =
+                    resolver
+                        .cat(&logger, &hash.to_ipfs_link())
+                        .await
+                        .map_err(|e| {
+                            SubgraphRegistrarError::ResolveError(
+                                SubgraphManifestResolveError::ResolveError(e),
+                            )
+                        })?;
+
+                serde_yaml::from_slice(&file_bytes)
+                    .map_err(|e| SubgraphRegistrarError::ResolveError(e.into()))?
+            };
+
+            if ignore_graft_base {
+                raw.remove("graft");
+            }
+
+            raw
         };
 
         let kind = BlockchainKind::from_manifest(&raw).map_err(|e| {
@@ -313,24 +325,6 @@ where
             history_blocks.or(self.settings.for_name(&name).map(|c| c.history_blocks));
 
         let deployment_locator = match kind {
-            BlockchainKind::Arweave => {
-                create_subgraph_version::<graph_chain_arweave::Chain, _>(
-                    &logger,
-                    self.store.clone(),
-                    self.chains.cheap_clone(),
-                    name.clone(),
-                    hash.cheap_clone(),
-                    start_block_override,
-                    graft_block_override,
-                    raw,
-                    node_id,
-                    debug_fork,
-                    self.version_switching_mode,
-                    &self.resolver,
-                    history_blocks,
-                )
-                .await?
-            }
             BlockchainKind::Ethereum => {
                 create_subgraph_version::<graph_chain_ethereum::Chain, _>(
                     &logger,
@@ -344,7 +338,7 @@ where
                     node_id,
                     debug_fork,
                     self.version_switching_mode,
-                    &self.resolver,
+                    &resolver,
                     history_blocks,
                 )
                 .await?
@@ -362,7 +356,7 @@ where
                     node_id,
                     debug_fork,
                     self.version_switching_mode,
-                    &self.resolver,
+                    &resolver,
                     history_blocks,
                 )
                 .await?
@@ -380,7 +374,7 @@ where
                     node_id,
                     debug_fork,
                     self.version_switching_mode,
-                    &self.resolver,
+                    &resolver,
                     history_blocks,
                 )
                 .await?
@@ -570,10 +564,11 @@ async fn create_subgraph_version<C: Blockchain, S: SubgraphStore>(
     history_blocks_override: Option<i32>,
 ) -> Result<DeploymentLocator, SubgraphRegistrarError> {
     let raw_string = serde_yaml::to_string(&raw).unwrap();
+
     let unvalidated = UnvalidatedSubgraphManifest::<C>::resolve(
         deployment.clone(),
         raw,
-        resolver,
+        &resolver,
         logger,
         ENV_VARS.max_spec_version.clone(),
     )

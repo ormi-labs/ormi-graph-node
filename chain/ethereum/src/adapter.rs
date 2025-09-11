@@ -7,7 +7,6 @@ use graph::data_source::common::ContractCall;
 use graph::firehose::CallToFilter;
 use graph::firehose::CombinedFilter;
 use graph::firehose::LogFilter;
-use graph::futures01::Future;
 use graph::prelude::web3::types::Bytes;
 use graph::prelude::web3::types::H160;
 use graph::prelude::web3::types::U256;
@@ -17,7 +16,6 @@ use prost_types::Any;
 use std::cmp;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::marker::Unpin;
 use thiserror::Error;
 use tiny_keccak::keccak256;
 use web3::types::{Address, Log, H256};
@@ -26,7 +24,6 @@ use graph::prelude::*;
 use graph::{
     blockchain as bc,
     components::metrics::{CounterVec, GaugeVec, HistogramVec},
-    futures01::Stream,
     petgraph::{self, graphmap::GraphMap},
 };
 
@@ -1058,13 +1055,13 @@ impl SubgraphEthRpcMetrics {
 
     pub fn observe_request(&self, duration: f64, method: &str, provider: &str) {
         self.request_duration
-            .with_label_values(&[&self.deployment, method, provider])
+            .with_label_values(&[self.deployment.as_str(), method, provider])
             .set(duration);
     }
 
     pub fn add_error(&self, method: &str, provider: &str) {
         self.errors
-            .with_label_values(&[&self.deployment, method, provider])
+            .with_label_values(&[self.deployment.as_str(), method, provider])
             .inc();
     }
 }
@@ -1083,22 +1080,19 @@ pub trait EthereumAdapter: Send + Sync + 'static {
     async fn net_identifiers(&self) -> Result<ChainIdentifier, Error>;
 
     /// Get the latest block, including full transactions.
-    fn latest_block(
-        &self,
-        logger: &Logger,
-    ) -> Box<dyn Future<Item = LightEthereumBlock, Error = bc::IngestorError> + Send + Unpin>;
+    async fn latest_block(&self, logger: &Logger) -> Result<LightEthereumBlock, bc::IngestorError>;
 
     /// Get the latest block, with only the header and transaction hashes.
-    fn latest_block_header(
+    async fn latest_block_header(
         &self,
         logger: &Logger,
-    ) -> Box<dyn Future<Item = web3::types::Block<H256>, Error = bc::IngestorError> + Send>;
+    ) -> Result<web3::types::Block<H256>, bc::IngestorError>;
 
-    fn load_block(
+    async fn load_block(
         &self,
         logger: &Logger,
         block_hash: H256,
-    ) -> Box<dyn Future<Item = LightEthereumBlock, Error = Error> + Send>;
+    ) -> Result<LightEthereumBlock, Error>;
 
     /// Load Ethereum blocks in bulk, returning results as they come back as a Stream.
     /// May use the `chain_store` as a cache.
@@ -1107,29 +1101,27 @@ pub trait EthereumAdapter: Send + Sync + 'static {
         logger: Logger,
         chain_store: Arc<dyn ChainStore>,
         block_hashes: HashSet<H256>,
-    ) -> Box<dyn Stream<Item = Arc<LightEthereumBlock>, Error = Error> + Send>;
+    ) -> Result<Vec<Arc<LightEthereumBlock>>, Error>;
 
     /// Find a block by its hash.
-    fn block_by_hash(
+    async fn block_by_hash(
         &self,
         logger: &Logger,
         block_hash: H256,
-    ) -> Box<dyn Future<Item = Option<LightEthereumBlock>, Error = Error> + Send>;
+    ) -> Result<Option<LightEthereumBlock>, Error>;
 
-    fn block_by_number(
+    async fn block_by_number(
         &self,
         logger: &Logger,
         block_number: BlockNumber,
-    ) -> Box<dyn Future<Item = Option<LightEthereumBlock>, Error = Error> + Send>;
+    ) -> Result<Option<LightEthereumBlock>, Error>;
 
     /// Load full information for the specified `block` (in particular, transaction receipts).
-    fn load_full_block(
+    async fn load_full_block(
         &self,
         logger: &Logger,
         block: LightEthereumBlock,
-    ) -> Pin<
-        Box<dyn std::future::Future<Output = Result<EthereumBlock, bc::IngestorError>> + Send + '_>,
-    >;
+    ) -> Result<EthereumBlock, bc::IngestorError>;
 
     /// Find a block by its number, according to the Ethereum node.
     ///
@@ -1140,11 +1132,11 @@ pub trait EthereumAdapter: Send + Sync + 'static {
     /// those confirmations.
     /// If the Ethereum node is far behind in processing blocks, even old blocks can be subject to
     /// reorgs.
-    fn block_hash_by_block_number(
+    async fn block_hash_by_block_number(
         &self,
         logger: &Logger,
         block_number: BlockNumber,
-    ) -> Box<dyn Future<Item = Option<H256>, Error = Error> + Send>;
+    ) -> Result<Option<H256>, Error>;
 
     /// Finds the hash and number of the lowest non-null block with height greater than or equal to
     /// the given number.
@@ -1177,20 +1169,20 @@ pub trait EthereumAdapter: Send + Sync + 'static {
         cache: Arc<dyn EthereumCallCache>,
     ) -> Result<Vec<(Option<Vec<Token>>, call::Source)>, ContractCallError>;
 
-    fn get_balance(
+    async fn get_balance(
         &self,
         logger: &Logger,
         address: H160,
         block_ptr: BlockPtr,
-    ) -> Box<dyn Future<Item = U256, Error = EthereumRpcError> + Send>;
+    ) -> Result<U256, EthereumRpcError>;
 
     // Returns the compiled bytecode of a smart contract
-    fn get_code(
+    async fn get_code(
         &self,
         logger: &Logger,
         address: H160,
         block_ptr: BlockPtr,
-    ) -> Box<dyn Future<Item = Bytes, Error = EthereumRpcError> + Send>;
+    ) -> Result<Bytes, EthereumRpcError>;
 }
 
 #[cfg(test)]

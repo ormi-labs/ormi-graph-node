@@ -7,7 +7,7 @@ use graph::prelude::AssignmentChange;
 use graph::prelude::NodeId;
 use graph_store_postgres::command_support::catalog;
 use graph_store_postgres::command_support::catalog::Site;
-use graph_store_postgres::connection_pool::ConnectionPool;
+use graph_store_postgres::ConnectionPool;
 use graph_store_postgres::NotificationSender;
 use thiserror::Error;
 
@@ -24,6 +24,18 @@ impl Deployment {
     pub fn locator(&self) -> &DeploymentLocator {
         &self.locator
     }
+
+    pub fn assigned_node(
+        &self,
+        primary_pool: ConnectionPool,
+    ) -> Result<Option<NodeId>, GraphmanError> {
+        let primary_conn = primary_pool.get().map_err(GraphmanError::from)?;
+        let mut catalog_conn = catalog::Connection::new(primary_conn);
+        let node = catalog_conn
+            .assigned_node(&self.site)
+            .map_err(GraphmanError::from)?;
+        Ok(node)
+    }
 }
 
 #[derive(Debug, Error)]
@@ -37,7 +49,7 @@ pub enum ReassignDeploymentError {
 
 #[derive(Clone, Debug)]
 pub enum ReassignResult {
-    EmptyResponse,
+    Ok,
     CompletedWithWarnings(Vec<String>),
 }
 
@@ -70,16 +82,13 @@ pub fn reassign_deployment(
     notification_sender: Arc<NotificationSender>,
     deployment: &Deployment,
     node: &NodeId,
+    curr_node: Option<NodeId>,
 ) -> Result<ReassignResult, ReassignDeploymentError> {
     let primary_conn = primary_pool.get().map_err(GraphmanError::from)?;
     let mut catalog_conn = catalog::Connection::new(primary_conn);
-
-    let changes: Vec<AssignmentChange> = match catalog_conn
-        .assigned_node(&deployment.site)
-        .map_err(GraphmanError::from)?
-    {
+    let changes: Vec<AssignmentChange> = match &curr_node {
         Some(curr) => {
-            if &curr == node {
+            if &curr == &node {
                 vec![]
             } else {
                 catalog_conn
@@ -112,6 +121,6 @@ pub fn reassign_deployment(
         let warning_msg = format!("This is the only deployment assigned to '{}'. Please make sure that the node ID is spelled correctly.",node.as_str());
         Ok(ReassignResult::CompletedWithWarnings(vec![warning_msg]))
     } else {
-        Ok(ReassignResult::EmptyResponse)
+        Ok(ReassignResult::Ok)
     }
 }

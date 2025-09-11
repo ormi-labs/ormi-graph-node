@@ -79,21 +79,6 @@ impl<S: SubgraphStore> SubgraphInstanceManagerTrait for SubgraphInstanceManager<
 
             async move {
                 match BlockchainKind::from_manifest(&manifest)? {
-                    BlockchainKind::Arweave => {
-                        let runner = instance_manager
-                            .build_subgraph_runner::<graph_chain_arweave::Chain>(
-                                logger.clone(),
-                                self.env_vars.cheap_clone(),
-                                loc.clone(),
-                                manifest,
-                                stop_block,
-                                Box::new(SubgraphTriggerProcessor {}),
-                                deployment_status_metric,
-                            )
-                            .await?;
-
-                        self.start_subgraph_inner(logger, loc, runner).await
-                    }
                     BlockchainKind::Ethereum => {
                         let runner = instance_manager
                             .build_subgraph_runner::<graph_chain_ethereum::Chain>(
@@ -287,7 +272,12 @@ impl<S: SubgraphStore> SubgraphInstanceManager<S> {
         let manifest = UnresolvedSubgraphManifest::parse(deployment.hash.cheap_clone(), manifest)?;
 
         // Allow for infinite retries for subgraph definition files.
-        let link_resolver = Arc::from(self.link_resolver.with_retries());
+        let link_resolver = Arc::from(
+            self.link_resolver
+                .for_manifest(&deployment.hash.to_string())
+                .map_err(SubgraphRegistrarError::Unknown)?
+                .with_retries(),
+        );
 
         // Make sure the `raw_yaml` is present on both this subgraph and the graft base.
         self.subgraph_store

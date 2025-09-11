@@ -113,21 +113,12 @@ impl EthereumAdapter {
     ) -> Self {
         let web3 = Arc::new(Web3::new(transport));
 
-        // Use the client version to check if it is ganache. For compatibility with unit tests, be
-        // are lenient with errors, defaulting to false.
-        let is_ganache = web3
-            .web3()
-            .client_version()
-            .await
-            .map(|s| s.contains("TestRPC"))
-            .unwrap_or(false);
-
         EthereumAdapter {
             logger,
             provider,
             web3,
             metrics: provider_metrics,
-            supports_eip_1898: supports_eip_1898 && !is_ganache,
+            supports_eip_1898,
             call_only,
             supports_block_receipts: Arc::new(RwLock::new(None)),
         }
@@ -500,12 +491,12 @@ impl EthereumAdapter {
         }
     }
 
-    fn code(
+    async fn code(
         &self,
         logger: &Logger,
         address: Address,
         block_ptr: BlockPtr,
-    ) -> impl Future<Item = Bytes, Error = EthereumRpcError> + Send {
+    ) -> Result<Bytes, EthereumRpcError> {
         let web3 = self.web3.clone();
         let logger = Logger::new(&logger, o!("provider" => self.provider.clone()));
 
@@ -531,17 +522,16 @@ impl EthereumAdapter {
                     }
                 }
             })
+            .await
             .map_err(|e| e.into_inner().unwrap_or(EthereumRpcError::Timeout))
-            .boxed()
-            .compat()
     }
 
-    fn balance(
+    async fn balance(
         &self,
         logger: &Logger,
         address: Address,
         block_ptr: BlockPtr,
-    ) -> impl Future<Item = U256, Error = EthereumRpcError> + Send {
+    ) -> Result<U256, EthereumRpcError> {
         let web3 = self.web3.clone();
         let logger = Logger::new(&logger, o!("provider" => self.provider.clone()));
 
@@ -567,9 +557,8 @@ impl EthereumAdapter {
                     }
                 }
             })
+            .await
             .map_err(|e| e.into_inner().unwrap_or(EthereumRpcError::Timeout))
-            .boxed()
-            .compat()
     }
 
     async fn call(
@@ -1258,169 +1247,150 @@ impl EthereumAdapterTrait for EthereumAdapter {
         Ok(ident)
     }
 
-    fn latest_block_header(
+    async fn latest_block_header(
         &self,
         logger: &Logger,
-    ) -> Box<dyn Future<Item = web3::types::Block<H256>, Error = IngestorError> + Send> {
+    ) -> Result<web3::types::Block<H256>, IngestorError> {
         let web3 = self.web3.clone();
-        Box::new(
-            retry("eth_getBlockByNumber(latest) no txs RPC call", logger)
-                .redact_log_urls(true)
-                .no_limit()
-                .timeout_secs(ENV_VARS.json_rpc_timeout.as_secs())
-                .run(move || {
-                    let web3 = web3.cheap_clone();
-                    async move {
-                        let block_opt = web3
-                            .eth()
-                            .block(Web3BlockNumber::Latest.into())
-                            .await
-                            .map_err(|e| {
-                                anyhow!("could not get latest block from Ethereum: {}", e)
-                            })?;
+        retry("eth_getBlockByNumber(latest) no txs RPC call", logger)
+            .redact_log_urls(true)
+            .no_limit()
+            .timeout_secs(ENV_VARS.json_rpc_timeout.as_secs())
+            .run(move || {
+                let web3 = web3.cheap_clone();
+                async move {
+                    let block_opt = web3
+                        .eth()
+                        .block(Web3BlockNumber::Latest.into())
+                        .await
+                        .map_err(|e| anyhow!("could not get latest block from Ethereum: {}", e))?;
 
-                        block_opt
-                            .ok_or_else(|| anyhow!("no latest block returned from Ethereum").into())
-                    }
+                    block_opt
+                        .ok_or_else(|| anyhow!("no latest block returned from Ethereum").into())
+                }
+            })
+            .map_err(move |e| {
+                e.into_inner().unwrap_or_else(move || {
+                    anyhow!("Ethereum node took too long to return latest block").into()
                 })
-                .map_err(move |e| {
-                    e.into_inner().unwrap_or_else(move || {
-                        anyhow!("Ethereum node took too long to return latest block").into()
-                    })
-                })
-                .boxed()
-                .compat(),
-        )
+            })
+            .await
     }
 
-    fn latest_block(
-        &self,
-        logger: &Logger,
-    ) -> Box<dyn Future<Item = LightEthereumBlock, Error = IngestorError> + Send + Unpin> {
+    async fn latest_block(&self, logger: &Logger) -> Result<LightEthereumBlock, IngestorError> {
         let web3 = self.web3.clone();
-        Box::new(
-            retry("eth_getBlockByNumber(latest) with txs RPC call", logger)
-                .redact_log_urls(true)
-                .no_limit()
-                .timeout_secs(ENV_VARS.json_rpc_timeout.as_secs())
-                .run(move || {
-                    let web3 = web3.cheap_clone();
-                    async move {
-                        let block_opt = web3
-                            .eth()
-                            .block_with_txs(Web3BlockNumber::Latest.into())
-                            .await
-                            .map_err(|e| {
-                                anyhow!("could not get latest block from Ethereum: {}", e)
-                            })?;
-                        block_opt
-                            .ok_or_else(|| anyhow!("no latest block returned from Ethereum").into())
-                    }
+        retry("eth_getBlockByNumber(latest) with txs RPC call", logger)
+            .redact_log_urls(true)
+            .no_limit()
+            .timeout_secs(ENV_VARS.json_rpc_timeout.as_secs())
+            .run(move || {
+                let web3 = web3.cheap_clone();
+                async move {
+                    let block_opt = web3
+                        .eth()
+                        .block_with_txs(Web3BlockNumber::Latest.into())
+                        .await
+                        .map_err(|e| anyhow!("could not get latest block from Ethereum: {}", e))?;
+                    block_opt
+                        .ok_or_else(|| anyhow!("no latest block returned from Ethereum").into())
+                }
+            })
+            .map_err(move |e| {
+                e.into_inner().unwrap_or_else(move || {
+                    anyhow!("Ethereum node took too long to return latest block").into()
                 })
-                .map_err(move |e| {
-                    e.into_inner().unwrap_or_else(move || {
-                        anyhow!("Ethereum node took too long to return latest block").into()
-                    })
-                })
-                .boxed()
-                .compat(),
-        )
+            })
+            .await
     }
 
-    fn load_block(
+    async fn load_block(
         &self,
         logger: &Logger,
         block_hash: H256,
-    ) -> Box<dyn Future<Item = LightEthereumBlock, Error = Error> + Send> {
-        Box::new(
-            self.block_by_hash(logger, block_hash)
-                .and_then(move |block_opt| {
-                    block_opt.ok_or_else(move || {
-                        anyhow!(
-                            "Ethereum node could not find block with hash {}",
-                            block_hash
-                        )
-                    })
-                }),
-        )
+    ) -> Result<LightEthereumBlock, Error> {
+        self.block_by_hash(logger, block_hash)
+            .await?
+            .ok_or_else(move || {
+                anyhow!(
+                    "Ethereum node could not find block with hash {}",
+                    block_hash
+                )
+            })
     }
 
-    fn block_by_hash(
+    async fn block_by_hash(
         &self,
         logger: &Logger,
         block_hash: H256,
-    ) -> Box<dyn Future<Item = Option<LightEthereumBlock>, Error = Error> + Send> {
+    ) -> Result<Option<LightEthereumBlock>, Error> {
         let web3 = self.web3.clone();
         let logger = logger.clone();
         let retry_log_message = format!(
             "eth_getBlockByHash RPC call for block hash {:?}",
             block_hash
         );
-        Box::new(
-            retry(retry_log_message, &logger)
-                .redact_log_urls(true)
-                .limit(ENV_VARS.request_retries)
-                .timeout_secs(ENV_VARS.json_rpc_timeout.as_secs())
-                .run(move || {
-                    Box::pin(web3.eth().block_with_txs(BlockId::Hash(block_hash)))
-                        .compat()
-                        .from_err()
-                        .compat()
+
+        retry(retry_log_message, &logger)
+            .redact_log_urls(true)
+            .limit(ENV_VARS.request_retries)
+            .timeout_secs(ENV_VARS.json_rpc_timeout.as_secs())
+            .run(move || {
+                let web3 = web3.cheap_clone();
+                async move {
+                    web3.eth()
+                        .block_with_txs(BlockId::Hash(block_hash))
+                        .await
+                        .map_err(Error::from)
+                }
+            })
+            .map_err(move |e| {
+                e.into_inner().unwrap_or_else(move || {
+                    anyhow!("Ethereum node took too long to return block {}", block_hash)
                 })
-                .map_err(move |e| {
-                    e.into_inner().unwrap_or_else(move || {
-                        anyhow!("Ethereum node took too long to return block {}", block_hash)
-                    })
-                })
-                .boxed()
-                .compat(),
-        )
+            })
+            .await
     }
 
-    fn block_by_number(
+    async fn block_by_number(
         &self,
         logger: &Logger,
         block_number: BlockNumber,
-    ) -> Box<dyn Future<Item = Option<LightEthereumBlock>, Error = Error> + Send> {
+    ) -> Result<Option<LightEthereumBlock>, Error> {
         let web3 = self.web3.clone();
         let logger = logger.clone();
         let retry_log_message = format!(
             "eth_getBlockByNumber RPC call for block number {}",
             block_number
         );
-        Box::new(
-            retry(retry_log_message, &logger)
-                .redact_log_urls(true)
-                .no_limit()
-                .timeout_secs(ENV_VARS.json_rpc_timeout.as_secs())
-                .run(move || {
-                    let web3 = web3.cheap_clone();
-                    async move {
-                        web3.eth()
-                            .block_with_txs(BlockId::Number(block_number.into()))
-                            .await
-                            .map_err(Error::from)
-                    }
+        retry(retry_log_message, &logger)
+            .redact_log_urls(true)
+            .no_limit()
+            .timeout_secs(ENV_VARS.json_rpc_timeout.as_secs())
+            .run(move || {
+                let web3 = web3.cheap_clone();
+                async move {
+                    web3.eth()
+                        .block_with_txs(BlockId::Number(block_number.into()))
+                        .await
+                        .map_err(Error::from)
+                }
+            })
+            .map_err(move |e| {
+                e.into_inner().unwrap_or_else(move || {
+                    anyhow!(
+                        "Ethereum node took too long to return block {}",
+                        block_number
+                    )
                 })
-                .map_err(move |e| {
-                    e.into_inner().unwrap_or_else(move || {
-                        anyhow!(
-                            "Ethereum node took too long to return block {}",
-                            block_number
-                        )
-                    })
-                })
-                .boxed()
-                .compat(),
-        )
+            })
+            .await
     }
 
-    fn load_full_block(
+    async fn load_full_block(
         &self,
         logger: &Logger,
         block: LightEthereumBlock,
-    ) -> Pin<Box<dyn std::future::Future<Output = Result<EthereumBlock, IngestorError>> + Send + '_>>
-    {
+    ) -> Result<EthereumBlock, IngestorError> {
         let web3 = Arc::clone(&self.web3);
         let logger = logger.clone();
         let block_hash = block.hash.expect("block is missing block hash");
@@ -1429,102 +1399,92 @@ impl EthereumAdapterTrait for EthereumAdapter {
         // request an empty batch which is not valid in JSON-RPC.
         if block.transactions.is_empty() {
             trace!(logger, "Block {} contains no transactions", block_hash);
-            return Box::pin(std::future::ready(Ok(EthereumBlock {
+            return Ok(EthereumBlock {
                 block: Arc::new(block),
                 transaction_receipts: Vec::new(),
-            })));
+            });
         }
         let hashes: Vec<_> = block.transactions.iter().map(|txn| txn.hash).collect();
 
-        let supports_block_receipts_future = self.check_block_receipt_support_and_update_cache(
-            web3.clone(),
-            block_hash,
-            self.supports_eip_1898,
-            self.call_only,
-            logger.clone(),
-        );
+        let supports_block_receipts = self
+            .check_block_receipt_support_and_update_cache(
+                web3.clone(),
+                block_hash,
+                self.supports_eip_1898,
+                self.call_only,
+                logger.clone(),
+            )
+            .await;
 
-        let receipts_future = supports_block_receipts_future
-            .then(move |supports_block_receipts| {
-                fetch_receipts_with_retry(web3, hashes, block_hash, logger, supports_block_receipts)
+        fetch_receipts_with_retry(web3, hashes, block_hash, logger, supports_block_receipts)
+            .await
+            .map(|transaction_receipts| EthereumBlock {
+                block: Arc::new(block),
+                transaction_receipts,
             })
-            .boxed();
-
-        let block_future =
-            futures03::TryFutureExt::map_ok(receipts_future, move |transaction_receipts| {
-                EthereumBlock {
-                    block: Arc::new(block),
-                    transaction_receipts,
-                }
-            });
-
-        Box::pin(block_future)
     }
 
-    fn block_hash_by_block_number(
+    async fn block_hash_by_block_number(
         &self,
         logger: &Logger,
         block_number: BlockNumber,
-    ) -> Box<dyn Future<Item = Option<H256>, Error = Error> + Send> {
+    ) -> Result<Option<H256>, Error> {
         let web3 = self.web3.clone();
         let retry_log_message = format!(
             "eth_getBlockByNumber RPC call for block number {}",
             block_number
         );
-        Box::new(
-            retry(retry_log_message, logger)
-                .redact_log_urls(true)
-                .no_limit()
-                .timeout_secs(ENV_VARS.json_rpc_timeout.as_secs())
-                .run(move || {
-                    let web3 = web3.cheap_clone();
-                    async move {
-                        web3.eth()
-                            .block(BlockId::Number(block_number.into()))
-                            .await
-                            .map(|block_opt| block_opt.and_then(|block| block.hash))
-                            .map_err(Error::from)
-                    }
+        retry(retry_log_message, logger)
+            .redact_log_urls(true)
+            .no_limit()
+            .timeout_secs(ENV_VARS.json_rpc_timeout.as_secs())
+            .run(move || {
+                let web3 = web3.cheap_clone();
+                async move {
+                    web3.eth()
+                        .block(BlockId::Number(block_number.into()))
+                        .await
+                        .map(|block_opt| block_opt.and_then(|block| block.hash))
+                        .map_err(Error::from)
+                }
+            })
+            .await
+            .map_err(move |e| {
+                e.into_inner().unwrap_or_else(move || {
+                    anyhow!(
+                        "Ethereum node took too long to return data for block #{}",
+                        block_number
+                    )
                 })
-                .boxed()
-                .compat()
-                .map_err(move |e| {
-                    e.into_inner().unwrap_or_else(move || {
-                        anyhow!(
-                            "Ethereum node took too long to return data for block #{}",
-                            block_number
-                        )
-                    })
-                }),
-        )
+            })
     }
 
-    fn get_balance(
+    async fn get_balance(
         &self,
         logger: &Logger,
         address: H160,
         block_ptr: BlockPtr,
-    ) -> Box<dyn Future<Item = U256, Error = EthereumRpcError> + Send> {
+    ) -> Result<U256, EthereumRpcError> {
         debug!(
             logger, "eth_getBalance";
             "address" => format!("{}", address),
             "block" => format!("{}", block_ptr)
         );
-        Box::new(self.balance(logger, address, block_ptr))
+        self.balance(logger, address, block_ptr).await
     }
 
-    fn get_code(
+    async fn get_code(
         &self,
         logger: &Logger,
         address: H160,
         block_ptr: BlockPtr,
-    ) -> Box<dyn Future<Item = Bytes, Error = EthereumRpcError> + Send> {
+    ) -> Result<Bytes, EthereumRpcError> {
         debug!(
             logger, "eth_getCode";
             "address" => format!("{}", address),
             "block" => format!("{}", block_ptr)
         );
-        Box::new(self.code(logger, address, block_ptr))
+        self.code(logger, address, block_ptr).await
     }
 
     async fn next_existing_ptr_to_number(
@@ -1734,7 +1694,7 @@ impl EthereumAdapterTrait for EthereumAdapter {
         logger: Logger,
         chain_store: Arc<dyn ChainStore>,
         block_hashes: HashSet<H256>,
-    ) -> Box<dyn Stream<Item = Arc<LightEthereumBlock>, Error = Error> + Send> {
+    ) -> Result<Vec<Arc<LightEthereumBlock>>, Error> {
         let block_hashes: Vec<_> = block_hashes.iter().cloned().collect();
         // Search for the block in the store first then use json-rpc as a backup.
         let mut blocks: Vec<Arc<LightEthereumBlock>> = chain_store
@@ -1756,27 +1716,25 @@ impl EthereumAdapterTrait for EthereumAdapter {
 
         // Return a stream that lazily loads batches of blocks.
         debug!(logger, "Requesting {} block(s)", missing_blocks.len());
-        Box::new(
-            self.load_blocks_rpc(logger.clone(), missing_blocks)
-                .collect()
-                .map(move |new_blocks| {
-                    let upsert_blocks: Vec<_> = new_blocks
-                        .iter()
-                        .map(|block| BlockFinality::Final(block.clone()))
-                        .collect();
-                    let block_refs: Vec<_> = upsert_blocks
-                        .iter()
-                        .map(|block| block as &dyn graph::blockchain::Block)
-                        .collect();
-                    if let Err(e) = chain_store.upsert_light_blocks(block_refs.as_slice()) {
-                        error!(logger, "Error writing to block cache {}", e);
-                    }
-                    blocks.extend(new_blocks);
-                    blocks.sort_by_key(|block| block.number);
-                    stream::iter_ok(blocks)
-                })
-                .flatten_stream(),
-        )
+        let new_blocks = self
+            .load_blocks_rpc(logger.clone(), missing_blocks)
+            .collect()
+            .compat()
+            .await?;
+        let upsert_blocks: Vec<_> = new_blocks
+            .iter()
+            .map(|block| BlockFinality::Final(block.clone()))
+            .collect();
+        let block_refs: Vec<_> = upsert_blocks
+            .iter()
+            .map(|block| block as &dyn graph::blockchain::Block)
+            .collect();
+        if let Err(e) = chain_store.upsert_light_blocks(block_refs.as_slice()) {
+            error!(logger, "Error writing to block cache {}", e);
+        }
+        blocks.extend(new_blocks);
+        blocks.sort_by_key(|block| block.number);
+        Ok(blocks)
     }
 }
 
@@ -1911,10 +1869,11 @@ pub(crate) async fn blocks_with_triggers(
 
     let logger2 = logger.cheap_clone();
 
-    let blocks = eth
+    let blocks: Vec<_> = eth
         .load_blocks(logger.cheap_clone(), chain_store.clone(), block_hashes)
-        .await
-        .and_then(
+        .await?
+        .into_iter()
+        .map(
             move |block| match triggers_by_block.remove(&(block.number() as BlockNumber)) {
                 Some(triggers) => Ok(BlockWithTriggers::new(
                     BlockFinality::Final(block),
@@ -1927,9 +1886,7 @@ pub(crate) async fn blocks_with_triggers(
                 )),
             },
         )
-        .collect()
-        .compat()
-        .await?;
+        .collect::<Result<_, _>>()?;
 
     // Filter out call triggers that come from unsuccessful transactions
     let futures = blocks.into_iter().map(|block| {

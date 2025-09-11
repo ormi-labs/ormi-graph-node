@@ -10,6 +10,7 @@ use std::task::Poll;
 use std::time::Duration;
 
 use graph::cheap_clone::CheapClone;
+use graph::env::ENV_VARS;
 use graph::futures03::future::BoxFuture;
 use graph::futures03::stream::StreamExt;
 use graph::futures03::{stream, Future, FutureExt, TryFutureExt};
@@ -29,8 +30,6 @@ pub use ipfs_service::{ipfs_service, IpfsService};
 
 const MIN_BACKOFF: Duration = Duration::from_secs(5);
 
-const MAX_BACKOFF: Duration = Duration::from_secs(600);
-
 struct Backoffs<ID> {
     backoff_maker: ExponentialBackoffMaker,
     backoffs: HashMap<ID, ExponentialBackoff>,
@@ -42,7 +41,7 @@ impl<ID: Eq + Hash> Backoffs<ID> {
         Self {
             backoff_maker: ExponentialBackoffMaker::new(
                 MIN_BACKOFF,
-                MAX_BACKOFF,
+                ENV_VARS.mappings.fds_max_backoff,
                 1.0,
                 HasherRng::new(),
             )
@@ -169,7 +168,9 @@ where
                         debug!(logger, "not found on polling"; "object_id" => id.to_string());
 
                         metrics.not_found.inc();
-                        queue.push_back(id);
+
+                        // We'll try again after a backoff.
+                        backoff(id, &queue, &mut backoffs);
                     }
 
                     // Error polling, log it and push the id to the back of the queue.
@@ -182,12 +183,7 @@ where
                         // Requests that return errors could mean there is a permanent issue with
                         // fetching the given item, or could signal the endpoint is overloaded.
                         // Either way a backoff makes sense.
-                        let queue = queue.cheap_clone();
-                        let backoff = backoffs.next_backoff(id.clone());
-                        graph::spawn(async move {
-                            backoff.await;
-                            queue.push_back(id);
-                        });
+                        backoff(id, &queue, &mut backoffs);
                     }
                 }
             }
@@ -195,6 +191,18 @@ where
     }
 
     PollingMonitor { queue }
+}
+
+fn backoff<ID>(id: ID, queue: &Arc<Queue<ID>>, backoffs: &mut Backoffs<ID>)
+where
+    ID: Eq + Hash + Clone + Send + 'static,
+{
+    let queue = queue.cheap_clone();
+    let backoff = backoffs.next_backoff(id.clone());
+    graph::spawn(async move {
+        backoff.await;
+        queue.push_back(id);
+    });
 }
 
 /// Handle for adding objects to be monitored.

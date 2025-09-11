@@ -3,11 +3,16 @@ mod err;
 mod traits;
 pub mod write;
 
+use diesel::deserialize::FromSql;
+use diesel::pg::Pg;
+use diesel::serialize::{Output, ToSql};
+use diesel::sql_types::Integer;
+use diesel_derives::{AsExpression, FromSqlRow};
 pub use entity_cache::{EntityCache, EntityLfuCache, GetScope, ModificationsAndCache};
 use slog::Logger;
 
 pub use super::subgraph::Entity;
-pub use err::StoreError;
+pub use err::{StoreError, StoreResult};
 use itertools::Itertools;
 use strum_macros::Display;
 pub use traits::*;
@@ -26,13 +31,13 @@ use std::time::Duration;
 use crate::blockchain::{Block, BlockHash, BlockPtr};
 use crate::cheap_clone::CheapClone;
 use crate::components::store::write::EntityModification;
-use crate::constraint_violation;
 use crate::data::store::scalar::Bytes;
 use crate::data::store::{Id, IdList, Value};
 use crate::data::value::Word;
 use crate::data_source::CausalityRegion;
 use crate::derive::CheapClone;
 use crate::env::ENV_VARS;
+use crate::internal_error;
 use crate::prelude::{s, Attribute, DeploymentHash, ValueType};
 use crate::schema::{ast as sast, EntityKey, EntityType, InputSchema};
 use crate::util::stats::MovingStats;
@@ -691,7 +696,20 @@ pub struct StoredDynamicDataSource {
 /// identifier only has meaning in the context of a specific instance of
 /// graph-node. Only store code should ever construct or consume it; all
 /// other code passes it around as an opaque token.
-#[derive(Copy, Clone, CheapClone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(
+    Copy,
+    Clone,
+    CheapClone,
+    Debug,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    Hash,
+    AsExpression,
+    FromSqlRow,
+)]
+#[diesel(sql_type = Integer)]
 pub struct DeploymentId(pub i32);
 
 impl Display for DeploymentId {
@@ -703,6 +721,19 @@ impl Display for DeploymentId {
 impl DeploymentId {
     pub fn new(id: i32) -> Self {
         Self(id)
+    }
+}
+
+impl FromSql<Integer, Pg> for DeploymentId {
+    fn from_sql(bytes: diesel::pg::PgValue) -> diesel::deserialize::Result<Self> {
+        let id = <i32 as FromSql<Integer, Pg>>::from_sql(bytes)?;
+        Ok(DeploymentId(id))
+    }
+}
+
+impl ToSql<Integer, Pg> for DeploymentId {
+    fn to_sql<'b>(&'b self, out: &mut Output<'b, '_, Pg>) -> diesel::serialize::Result {
+        <i32 as ToSql<Integer, Pg>>::to_sql(&self.0, out)
     }
 }
 
@@ -897,6 +928,13 @@ pub struct VersionStats {
     pub ratio: f64,
     /// The last block to which this table was pruned
     pub last_pruned_block: Option<BlockNumber>,
+    /// Histograms for the upper bounds of the block ranges in
+    /// this table. Each histogram bucket contains roughly the same number
+    /// of rows; values might be repeated to achieve that. The vectors are
+    /// empty if the table hasn't been analyzed, the subgraph is stored in
+    /// Postgres version 16 or lower, or if the table doesn't have a
+    /// block_range column.
+    pub block_range_upper: Vec<BlockNumber>,
 }
 
 /// What phase of pruning we are working on
@@ -972,6 +1010,9 @@ pub struct PruneRequest {
     pub earliest_block: BlockNumber,
     /// The last block that contains final entities not subject to a reorg
     pub final_block: BlockNumber,
+    /// The first block for which the deployment contained entities when the
+    /// request was made
+    pub first_block: BlockNumber,
     /// The latest block, i.e., the subgraph head
     pub latest_block: BlockNumber,
     /// Use the rebuild strategy when removing more than this fraction of
@@ -1000,17 +1041,17 @@ impl PruneRequest {
         let rebuild_threshold = ENV_VARS.store.rebuild_threshold;
         let delete_threshold = ENV_VARS.store.delete_threshold;
         if rebuild_threshold < 0.0 || rebuild_threshold > 1.0 {
-            return Err(constraint_violation!(
+            return Err(internal_error!(
                 "the copy threshold must be between 0 and 1 but is {rebuild_threshold}"
             ));
         }
         if delete_threshold < 0.0 || delete_threshold > 1.0 {
-            return Err(constraint_violation!(
+            return Err(internal_error!(
                 "the delete threshold must be between 0 and 1 but is {delete_threshold}"
             ));
         }
         if history_blocks <= reorg_threshold {
-            return Err(constraint_violation!(
+            return Err(internal_error!(
                 "the deployment {} needs to keep at least {} blocks \
                    of history and can't be pruned to only {} blocks of history",
                 deployment,
@@ -1019,7 +1060,7 @@ impl PruneRequest {
             ));
         }
         if first_block >= latest_block {
-            return Err(constraint_violation!(
+            return Err(internal_error!(
                 "the earliest block {} must be before the latest block {}",
                 first_block,
                 latest_block
@@ -1035,6 +1076,7 @@ impl PruneRequest {
             earliest_block,
             final_block,
             latest_block,
+            first_block,
             rebuild_threshold,
             delete_threshold,
         })
@@ -1056,11 +1098,22 @@ impl PruneRequest {
             return None;
         }
 
-        // Estimate how much data we will throw away; we assume that
-        // entity versions are distributed evenly across all blocks so
-        // that `history_pct` will tell us how much of that data pruning
-        // will remove.
-        let removal_ratio = self.history_pct(stats) * (1.0 - stats.ratio);
+        let removal_ratio = if stats.block_range_upper.is_empty()
+            || ENV_VARS.store.prune_disable_range_bound_estimation
+        {
+            // Estimate how much data we will throw away; we assume that
+            // entity versions are distributed evenly across all blocks so
+            // that `history_pct` will tell us how much of that data pruning
+            // will remove.
+            self.history_pct(stats) * (1.0 - stats.ratio)
+        } else {
+            // This estimate is more accurate than the one above since it
+            // does not assume anything about the distribution of entities
+            // and versions but uses the estimates from Postgres statistics.
+            // Of course, we can only use it if we have statistics
+            self.remove_pct_from_bounds(stats)
+        };
+
         if removal_ratio >= self.rebuild_threshold {
             Some(PruningStrategy::Rebuild)
         } else if removal_ratio >= self.delete_threshold {
@@ -1084,6 +1137,18 @@ impl PruneRequest {
         } else {
             1.0 - self.history_blocks as f64 / total_blocks as f64
         }
+    }
+
+    /// Return the fraction of entities that we will remove according to the
+    /// histogram bounds in `stats`. That fraction can be estimated as the
+    /// fraction of histogram buckets that end before `self.earliest_block`
+    fn remove_pct_from_bounds(&self, stats: &VersionStats) -> f64 {
+        stats
+            .block_range_upper
+            .iter()
+            .filter(|b| **b <= self.earliest_block)
+            .count() as f64
+            / stats.block_range_upper.len() as f64
     }
 }
 

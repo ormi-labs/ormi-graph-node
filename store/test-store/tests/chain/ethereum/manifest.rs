@@ -91,6 +91,13 @@ impl LinkResolverTrait for TextResolver {
         Box::new(self.clone())
     }
 
+    fn for_manifest(
+        &self,
+        _manifest_path: &str,
+    ) -> Result<Box<dyn LinkResolverTrait>, anyhow::Error> {
+        Ok(Box::new(self.clone()))
+    }
+
     async fn cat(&self, _logger: &Logger, link: &Link) -> Result<Vec<u8>, anyhow::Error> {
         self.texts
             .get(&link.link)
@@ -1854,7 +1861,8 @@ specVersion: 1.3.0
                 assert!(matches!(e, SubgraphManifestResolveError::ResolveError(_)));
                 let error_msg = e.to_string();
                 println!("{}", error_msg);
-                assert!(error_msg.contains("Nested subgraph data sources are not supported."));
+                assert!(error_msg
+                    .contains("Nested subgraph data sources [SubgraphSource] are not supported."));
             }
         }
     })

@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::anyhow;
@@ -9,7 +8,6 @@ use derivative::Derivative;
 use futures03::compat::Stream01CompatExt;
 use futures03::stream::StreamExt;
 use futures03::stream::TryStreamExt;
-use lru_time_cache::LruCache;
 use serde_json::Value;
 
 use crate::derive::CheapClone;
@@ -30,13 +28,9 @@ pub struct IpfsResolver {
     #[derivative(Debug = "ignore")]
     client: Arc<dyn IpfsClient>,
 
-    #[derivative(Debug = "ignore")]
-    cache: Arc<Mutex<LruCache<ContentPath, Vec<u8>>>>,
-
     timeout: Duration,
     max_file_size: usize,
     max_map_file_size: usize,
-    max_cache_file_size: usize,
 
     /// When set to `true`, it means infinite retries, ignoring the timeout setting.
     retry: bool,
@@ -48,13 +42,9 @@ impl IpfsResolver {
 
         Self {
             client,
-            cache: Arc::new(Mutex::new(LruCache::with_capacity(
-                env.max_ipfs_cache_size as usize,
-            ))),
             timeout: env.ipfs_timeout,
             max_file_size: env.max_ipfs_file_bytes,
             max_map_file_size: env.max_ipfs_map_file_size,
-            max_cache_file_size: env.max_ipfs_cache_file_size,
             retry: false,
         }
     }
@@ -74,18 +64,14 @@ impl LinkResolverTrait for IpfsResolver {
         Box::new(s)
     }
 
-    async fn cat(&self, logger: &Logger, link: &Link) -> Result<Vec<u8>, Error> {
+    fn for_manifest(&self, _manifest_path: &str) -> Result<Box<dyn LinkResolverTrait>, Error> {
+        Ok(Box::new(self.cheap_clone()))
+    }
+
+    async fn cat(&self, _logger: &Logger, link: &Link) -> Result<Vec<u8>, Error> {
         let path = ContentPath::new(&link.link)?;
         let timeout = self.timeout;
         let max_file_size = self.max_file_size;
-        let max_cache_file_size = self.max_cache_file_size;
-
-        if let Some(data) = self.cache.lock().unwrap().get(&path) {
-            trace!(logger, "IPFS cat cache hit"; "hash" => path.to_string());
-            return Ok(data.to_owned());
-        }
-
-        trace!(logger, "IPFS cat cache miss"; "hash" => path.to_string());
 
         let (timeout, retry_policy) = if self.retry {
             (None, RetryPolicy::NonDeterministic)
@@ -99,21 +85,6 @@ impl LinkResolverTrait for IpfsResolver {
             .cat(&path, max_file_size, timeout, retry_policy)
             .await?
             .to_vec();
-
-        if data.len() <= max_cache_file_size {
-            let mut cache = self.cache.lock().unwrap();
-
-            if !cache.contains_key(&path) {
-                cache.insert(path.clone(), data.clone());
-            }
-        } else {
-            debug!(
-                logger,
-                "IPFS file too large for cache";
-                "path" => path.to_string(),
-                "size" => data.len(),
-            );
-        }
 
         Ok(data)
     }

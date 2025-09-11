@@ -24,7 +24,6 @@ use crate::query::ext::BlockConstraint;
 /// A resolver that fetches entities from a `Store`.
 #[derive(Clone, CheapClone)]
 pub struct StoreResolver {
-    #[allow(dead_code)]
     logger: Logger,
     pub(crate) store: Arc<dyn QueryStore>,
     pub(crate) block_ptr: Option<BlockPtr>,
@@ -327,7 +326,7 @@ impl Resolver for StoreResolver {
                     None => {
                         let child0_id = child_id(&children[0]);
                         let child1_id = child_id(&children[1]);
-                        QueryExecutionError::ConstraintViolation(format!(
+                        QueryExecutionError::InternalError(format!(
                             "expected only one child for {}.{} but got {}. One child has id {}, another has id {}",
                             object_type.name(), field.name,
                             children.len(), child0_id, child1_id

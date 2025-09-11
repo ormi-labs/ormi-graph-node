@@ -9,10 +9,10 @@ use async_trait::async_trait;
 use graph::blockchain::block_stream::{EntitySourceOperation, FirehoseCursor};
 use graph::blockchain::BlockTime;
 use graph::components::store::{Batch, DeploymentCursorTracker, DerivedEntityQuery, ReadStore};
-use graph::constraint_violation;
 use graph::data::store::IdList;
 use graph::data::subgraph::schema;
 use graph::data_source::CausalityRegion;
+use graph::internal_error;
 use graph::prelude::{
     BlockNumber, CacheWeight, Entity, MetricsRegistry, SubgraphDeploymentEntity,
     SubgraphStore as _, BLOCK_NUMBER_MAX,
@@ -49,7 +49,7 @@ use crate::{primary, primary::Site, relational::Layout, SubgraphStore};
 struct WritableSubgraphStore(SubgraphStore);
 
 impl WritableSubgraphStore {
-    fn primary_conn(&self) -> Result<primary::Connection, StoreError> {
+    fn primary_conn(&self) -> Result<primary::Connection<'_>, StoreError> {
         self.0.primary_conn()
     }
 
@@ -95,8 +95,8 @@ impl LastRollup {
         let kind = match (has_aggregations, block) {
             (false, _) => LastRollup::NotNeeded,
             (true, None) => LastRollup::Unknown,
-            (true, Some(block)) => {
-                let block_time = store.block_time(site, block)?;
+            (true, Some(_)) => {
+                let block_time = store.block_time(site)?;
                 block_time
                     .map(|b| LastRollup::Some(b))
                     .unwrap_or(LastRollup::Unknown)
@@ -133,7 +133,7 @@ impl LastRollupTracker {
                 *last = LastRollup::Some(block_time);
             }
             (LastRollup::Some(_) | LastRollup::Unknown, None) => {
-                constraint_violation!("block time cannot be unset");
+                internal_error!("block time cannot be unset");
             }
         }
 
@@ -240,9 +240,7 @@ impl SyncStore {
                 firehose_cursor,
             )?;
 
-            let block_time = self
-                .writable
-                .block_time(self.site.cheap_clone(), block_ptr_to.number)?;
+            let block_time = self.writable.block_time(self.site.cheap_clone())?;
             self.last_rollup.set(block_time)
         })
     }
@@ -355,6 +353,17 @@ impl SyncStore {
             pconn.transaction(|conn| -> Result<_, StoreError> {
                 let mut pconn = primary::Connection::new(conn);
                 let changes = pconn.unassign_subgraph(site)?;
+                self.store.send_store_event(&StoreEvent::new(changes))
+            })
+        })
+    }
+
+    fn pause_subgraph(&self, site: &Site) -> Result<(), StoreError> {
+        retry::forever(&self.logger, "unassign_subgraph", || {
+            let mut pconn = self.store.primary_conn()?;
+            pconn.transaction(|conn| -> Result<_, StoreError> {
+                let mut pconn = primary::Connection::new(conn);
+                let changes = pconn.pause_subgraph(site)?;
                 self.store.send_store_event(&StoreEvent::new(changes))
             })
         })
@@ -686,8 +695,8 @@ impl Request {
                 let batch = batch.read().unwrap();
                 if let Some(err) = &batch.error {
                     // This can happen when appending to the batch failed
-                    // because of a constraint violation. Returning an `Err`
-                    // here will poison and shut down the queue
+                    // because of an internal error. Returning an `Err` here
+                    // will poison and shut down the queue
                     return Err(err.clone());
                 }
                 let res = store
@@ -1344,7 +1353,7 @@ impl Writer {
                 // If there was an error, report that instead of a naked 'writer not running'
                 queue.check_err()?;
                 if join_handle.is_finished() {
-                    Err(constraint_violation!(
+                    Err(internal_error!(
                         "Subgraph writer for {} is not running",
                         queue.store.site
                     ))
@@ -1681,7 +1690,7 @@ impl WritableStoreTrait for WritableStore {
 
         if let Some(block_ptr) = self.block_ptr.lock().unwrap().as_ref() {
             if block_ptr_to.number <= block_ptr.number {
-                return Err(constraint_violation!(
+                return Err(internal_error!(
                     "transact_block_operations called for block {} but its head is already at {}",
                     block_ptr_to,
                     block_ptr
@@ -1724,8 +1733,8 @@ impl WritableStoreTrait for WritableStore {
         self.is_deployment_synced.load(Ordering::SeqCst)
     }
 
-    fn unassign_subgraph(&self) -> Result<(), StoreError> {
-        self.store.unassign_subgraph(&self.store.site)
+    fn pause_subgraph(&self) -> Result<(), StoreError> {
+        self.store.pause_subgraph(&self.store.site)
     }
 
     async fn load_dynamic_data_sources(

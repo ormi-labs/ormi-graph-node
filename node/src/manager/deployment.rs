@@ -11,14 +11,14 @@ use graph::{
     prelude::{anyhow, lazy_static, regex::Regex, DeploymentHash},
 };
 use graph_store_postgres::command_support::catalog as store_catalog;
-use graph_store_postgres::connection_pool::ConnectionPool;
 use graph_store_postgres::unused;
+use graph_store_postgres::ConnectionPool;
 
 lazy_static! {
     // `Qm...` optionally follow by `:$shard`
     static ref HASH_RE: Regex = Regex::new("\\A(?P<hash>Qm[^:]+)(:(?P<shard>[a-z0-9_]+))?\\z").unwrap();
     // `sgdNNN`
-    static ref DEPLOYMENT_RE: Regex = Regex::new("\\A(?P<nsp>sgd[0-9]+)\\z").unwrap();
+    static ref DEPLOYMENT_RE: Regex = Regex::new("\\A(?P<nsp>(sgd)?[0-9]+)\\z").unwrap();
 }
 
 /// A search for one or multiple deployments to make it possible to search
@@ -58,7 +58,12 @@ impl FromStr for DeploymentSearch {
             Ok(DeploymentSearch::Hash { hash, shard })
         } else if let Some(caps) = DEPLOYMENT_RE.captures(s) {
             let namespace = caps.name("nsp").unwrap().as_str().to_string();
-            Ok(DeploymentSearch::Deployment { namespace })
+            if namespace.starts_with("sgd") {
+                Ok(DeploymentSearch::Deployment { namespace })
+            } else {
+                let namespace = format!("sgd{namespace}");
+                Ok(DeploymentSearch::Deployment { namespace })
+            }
         } else {
             Ok(DeploymentSearch::Name {
                 name: s.to_string(),

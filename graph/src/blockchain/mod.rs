@@ -10,7 +10,6 @@ pub mod firehose_block_ingestor;
 pub mod firehose_block_stream;
 pub mod mock;
 mod noop_runtime_adapter;
-pub mod polling_block_stream;
 pub mod substreams_block_stream;
 mod types;
 
@@ -31,7 +30,7 @@ use crate::{
     runtime::{gas::GasCounter, AscHeap, HostExportError},
 };
 use crate::{
-    components::store::{BlockNumber, ChainStore},
+    components::store::BlockNumber,
     prelude::{thiserror::Error, LinkResolver},
 };
 use anyhow::{anyhow, Context, Error};
@@ -196,7 +195,8 @@ pub trait Blockchain: Debug + Sized + Send + Sync + Unpin + 'static {
         unified_api_version: UnifiedMappingApiVersion,
     ) -> Result<Box<dyn BlockStream<Self>>, Error>;
 
-    fn chain_store(&self) -> Arc<dyn ChainStore>;
+    /// Return the pointer for the latest block that we are aware of
+    async fn chain_head_ptr(&self) -> Result<Option<BlockPtr>, Error>;
 
     async fn block_pointer_from_number(
         &self,
@@ -378,6 +378,7 @@ pub trait UnresolvedDataSourceTemplate<C: Blockchain>:
         resolver: &Arc<dyn LinkResolver>,
         logger: &Logger,
         manifest_idx: u32,
+        spec_version: &semver::Version,
     ) -> Result<C::DataSourceTemplate, anyhow::Error>;
 }
 
@@ -407,6 +408,7 @@ pub trait UnresolvedDataSource<C: Blockchain>:
         resolver: &Arc<dyn LinkResolver>,
         logger: &Logger,
         manifest_idx: u32,
+        spec_version: &semver::Version,
     ) -> Result<C::DataSource, anyhow::Error>;
 }
 
@@ -556,9 +558,6 @@ pub trait NodeCapabilities<C: Blockchain> {
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum BlockchainKind {
-    /// Arweave chains that are compatible.
-    Arweave,
-
     /// Ethereum itself or chains that are compatible.
     Ethereum,
 
@@ -571,7 +570,6 @@ pub enum BlockchainKind {
 impl fmt::Display for BlockchainKind {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let value = match self {
-            BlockchainKind::Arweave => "arweave",
             BlockchainKind::Ethereum => "ethereum",
             BlockchainKind::Near => "near",
             BlockchainKind::Substreams => "substreams",
@@ -585,7 +583,6 @@ impl FromStr for BlockchainKind {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "arweave" => Ok(BlockchainKind::Arweave),
             "ethereum" => Ok(BlockchainKind::Ethereum),
             "near" => Ok(BlockchainKind::Near),
             "substreams" => Ok(BlockchainKind::Substreams),

@@ -7,7 +7,7 @@ use graph::prelude::{
         api::{Eth, Namespace},
         contract::{tokens::Tokenize, Contract as Web3Contract, Options},
         transports::Http,
-        types::{Address, Bytes, TransactionReceipt},
+        types::{Address, Block, BlockId, BlockNumber, Bytes, TransactionReceipt, H256},
     },
 };
 // web3 version 0.18 does not expose this; once the graph crate updates to
@@ -42,6 +42,10 @@ lazy_static! {
             Contract {
                 name: "OverloadedContract".to_string(),
                 address: Address::from_str("0x0dcd1bf9a1b36ce34237eeafef220932846bcd82").unwrap(),
+            },
+            Contract {
+                name: "DeclaredCallsContract".to_string(),
+                address: Address::from_str("0x9a676e781a523b5d0c0e43731313a708cb607508").unwrap(),
             },
         ]
     };
@@ -153,6 +157,50 @@ impl Contract {
                         contract.call("emitTrigger", (i as u16,)).await.unwrap();
                     }
                 }
+                // Declared calls tests need a Transfer
+                if contract.name == "DeclaredCallsContract" {
+                    status!("contracts", "Emitting transfers from DeclaredCallsContract");
+                    let addr1 = "0x1111111111111111111111111111111111111111"
+                        .parse::<graph::prelude::web3::types::Address>()
+                        .unwrap();
+                    let addr2 = "0x2222222222222222222222222222222222222222"
+                        .parse::<graph::prelude::web3::types::Address>()
+                        .unwrap();
+                    let addr3 = "0x3333333333333333333333333333333333333333"
+                        .parse::<graph::prelude::web3::types::Address>()
+                        .unwrap();
+                    let addr4 = "0x4444444444444444444444444444444444444444"
+                        .parse::<graph::prelude::web3::types::Address>()
+                        .unwrap();
+
+                    contract
+                        .call("emitTransfer", (addr1, addr2, 100u64))
+                        .await
+                        .unwrap();
+
+                    // Emit an asset transfer event to trigger struct field declared calls
+                    contract
+                        .call("emitAssetTransfer", (addr1, 150u64, true, addr3))
+                        .await
+                        .unwrap();
+
+                    // Also emit a complex asset event for nested struct testing
+                    let values = vec![1u64, 2u64, 3u64];
+                    contract
+                        .call(
+                            "emitComplexAssetCreated",
+                            (
+                                addr4,
+                                250u64,
+                                true,
+                                "Complex Asset Metadata".to_string(),
+                                values,
+                                99u64,
+                            ),
+                        )
+                        .await
+                        .unwrap();
+                }
             } else {
                 status!(
                     "contracts",
@@ -164,5 +212,14 @@ impl Contract {
             contracts.push(contract);
         }
         Ok(contracts)
+    }
+
+    pub async fn latest_block() -> Option<Block<H256>> {
+        let eth = Self::eth();
+        let block = eth
+            .block(BlockId::Number(BlockNumber::Latest))
+            .await
+            .unwrap_or_default();
+        block
     }
 }

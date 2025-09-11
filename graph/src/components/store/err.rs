@@ -1,18 +1,18 @@
 use super::{BlockNumber, DeploymentSchemaVersion};
+use crate::prelude::DeploymentHash;
 use crate::prelude::QueryExecutionError;
-use crate::{data::store::EntityValidationError, prelude::DeploymentHash};
 
 use anyhow::{anyhow, Error};
 use diesel::result::Error as DieselError;
 use thiserror::Error;
 use tokio::task::JoinError;
 
+pub type StoreResult<T> = Result<T, StoreError>;
+
 #[derive(Error, Debug)]
 pub enum StoreError {
     #[error("store error: {0:#}")]
     Unknown(Error),
-    #[error("Entity validation failed: {0}")]
-    EntityValidationError(EntityValidationError),
     #[error(
         "tried to set entity of type `{0}` with ID \"{1}\" but an entity of type `{2}`, \
          which has an interface in common with `{0}`, exists with the same ID"
@@ -24,8 +24,6 @@ pub enum StoreError {
     UnknownTable(String),
     #[error("entity type '{0}' does not have an attribute '{0}'")]
     UnknownAttribute(String, String),
-    #[error("malformed directive '{0}'")]
-    MalformedDirective(String),
     #[error("query execution failed: {0}")]
     QueryExecutionError(String),
     #[error("Child filter nesting not supported by value `{0}`: `{1}`")]
@@ -40,8 +38,8 @@ pub enum StoreError {
     /// An internal error where we expected the application logic to enforce
     /// some constraint, e.g., that subgraph names are unique, but found that
     /// constraint to not hold
-    #[error("internal constraint violated: {0}")]
-    ConstraintViolation(String),
+    #[error("internal error: {0}")]
+    InternalError(String),
     #[error("deployment not found: {0}")]
     DeploymentNotFound(String),
     #[error("shard not found: {0} (this usually indicates a misconfiguration)")]
@@ -54,8 +52,6 @@ pub enum StoreError {
     Canceled,
     #[error("database unavailable")]
     DatabaseUnavailable,
-    #[error("database disabled")]
-    DatabaseDisabled,
     #[error("subgraph forking failed: {0}")]
     ForkFailure(String),
     #[error("subgraph writer poisoned by previous error")]
@@ -63,9 +59,9 @@ pub enum StoreError {
     #[error("panic in subgraph writer: {0}")]
     WriterPanic(JoinError),
     #[error(
-        "found schema version {0} but this graph node only supports versions up to {}. \
+        "found schema version {0} but this graph node only supports versions up to {latest}. \
          Did you downgrade Graph Node?",
-        DeploymentSchemaVersion::LATEST
+        latest = DeploymentSchemaVersion::LATEST
     )]
     UnsupportedDeploymentSchemaVersion(i32),
     #[error("pruning failed: {0}")]
@@ -76,16 +72,18 @@ pub enum StoreError {
     WriteFailure(String, BlockNumber, String, String),
     #[error("database query timed out")]
     StatementTimeout,
+    #[error("database constraint violated: {0}")]
+    ConstraintViolation(String),
 }
 
-// Convenience to report a constraint violation
+// Convenience to report an internal error
 #[macro_export]
-macro_rules! constraint_violation {
+macro_rules! internal_error {
     ($msg:expr) => {{
-        $crate::prelude::StoreError::ConstraintViolation(format!("{}", $msg))
+        $crate::prelude::StoreError::InternalError(format!("{}", $msg))
     }};
     ($fmt:expr, $($arg:tt)*) => {{
-        $crate::prelude::StoreError::ConstraintViolation(format!($fmt, $($arg)*))
+        $crate::prelude::StoreError::InternalError(format!($fmt, $($arg)*))
     }}
 }
 
@@ -96,7 +94,6 @@ impl Clone for StoreError {
     fn clone(&self) -> Self {
         match self {
             Self::Unknown(arg0) => Self::Unknown(anyhow!("{}", arg0)),
-            Self::EntityValidationError(arg0) => Self::EntityValidationError(arg0.clone()),
             Self::ConflictingId(arg0, arg1, arg2) => {
                 Self::ConflictingId(arg0.clone(), arg1.clone(), arg2.clone())
             }
@@ -105,7 +102,6 @@ impl Clone for StoreError {
             Self::UnknownAttribute(arg0, arg1) => {
                 Self::UnknownAttribute(arg0.clone(), arg1.clone())
             }
-            Self::MalformedDirective(arg0) => Self::MalformedDirective(arg0.clone()),
             Self::QueryExecutionError(arg0) => Self::QueryExecutionError(arg0.clone()),
             Self::ChildFilterNestingNotSupportedError(arg0, arg1) => {
                 Self::ChildFilterNestingNotSupportedError(arg0.clone(), arg1.clone())
@@ -114,14 +110,13 @@ impl Clone for StoreError {
             Self::DuplicateBlockProcessing(arg0, arg1) => {
                 Self::DuplicateBlockProcessing(arg0.clone(), arg1.clone())
             }
-            Self::ConstraintViolation(arg0) => Self::ConstraintViolation(arg0.clone()),
+            Self::InternalError(arg0) => Self::InternalError(arg0.clone()),
             Self::DeploymentNotFound(arg0) => Self::DeploymentNotFound(arg0.clone()),
             Self::UnknownShard(arg0) => Self::UnknownShard(arg0.clone()),
             Self::FulltextSearchNonDeterministic => Self::FulltextSearchNonDeterministic,
             Self::FulltextColumnMissingConfig => Self::FulltextColumnMissingConfig,
             Self::Canceled => Self::Canceled,
             Self::DatabaseUnavailable => Self::DatabaseUnavailable,
-            Self::DatabaseDisabled => Self::DatabaseDisabled,
             Self::ForkFailure(arg0) => Self::ForkFailure(arg0.clone()),
             Self::Poisoned => Self::Poisoned,
             Self::WriterPanic(arg0) => Self::Unknown(anyhow!("writer panic: {}", arg0)),
@@ -136,6 +131,7 @@ impl Clone for StoreError {
                 Self::WriteFailure(arg0.clone(), arg1.clone(), arg2.clone(), arg3.clone())
             }
             Self::StatementTimeout => Self::StatementTimeout,
+            Self::ConstraintViolation(arg0) => Self::ConstraintViolation(arg0.clone()),
         }
     }
 }
@@ -144,6 +140,7 @@ impl StoreError {
     pub fn from_diesel_error(e: &DieselError) -> Option<Self> {
         const CONN_CLOSE: &str = "server closed the connection unexpectedly";
         const STMT_TIMEOUT: &str = "canceling statement due to statement timeout";
+        const UNIQUE_CONSTR: &str = "duplicate key value violates unique constraint";
         let DieselError::DatabaseError(_, info) = e else {
             return None;
         };
@@ -155,6 +152,12 @@ impl StoreError {
             Some(StoreError::DatabaseUnavailable)
         } else if info.message().contains(STMT_TIMEOUT) {
             Some(StoreError::StatementTimeout)
+        } else if info.message().contains(UNIQUE_CONSTR) {
+            let msg = match info.details() {
+                Some(details) => format!("{}: {}", info.message(), details.replace('\n', " ")),
+                None => info.message().to_string(),
+            };
+            Some(StoreError::ConstraintViolation(msg))
         } else {
             None
         }
@@ -169,6 +172,43 @@ impl StoreError {
         Self::from_diesel_error(&error).unwrap_or_else(|| {
             StoreError::WriteFailure(entity.to_string(), block, error.to_string(), query)
         })
+    }
+
+    pub fn is_deterministic(&self) -> bool {
+        use StoreError::*;
+
+        // This classification tries to err on the side of caution. If in doubt,
+        // assume the error is non-deterministic.
+        match self {
+            // deterministic errors
+            ConflictingId(_, _, _)
+            | UnknownField(_, _)
+            | UnknownTable(_)
+            | UnknownAttribute(_, _)
+            | InvalidIdentifier(_)
+            | UnsupportedFilter(_, _)
+            | ConstraintViolation(_) => true,
+
+            // non-deterministic errors
+            Unknown(_)
+            | QueryExecutionError(_)
+            | ChildFilterNestingNotSupportedError(_, _)
+            | DuplicateBlockProcessing(_, _)
+            | InternalError(_)
+            | DeploymentNotFound(_)
+            | UnknownShard(_)
+            | FulltextSearchNonDeterministic
+            | FulltextColumnMissingConfig
+            | Canceled
+            | DatabaseUnavailable
+            | ForkFailure(_)
+            | Poisoned
+            | WriterPanic(_)
+            | UnsupportedDeploymentSchemaVersion(_)
+            | PruneFailure(_)
+            | WriteFailure(_, _, _, _)
+            | StatementTimeout => false,
+        }
     }
 }
 

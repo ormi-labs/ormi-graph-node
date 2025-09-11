@@ -10,20 +10,23 @@ use diesel::{
     r2d2::{ConnectionManager, PooledConnection},
     sql_query, ExpressionMethods as _, PgConnection, RunQueryDsl,
 };
-use graph::components::network_provider::ChainName;
 use graph::{
     blockchain::ChainIdentifier,
     components::store::{BlockStore as BlockStoreTrait, QueryPermit},
     prelude::{error, info, BlockNumber, BlockPtr, Logger, ENV_VARS},
     slog::o,
 };
-use graph::{constraint_violation, prelude::CheapClone};
+use graph::{
+    components::{network_provider::ChainName, store::ChainIdStore},
+    prelude::ChainStore as _,
+};
+use graph::{internal_error, prelude::CheapClone};
 use graph::{prelude::StoreError, util::timed_cache::TimedCache};
 
 use crate::{
     chain_head_listener::ChainHeadUpdateSender,
     chain_store::{ChainStoreMetrics, Storage},
-    connection_pool::ConnectionPool,
+    pool::ConnectionPool,
     primary::Mirror as PrimaryMirror,
     ChainStore, NotificationSender, Shard, PRIMARY_SHARD,
 };
@@ -55,12 +58,12 @@ pub mod primary {
     };
     use graph::{
         blockchain::{BlockHash, ChainIdentifier},
-        constraint_violation,
+        internal_error,
         prelude::StoreError,
     };
 
     use crate::chain_store::Storage;
-    use crate::{connection_pool::ConnectionPool, Shard};
+    use crate::{ConnectionPool, Shard};
 
     table! {
             chains(id) {
@@ -92,7 +95,7 @@ pub mod primary {
                 net_version: self.net_version.clone(),
                 genesis_block_hash: BlockHash::try_from(self.genesis_block.as_str()).map_err(
                     |e| {
-                        constraint_violation!(
+                        internal_error!(
                             "the genesis block hash `{}` for chain `{}` is not a valid hash: {}",
                             self.genesis_block,
                             self.name,
@@ -366,7 +369,7 @@ impl BlockStore {
         let pool = self
             .pools
             .get(&chain.shard)
-            .ok_or_else(|| constraint_violation!("there is no pool for shard {}", chain.shard))?
+            .ok_or_else(|| internal_error!("there is no pool for shard {}", chain.shard))?
             .clone();
         let sender = ChainHeadUpdateSender::new(
             self.mirror.primary().clone(),
@@ -427,7 +430,7 @@ impl BlockStore {
     pub fn chain_head_block(&self, chain: &str) -> Result<Option<BlockNumber>, StoreError> {
         let store = self
             .store(chain)
-            .ok_or_else(|| constraint_violation!("unknown network `{}`", chain))?;
+            .ok_or_else(|| internal_error!("unknown network `{}`", chain))?;
         store.chain_head_block(chain)
     }
 
@@ -466,7 +469,7 @@ impl BlockStore {
     pub fn drop_chain(&self, chain: &str) -> Result<(), StoreError> {
         let chain_store = self
             .store(chain)
-            .ok_or_else(|| constraint_violation!("unknown chain {}", chain))?;
+            .ok_or_else(|| internal_error!("unknown chain {}", chain))?;
 
         // Delete from the primary first since that's where
         // deployment_schemas has a fk constraint on chains
@@ -503,7 +506,7 @@ impl BlockStore {
             };
 
             if let Some(head_block) = store.remove_cursor(&&store.chain)? {
-                let lower_bound = head_block.saturating_sub(ENV_VARS.reorg_threshold * 2);
+                let lower_bound = head_block.saturating_sub(ENV_VARS.reorg_threshold() * 2);
                 info!(&self.logger, "Removed cursor for non-firehose chain, now cleaning shallow blocks"; "network" => &store.chain, "lower_bound" => lower_bound);
                 store.cleanup_shallow_blocks(lower_bound)?;
             }
@@ -567,20 +570,11 @@ impl BlockStore {
 
         Ok(())
     }
-}
-
-impl BlockStoreTrait for BlockStore {
-    type ChainStore = ChainStore;
-
-    fn chain_store(&self, network: &str) -> Option<Arc<Self::ChainStore>> {
-        self.store(network)
-    }
-
-    fn create_chain_store(
+    pub fn create_chain_store(
         &self,
         network: &str,
         ident: ChainIdentifier,
-    ) -> anyhow::Result<Arc<Self::ChainStore>> {
+    ) -> anyhow::Result<Arc<ChainStore>> {
         match self.store(network) {
             Some(chain_store) => {
                 return Ok(chain_store);
@@ -603,5 +597,51 @@ impl BlockStoreTrait for BlockStore {
         let chain = primary::add_chain(&mut conn, &network, &shard, ident)?;
         self.add_chain_store(&chain, ChainStatus::Ingestible, true)
             .map_err(anyhow::Error::from)
+    }
+}
+
+impl BlockStoreTrait for BlockStore {
+    type ChainStore = ChainStore;
+
+    fn chain_store(&self, network: &str) -> Option<Arc<Self::ChainStore>> {
+        self.store(network)
+    }
+}
+
+impl ChainIdStore for BlockStore {
+    fn chain_identifier(&self, chain_name: &ChainName) -> Result<ChainIdentifier, anyhow::Error> {
+        let chain_store = self
+            .chain_store(&chain_name)
+            .ok_or_else(|| anyhow!("unable to get store for chain '{chain_name}'"))?;
+
+        chain_store.chain_identifier()
+    }
+
+    fn set_chain_identifier(
+        &self,
+        chain_name: &ChainName,
+        ident: &ChainIdentifier,
+    ) -> Result<(), anyhow::Error> {
+        use primary::chains as c;
+
+        // Update the block shard first since that contains a copy from the primary
+        let chain_store = self
+            .chain_store(&chain_name)
+            .ok_or_else(|| anyhow!("unable to get store for chain '{chain_name}'"))?;
+
+        chain_store.set_chain_identifier(ident)?;
+
+        // Update the master copy in the primary
+        let primary_pool = self.pools.get(&*PRIMARY_SHARD).unwrap();
+        let mut conn = primary_pool.get()?;
+
+        diesel::update(c::table.filter(c::name.eq(chain_name.as_str())))
+            .set((
+                c::genesis_block_hash.eq(ident.genesis_block_hash.hash_hex()),
+                c::net_version.eq(&ident.net_version),
+            ))
+            .execute(&mut conn)?;
+
+        Ok(())
     }
 }

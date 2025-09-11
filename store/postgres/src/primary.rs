@@ -3,10 +3,10 @@
 //! for the primary shard.
 use crate::{
     block_range::UNVERSIONED_RANGE,
-    connection_pool::{ConnectionPool, ForeignServer},
     detail::DeploymentDetail,
+    pool::PRIMARY_PUBLIC,
     subgraph_store::{unused, Shard, PRIMARY_SHARD},
-    NotificationSender,
+    ConnectionPool, ForeignServer, NotificationSender,
 };
 use diesel::{
     connection::SimpleConnection,
@@ -31,11 +31,12 @@ use diesel::{
 };
 use graph::{
     components::store::DeploymentLocator,
-    constraint_violation,
     data::{
         store::scalar::ToPrimitive,
         subgraph::{status, DeploymentFeatures},
     },
+    derive::CheapClone,
+    internal_error,
     prelude::{
         anyhow,
         chrono::{DateTime, Utc},
@@ -53,9 +54,9 @@ use maybe_owned::MaybeOwnedMut;
 use std::{
     borrow::Borrow,
     collections::HashMap,
-    convert::TryFrom,
-    convert::TryInto,
+    convert::{TryFrom, TryInto},
     fmt,
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -383,9 +384,9 @@ impl TryFrom<Schema> for Site {
 
     fn try_from(schema: Schema) -> Result<Self, Self::Error> {
         let deployment = DeploymentHash::new(&schema.subgraph)
-            .map_err(|s| constraint_violation!("Invalid deployment id {}", s))?;
+            .map_err(|s| internal_error!("Invalid deployment id {}", s))?;
         let namespace = Namespace::new(schema.name.clone()).map_err(|nsp| {
-            constraint_violation!(
+            internal_error!(
                 "Invalid schema name {} for deployment {}",
                 nsp,
                 &schema.subgraph
@@ -449,8 +450,9 @@ mod queries {
     use diesel::sql_types::Text;
     use graph::prelude::NodeId;
     use graph::{
-        constraint_violation,
+        components::store::DeploymentId as GraphDeploymentId,
         data::subgraph::status,
+        internal_error,
         prelude::{DeploymentHash, StoreError, SubgraphName},
     };
     use std::{collections::HashMap, convert::TryFrom, convert::TryInto};
@@ -509,7 +511,7 @@ mod queries {
             .optional()?;
         match id {
             Some(id) => DeploymentHash::new(id)
-                .map_err(|id| constraint_violation!("illegal deployment id: {}", id)),
+                .map_err(|id| internal_error!("illegal deployment id: {}", id)),
             None => Err(StoreError::DeploymentNotFound(name.to_string())),
         }
     }
@@ -645,18 +647,18 @@ mod queries {
         conn: &mut PgConnection,
         infos: &mut [status::Info],
     ) -> Result<(), StoreError> {
-        let ids: Vec<_> = infos.iter().map(|info| &info.subgraph).collect();
+        let ids: Vec<_> = infos.iter().map(|info| &info.id).collect();
         let nodes: HashMap<_, _> = a::table
             .inner_join(ds::table.on(ds::id.eq(a::id)))
-            .filter(ds::subgraph.eq_any(ids))
-            .select((ds::subgraph, a::node_id, a::paused_at.is_not_null()))
-            .load::<(String, String, bool)>(conn)?
+            .filter(ds::id.eq_any(ids))
+            .select((ds::id, a::node_id, a::paused_at.is_not_null()))
+            .load::<(GraphDeploymentId, String, bool)>(conn)?
             .into_iter()
-            .map(|(subgraph, node, paused)| (subgraph, (node, paused)))
+            .map(|(id, node, paused)| (id, (node, paused)))
             .collect();
         for info in infos {
-            info.node = nodes.get(&info.subgraph).map(|(node, _)| node.clone());
-            info.paused = nodes.get(&info.subgraph).map(|(_, paused)| *paused);
+            info.node = nodes.get(&info.id).map(|(node, _)| node.clone());
+            info.paused = nodes.get(&info.id).map(|(_, paused)| *paused);
         }
         Ok(())
     }
@@ -672,7 +674,7 @@ mod queries {
             .optional()?
             .map(|node| {
                 NodeId::new(&node).map_err(|()| {
-                    constraint_violation!(
+                    internal_error!(
                         "invalid node id `{}` in assignment for `{}`",
                         node,
                         site.deployment
@@ -697,7 +699,7 @@ mod queries {
             .optional()?
             .map(|(node, ts)| {
                 let node_id = NodeId::new(&node).map_err(|()| {
-                    constraint_violation!(
+                    internal_error!(
                         "invalid node id `{}` in assignment for `{}`",
                         node,
                         site.deployment
@@ -836,7 +838,7 @@ impl<'a> Connection<'a> {
                 DeploymentHash::new(hash)
                     .map(|hash| AssignmentChange::removed(DeploymentLocator::new(id.into(), hash)))
                     .map_err(|id| {
-                        StoreError::ConstraintViolation(format!(
+                        StoreError::InternalError(format!(
                             "invalid id `{}` for deployment assignment",
                             id
                         ))
@@ -1317,7 +1319,7 @@ impl<'a> Connection<'a> {
             .cloned()
             .ok_or_else(|| anyhow!("failed to read schema name for {} back", deployment))?;
         let namespace = Namespace::new(namespace).map_err(|name| {
-            constraint_violation!("Generated database schema name {} is invalid", name)
+            internal_error!("Generated database schema name {} is invalid", name)
         })?;
 
         Ok(Site {
@@ -1521,7 +1523,7 @@ impl<'a> Connection<'a> {
             .transpose()
             // This can't really happen since we filtered by valid NodeId's
             .map_err(|node| {
-                constraint_violation!("database has assignment for illegal node name {:?}", node)
+                internal_error!("database has assignment for illegal node name {:?}", node)
             })
     }
 
@@ -1558,7 +1560,7 @@ impl<'a> Connection<'a> {
             .map(|(shard, _)| Shard::new(shard.to_string()))
             .transpose()
             // This can't really happen since we filtered by valid shards
-            .map_err(|e| constraint_violation!("database has illegal shard name: {}", e))
+            .map_err(|e| internal_error!("database has illegal shard name: {}", e))
     }
 
     #[cfg(debug_assertions)]
@@ -1675,10 +1677,10 @@ impl<'a> Connection<'a> {
 
         for detail in details {
             let (latest_hash, latest_number) = block(
-                &detail.deployment,
+                &detail.subgraph,
                 "latest_ethereum_block",
-                detail.latest_ethereum_block_hash.clone(),
-                detail.latest_ethereum_block_number.clone(),
+                detail.block_hash.clone(),
+                detail.block_number.clone(),
             )?
             .map(|b| b.to_ptr())
             .map(|ptr| (Some(Vec::from(ptr.hash_slice())), Some(ptr.number)))
@@ -1728,10 +1730,7 @@ impl<'a> Connection<'a> {
                 let ts = chrono::offset::Local::now()
                     .checked_sub_signed(duration)
                     .ok_or_else(|| {
-                        StoreError::ConstraintViolation(format!(
-                            "duration {} is too large",
-                            duration
-                        ))
+                        StoreError::InternalError(format!("duration {} is too large", duration))
                     })?;
                 Ok(u::table
                     .filter(u::removed_at.is_null())
@@ -1823,6 +1822,52 @@ impl<'a> Connection<'a> {
         delete(cp::table.filter(cp::dst.eq(dst.id))).execute(self.conn.as_mut())?;
 
         Ok(())
+    }
+}
+
+/// A limited interface to query the primary database.
+#[derive(Clone, CheapClone)]
+pub struct Primary {
+    pool: Arc<ConnectionPool>,
+}
+
+impl Primary {
+    pub fn new(pool: Arc<ConnectionPool>) -> Self {
+        // This really indicates a programming error
+        if pool.shard != *PRIMARY_SHARD {
+            panic!("Primary pool must be the primary shard");
+        }
+
+        Primary { pool }
+    }
+
+    /// Return `true` if the site is the source of a copy operation. The copy
+    /// operation might be just queued or in progress already. This method will
+    /// block until a fdw connection becomes available.
+    pub fn is_source(&self, site: &Site) -> Result<bool, StoreError> {
+        use active_copies as ac;
+
+        let mut conn = self.pool.get()?;
+
+        select(diesel::dsl::exists(
+            ac::table
+                .filter(ac::src.eq(site.id))
+                .filter(ac::cancelled_at.is_null()),
+        ))
+        .get_result::<bool>(&mut conn)
+        .map_err(StoreError::from)
+    }
+
+    pub fn is_copy_cancelled(&self, dst: &Site) -> Result<bool, StoreError> {
+        use active_copies as ac;
+
+        let mut conn = self.pool.get()?;
+
+        ac::table
+            .filter(ac::dst.eq(dst.id))
+            .select(ac::cancelled_at.is_not_null())
+            .get_result::<bool>(&mut conn)
+            .map_err(StoreError::from)
     }
 }
 
@@ -1963,12 +2008,7 @@ impl Mirror {
 
         // Repopulate `PUBLIC_TABLES` by copying their data wholesale
         for table_name in Self::PUBLIC_TABLES {
-            copy_table(
-                conn,
-                ForeignServer::PRIMARY_PUBLIC,
-                NAMESPACE_PUBLIC,
-                table_name,
-            )?;
+            copy_table(conn, PRIMARY_PUBLIC, NAMESPACE_PUBLIC, table_name)?;
             check_cancel()?;
         }
 

@@ -16,8 +16,7 @@ use graph::blockchain::{
 };
 use graph::cheap_clone::CheapClone;
 use graph::components::network_provider::ChainName;
-use graph::components::store::{BlockStore as _, ChainStore};
-use graph::data::store::NodeId;
+use graph::components::store::{BlockStore as _, ChainHeadStore};
 use graph::endpoint::EndpointMetrics;
 use graph::env::{EnvVars, ENV_VARS};
 use graph::firehose::{FirehoseEndpoint, SubgraphLimit};
@@ -48,10 +47,39 @@ pub enum ProviderNetworkStatus {
     },
 }
 
+pub trait ChainFilter: Send + Sync {
+    fn filter(&self, chain_name: &str) -> bool;
+}
+
+pub struct AnyChainFilter;
+
+impl ChainFilter for AnyChainFilter {
+    fn filter(&self, _: &str) -> bool {
+        true
+    }
+}
+
+pub struct OneChainFilter {
+    chain_name: String,
+}
+
+impl OneChainFilter {
+    pub fn new(chain_name: String) -> Self {
+        Self { chain_name }
+    }
+}
+
+impl ChainFilter for OneChainFilter {
+    fn filter(&self, chain_name: &str) -> bool {
+        self.chain_name == chain_name
+    }
+}
+
 pub fn create_substreams_networks(
     logger: Logger,
     config: &Config,
     endpoint_metrics: Arc<EndpointMetrics>,
+    chain_filter: &dyn ChainFilter,
 ) -> Vec<AdapterConfiguration> {
     debug!(
         logger,
@@ -63,7 +91,13 @@ pub fn create_substreams_networks(
     let mut networks_by_kind: BTreeMap<(BlockchainKind, ChainName), Vec<Arc<FirehoseEndpoint>>> =
         BTreeMap::new();
 
-    for (name, chain) in &config.chains.chains {
+    let filtered_chains = config
+        .chains
+        .chains
+        .iter()
+        .filter(|(name, _)| chain_filter.filter(name));
+
+    for (name, chain) in filtered_chains {
         let name: ChainName = name.as_str().into();
         for provider in &chain.providers {
             if let ProviderDetails::Substreams(ref firehose) = provider.details {
@@ -113,6 +147,7 @@ pub fn create_firehose_networks(
     logger: Logger,
     config: &Config,
     endpoint_metrics: Arc<EndpointMetrics>,
+    chain_filter: &dyn ChainFilter,
 ) -> Vec<AdapterConfiguration> {
     debug!(
         logger,
@@ -124,7 +159,13 @@ pub fn create_firehose_networks(
     let mut networks_by_kind: BTreeMap<(BlockchainKind, ChainName), Vec<Arc<FirehoseEndpoint>>> =
         BTreeMap::new();
 
-    for (name, chain) in &config.chains.chains {
+    let filtered_chains = config
+        .chains
+        .chains
+        .iter()
+        .filter(|(name, _)| chain_filter.filter(name));
+
+    for (name, chain) in filtered_chains {
         let name: ChainName = name.as_str().into();
         for provider in &chain.providers {
             let logger = logger.cheap_clone();
@@ -179,11 +220,12 @@ pub fn create_firehose_networks(
 
 /// Parses all Ethereum connection strings and returns their network names and
 /// `EthereumAdapter`.
-pub async fn create_all_ethereum_networks(
+pub async fn create_ethereum_networks(
     logger: Logger,
     registry: Arc<MetricsRegistry>,
     config: &Config,
     endpoint_metrics: Arc<EndpointMetrics>,
+    chain_filter: &dyn ChainFilter,
 ) -> anyhow::Result<Vec<AdapterConfiguration>> {
     let eth_rpc_metrics = Arc::new(ProviderEthRpcMetrics::new(registry));
     let eth_networks_futures = config
@@ -191,6 +233,7 @@ pub async fn create_all_ethereum_networks(
         .chains
         .iter()
         .filter(|(_, chain)| chain.protocol == BlockchainKind::Ethereum)
+        .filter(|(name, _)| chain_filter.filter(name))
         .map(|(name, _)| {
             create_ethereum_networks_for_chain(
                 &logger,
@@ -309,7 +352,6 @@ pub async fn create_ethereum_networks_for_chain(
 pub async fn networks_as_chains(
     config: &Arc<EnvVars>,
     blockchain_map: &mut BlockchainMap,
-    node_id: &NodeId,
     logger: &Logger,
     networks: &Networks,
     store: Arc<BlockStore>,
@@ -363,7 +405,7 @@ pub async fn networks_as_chains(
             chain_id: ChainName,
             blockchain_map: &mut BlockchainMap,
             logger_factory: LoggerFactory,
-            chain_store: Arc<dyn ChainStore>,
+            chain_head_store: Arc<dyn ChainHeadStore>,
             metrics_registry: Arc<MetricsRegistry>,
         ) {
             let substreams_endpoints = networks.substreams_endpoints(chain_id.clone());
@@ -377,7 +419,7 @@ pub async fn networks_as_chains(
                     BasicBlockchainBuilder {
                         logger_factory: logger_factory.clone(),
                         name: chain_id.clone(),
-                        chain_store,
+                        chain_head_store,
                         metrics_registry: metrics_registry.clone(),
                         firehose_endpoints: substreams_endpoints,
                     }
@@ -388,35 +430,6 @@ pub async fn networks_as_chains(
         }
 
         match kind {
-            BlockchainKind::Arweave => {
-                let firehose_endpoints = networks.firehose_endpoints(chain_id.clone());
-
-                blockchain_map.insert::<graph_chain_arweave::Chain>(
-                    chain_id.clone(),
-                    Arc::new(
-                        BasicBlockchainBuilder {
-                            logger_factory: logger_factory.clone(),
-                            name: chain_id.clone(),
-                            chain_store: chain_store.cheap_clone(),
-                            firehose_endpoints,
-                            metrics_registry: metrics_registry.clone(),
-                        }
-                        .build(config)
-                        .await,
-                    ),
-                );
-
-                add_substreams::<graph_chain_arweave::Chain>(
-                    networks,
-                    config,
-                    chain_id.clone(),
-                    blockchain_map,
-                    logger_factory.clone(),
-                    chain_store,
-                    metrics_registry.clone(),
-                )
-                .await;
-            }
             BlockchainKind::Ethereum => {
                 // polling interval is set per chain so if set all adapter configuration will have
                 // the same value.
@@ -449,7 +462,6 @@ pub async fn networks_as_chains(
                 let chain = ethereum::Chain::new(
                     logger_factory.clone(),
                     chain_id.clone(),
-                    node_id.clone(),
                     metrics_registry.clone(),
                     chain_store.cheap_clone(),
                     call_cache,
@@ -460,7 +472,7 @@ pub async fn networks_as_chains(
                     Arc::new(adapter_selector),
                     Arc::new(EthereumRuntimeAdapterBuilder {}),
                     eth_adapters,
-                    ENV_VARS.reorg_threshold,
+                    ENV_VARS.reorg_threshold(),
                     polling_interval,
                     true,
                 );
@@ -487,7 +499,7 @@ pub async fn networks_as_chains(
                         BasicBlockchainBuilder {
                             logger_factory: logger_factory.clone(),
                             name: chain_id.clone(),
-                            chain_store: chain_store.cheap_clone(),
+                            chain_head_store: chain_store.cheap_clone(),
                             firehose_endpoints,
                             metrics_registry: metrics_registry.clone(),
                         }
@@ -515,7 +527,7 @@ pub async fn networks_as_chains(
                         BasicBlockchainBuilder {
                             logger_factory: logger_factory.clone(),
                             name: chain_id.clone(),
-                            chain_store,
+                            chain_head_store: chain_store,
                             metrics_registry: metrics_registry.clone(),
                             firehose_endpoints: substreams_endpoints,
                         }

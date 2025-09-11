@@ -21,9 +21,9 @@ use graph::{
             PruneReporter, PruneRequest, SubgraphFork,
         },
     },
-    constraint_violation,
     data::query::QueryTarget,
     data::subgraph::{schema::DeploymentCreate, status, DeploymentFeatures},
+    internal_error,
     prelude::{
         anyhow, lazy_static, o, web3::types::Address, ApiVersion, BlockNumber, BlockPtr,
         ChainStore, DeploymentHash, EntityOperation, Logger, MetricsRegistry, NodeId,
@@ -37,15 +37,15 @@ use graph::{
 };
 
 use crate::{
-    connection_pool::ConnectionPool,
     deployment::{OnSync, SubgraphHealth},
-    primary::{self, DeploymentId, Mirror as PrimaryMirror, Site},
+    primary::{self, DeploymentId, Mirror as PrimaryMirror, Primary, Site},
     relational::{
+        self,
         index::{IndexList, Method},
         Layout,
     },
     writable::{SourceableStore, WritableStore},
-    NotificationSender,
+    ConnectionPool, NotificationSender,
 };
 use crate::{
     deployment_store::{DeploymentStore, ReplicaId},
@@ -184,11 +184,12 @@ pub mod unused {
 /// metadata is stored in tables in the `subgraphs` namespace in the same
 /// shard as the deployment data. The most important of these tables are
 ///
-/// - `subgraphs.subgraph_deployment`: the main table for deployment
-///   metadata; most importantly, it stores the pointer to the current
-///   subgraph head, i.e., the block up to which the subgraph has indexed
-///   the chain, together with other things like whether the subgraph has
-///   synced, whether it has failed and whether it encountered any errors
+/// - `subgraphs.deployment` and `subgraphs.head`: the main table for
+///   deployment metadata; most importantly, it stores the pointer to the
+///   current subgraph head, i.e., the block up to which the subgraph has
+///   indexed the chain, together with other things like whether the
+///   subgraph has synced, whether it has failed and whether it encountered
+///   any errors
 /// - `subgraphs.subgraph_manifest`: immutable information derived from the
 ///   YAML manifest for the deployment
 /// - `subgraphs.dynamic_ethereum_contract_data_source`: the data sources
@@ -360,6 +361,12 @@ impl SubgraphStoreInner {
         sender: Arc<NotificationSender>,
         registry: Arc<MetricsRegistry>,
     ) -> Self {
+        let primary = stores
+            .iter()
+            .find(|(name, _, _, _)| name == &*PRIMARY_SHARD)
+            .map(|(_, pool, _, _)| Primary::new(Arc::new(pool.clone())))
+            .expect("primary shard must be present");
+
         let mirror = {
             let pools = HashMap::from_iter(
                 stores
@@ -376,6 +383,7 @@ impl SubgraphStoreInner {
                     name,
                     Arc::new(DeploymentStore::new(
                         &logger,
+                        primary.cheap_clone(),
                         main_pool,
                         read_only_pools,
                         weights,
@@ -436,7 +444,7 @@ impl SubgraphStoreInner {
     fn evict(&self, id: &DeploymentHash) -> Result<(), StoreError> {
         if let Some((site, _)) = self.sites.remove(id) {
             let store = self.stores.get(&site.shard).ok_or_else(|| {
-                constraint_violation!(
+                internal_error!(
                     "shard {} for deployment sgd{} not found when evicting",
                     site.shard,
                     site.id
@@ -533,9 +541,7 @@ impl SubgraphStoreInner {
         let placement = self
             .placer
             .place(name.as_str(), network_name)
-            .map_err(|msg| {
-                constraint_violation!("illegal indexer name in deployment rule: {}", msg)
-            })?;
+            .map_err(|msg| internal_error!("illegal indexer name in deployment rule: {}", msg))?;
 
         match placement {
             None => Ok((PRIMARY_SHARD.clone(), default_node)),
@@ -783,7 +789,7 @@ impl SubgraphStoreInner {
     /// connections can deadlock the entire process if the pool runs out
     /// of connections in between getting the first one and trying to get the
     /// second one.
-    pub(crate) fn primary_conn(&self) -> Result<primary::Connection, StoreError> {
+    pub(crate) fn primary_conn(&self) -> Result<primary::Connection<'_>, StoreError> {
         let conn = self.mirror.primary().get()?;
         Ok(primary::Connection::new(conn))
     }
@@ -978,7 +984,7 @@ impl SubgraphStoreInner {
     pub(crate) fn version_info(&self, version: &str) -> Result<VersionInfo, StoreError> {
         if let Some((deployment_id, created_at)) = self.mirror.version_info(version)? {
             let id = DeploymentHash::new(deployment_id.clone())
-                .map_err(|id| constraint_violation!("illegal deployment id {}", id))?;
+                .map_err(|id| internal_error!("illegal deployment id {}", id))?;
             let (store, site) = self.store(&id)?;
             let statuses = store.deployment_statuses(&[site.clone()])?;
             let status = statuses
@@ -987,7 +993,7 @@ impl SubgraphStoreInner {
             let chain = status
                 .chains
                 .first()
-                .ok_or_else(|| constraint_violation!("no chain info for {}", deployment_id))?;
+                .ok_or_else(|| internal_error!("no chain info for {}", deployment_id))?;
             let latest_ethereum_block_number =
                 chain.latest_block.as_ref().map(|block| block.number());
             let subgraph_info = store.subgraph_info(site.cheap_clone())?;
@@ -1032,7 +1038,7 @@ impl SubgraphStoreInner {
         store.error_count(id)
     }
 
-    /// Vacuum the `subgraph_deployment` table in each shard
+    /// Vacuum the `head` and `deployment` table in each shard
     pub(crate) async fn vacuum(&self) -> Vec<Result<(), StoreError>> {
         join_all(self.stores.values().map(|store| store.vacuum())).await
     }
@@ -1245,6 +1251,16 @@ impl SubgraphStoreInner {
         store.prune(reporter, site, req).await
     }
 
+    pub async fn prune_viewer(
+        &self,
+        deployment: &DeploymentLocator,
+    ) -> Result<relational::prune::Viewer, StoreError> {
+        let site = self.find_site(deployment.id.into())?;
+        let store = self.for_site(&site)?;
+
+        store.prune_viewer(site).await
+    }
+
     pub fn set_history_blocks(
         &self,
         deployment: &DeploymentLocator,
@@ -1396,6 +1412,16 @@ impl SubgraphStoreTrait for SubgraphStore {
         pconn.transaction(|conn| -> Result<_, StoreError> {
             let mut pconn = primary::Connection::new(conn);
             let changes = pconn.reassign_subgraph(site.as_ref(), node_id)?;
+            pconn.send_store_event(&self.sender, &StoreEvent::new(changes))
+        })
+    }
+
+    fn unassign_subgraph(&self, deployment: &DeploymentLocator) -> Result<(), StoreError> {
+        let site = self.find_site(deployment.id.into())?;
+        let mut pconn = self.primary_conn()?;
+        pconn.transaction(|conn| -> Result<_, StoreError> {
+            let mut pconn = primary::Connection::new(conn);
+            let changes = pconn.unassign_subgraph(site.as_ref())?;
             pconn.send_store_event(&self.sender, &StoreEvent::new(changes))
         })
     }
@@ -1594,7 +1620,7 @@ impl SubgraphStoreTrait for SubgraphStore {
     fn active_locator(&self, hash: &str) -> Result<Option<DeploymentLocator>, StoreError> {
         let sites = self.mirror.find_sites(&[hash.to_string()], true)?;
         if sites.len() > 1 {
-            return Err(constraint_violation!(
+            return Err(internal_error!(
                 "There are {} active deployments for {hash}, there should only be one",
                 sites.len()
             ));

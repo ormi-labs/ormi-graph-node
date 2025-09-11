@@ -31,25 +31,26 @@ use diesel::{
     QueryDsl, RunQueryDsl,
 };
 use graph::{
-    constraint_violation,
-    futures03::future::select_all,
+    futures03::{future::select_all, FutureExt as _},
+    internal_error,
     prelude::{
         info, lazy_static, o, warn, BlockNumber, BlockPtr, CheapClone, Logger, StoreError, ENV_VARS,
     },
     schema::EntityType,
     slog::error,
+    tokio,
 };
 use itertools::Itertools;
 
 use crate::{
     advisory_lock, catalog, deployment,
     dynds::DataSourcesTable,
-    primary::{DeploymentId, Site},
-    relational::index::IndexList,
+    primary::{DeploymentId, Primary, Site},
+    relational::{index::IndexList, Layout, Table},
+    relational_queries as rq,
     vid_batcher::{VidBatcher, VidRange},
+    ConnectionPool,
 };
-use crate::{connection_pool::ConnectionPool, relational::Layout};
-use crate::{relational::Table, relational_queries as rq};
 
 const LOG_INTERVAL: Duration = Duration::from_secs(3 * 60);
 
@@ -63,10 +64,8 @@ const ACCEPTABLE_REPLICATION_LAG: Duration = Duration::from_secs(30);
 /// the lag again
 const REPLICATION_SLEEP: Duration = Duration::from_secs(10);
 
-type PooledPgConnection = PooledConnection<ConnectionManager<PgConnection>>;
-
 lazy_static! {
-    static ref STATEMENT_TIMEOUT: Option<String> = ENV_VARS
+    pub(crate) static ref BATCH_STATEMENT_TIMEOUT: Option<String> = ENV_VARS
         .store
         .batch_timeout
         .map(|duration| format!("set local statement_timeout={}", duration.as_millis()));
@@ -103,29 +102,6 @@ table! {
     }
 }
 
-// This is the same as primary::active_copies, but mapped into each shard
-table! {
-    primary_public.active_copies(dst) {
-        src -> Integer,
-        dst -> Integer,
-        cancelled_at -> Nullable<Date>,
-    }
-}
-
-/// Return `true` if the site is the source of a copy operation. The copy
-/// operation might be just queued or in progress already
-pub fn is_source(conn: &mut PgConnection, site: &Site) -> Result<bool, StoreError> {
-    use active_copies as ac;
-
-    select(diesel::dsl::exists(
-        ac::table
-            .filter(ac::src.eq(site.id))
-            .filter(ac::cancelled_at.is_null()),
-    ))
-    .get_result::<bool>(conn)
-    .map_err(StoreError::from)
-}
-
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum Status {
     Finished,
@@ -143,6 +119,7 @@ struct CopyState {
 impl CopyState {
     fn new(
         conn: &mut PgConnection,
+        primary: Primary,
         src: Arc<Layout>,
         dst: Arc<Layout>,
         target_block: BlockPtr,
@@ -163,7 +140,7 @@ impl CopyState {
             Some((src_id, hash, number)) => {
                 let stored_target_block = BlockPtr::from((hash, number));
                 if stored_target_block != target_block {
-                    return Err(constraint_violation!(
+                    return Err(internal_error!(
                         "CopyState {} for copying {} to {} has incompatible block pointer {} instead of {}",
                         dst.site.id,
                         src.site.deployment,
@@ -172,7 +149,7 @@ impl CopyState {
                         target_block));
                 }
                 if src_id != src.site.id {
-                    return Err(constraint_violation!(
+                    return Err(internal_error!(
                         "CopyState {} for copying {} to {} has incompatible source {} instead of {}",
                         dst.site.id,
                         src.site.deployment,
@@ -181,9 +158,9 @@ impl CopyState {
                         src.site.id
                     ));
                 }
-                Self::load(conn, src, dst, target_block)
+                Self::load(conn, primary, src, dst, target_block)
             }
-            None => Self::create(conn, src, dst, target_block),
+            None => Self::create(conn, primary.cheap_clone(), src, dst, target_block),
         }?;
 
         Ok(state)
@@ -191,11 +168,12 @@ impl CopyState {
 
     fn load(
         conn: &mut PgConnection,
+        primary: Primary,
         src: Arc<Layout>,
         dst: Arc<Layout>,
         target_block: BlockPtr,
     ) -> Result<CopyState, StoreError> {
-        let tables = TableState::load(conn, src.as_ref(), dst.as_ref())?;
+        let tables = TableState::load(conn, primary, src.as_ref(), dst.as_ref())?;
         let (finished, mut unfinished): (Vec<_>, Vec<_>) =
             tables.into_iter().partition(|table| table.finished());
         unfinished.sort_by_key(|table| table.dst.object.to_string());
@@ -210,6 +188,7 @@ impl CopyState {
 
     fn create(
         conn: &mut PgConnection,
+        primary: Primary,
         src: Arc<Layout>,
         dst: Arc<Layout>,
         target_block: BlockPtr,
@@ -235,6 +214,7 @@ impl CopyState {
                     .map(|src_table| {
                         TableState::init(
                             conn,
+                            primary.cheap_clone(),
                             dst.site.clone(),
                             &src,
                             src_table.clone(),
@@ -295,7 +275,7 @@ impl CopyState {
                 // drop_foreign_schema does), see that we do not have
                 // metadata for `src`
                 if crate::deployment::exists(conn, &self.src.site)? {
-                    return Err(constraint_violation!(
+                    return Err(internal_error!(
                         "we think we are copying {}[{}] across shards from {} to {}, but the \
                         source subgraph is actually in this shard",
                         self.src.site.deployment,
@@ -336,6 +316,7 @@ pub(crate) fn source(
 /// transformation. See `CopyEntityBatchQuery` for the details of what
 /// exactly that means
 struct TableState {
+    primary: Primary,
     src: Arc<Table>,
     dst: Arc<Table>,
     dst_site: Arc<Site>,
@@ -346,6 +327,7 @@ struct TableState {
 impl TableState {
     fn init(
         conn: &mut PgConnection,
+        primary: Primary,
         dst_site: Arc<Site>,
         src_layout: &Layout,
         src: Arc<Table>,
@@ -355,6 +337,7 @@ impl TableState {
         let vid_range = VidRange::for_copy(conn, &src, target_block)?;
         let batcher = VidBatcher::load(conn, &src_layout.site.namespace, src.as_ref(), vid_range)?;
         Ok(Self {
+            primary,
             src,
             dst,
             dst_site,
@@ -369,6 +352,7 @@ impl TableState {
 
     fn load(
         conn: &mut PgConnection,
+        primary: Primary,
         src_layout: &Layout,
         dst_layout: &Layout,
     ) -> Result<Vec<TableState>, StoreError> {
@@ -384,7 +368,7 @@ impl TableState {
             layout
                 .table_for_entity(entity_type)
                 .map_err(|e| {
-                    constraint_violation!(
+                    internal_error!(
                         "invalid {} table {} in CopyState {} (table {}): {}",
                         kind,
                         entity_type,
@@ -432,6 +416,7 @@ impl TableState {
                             .with_batch_size(size as usize);
 
                             Ok(TableState {
+                                primary: primary.cheap_clone(),
                                 src,
                                 dst,
                                 dst_site: dst_layout.site.clone(),
@@ -498,13 +483,8 @@ impl TableState {
     }
 
     fn is_cancelled(&self, conn: &mut PgConnection) -> Result<bool, StoreError> {
-        use active_copies as ac;
-
         let dst = self.dst_site.as_ref();
-        let canceled = ac::table
-            .filter(ac::dst.eq(dst.id))
-            .select(ac::cancelled_at.is_not_null())
-            .get_result::<bool>(conn)?;
+        let canceled = self.primary.is_copy_cancelled(dst)?;
         if canceled {
             use copy_state as cs;
 
@@ -670,17 +650,92 @@ impl CopyProgress {
     }
 }
 
+enum WorkerResult {
+    Ok(CopyTableWorker),
+    Err(StoreError),
+    Wake,
+}
+
+impl From<Result<CopyTableWorker, StoreError>> for WorkerResult {
+    fn from(result: Result<CopyTableWorker, StoreError>) -> Self {
+        match result {
+            Ok(worker) => WorkerResult::Ok(worker),
+            Err(e) => WorkerResult::Err(e),
+        }
+    }
+}
+
+/// We pass connections back and forth between the control loop and various
+/// workers. We need to make sure that we end up with the connection that
+/// was used to acquire the copy lock in the right place so we can release
+/// the copy lock which is only possible with the connection that acquired
+/// it.
+///
+/// This struct helps us with that. It wraps a connection and tracks whether
+/// the connection was used to acquire the copy lock
+struct LockTrackingConnection {
+    inner: PooledConnection<ConnectionManager<PgConnection>>,
+    has_lock: bool,
+}
+
+impl LockTrackingConnection {
+    fn new(inner: PooledConnection<ConnectionManager<PgConnection>>) -> Self {
+        Self {
+            inner,
+            has_lock: false,
+        }
+    }
+
+    fn transaction<T, F>(&mut self, f: F) -> Result<T, StoreError>
+    where
+        F: FnOnce(&mut PgConnection) -> Result<T, StoreError>,
+    {
+        let conn = &mut self.inner;
+        conn.transaction(|conn| f(conn))
+    }
+
+    /// Put `self` into `other` if `self` has the lock.
+    fn extract(self, other: &mut Option<Self>) {
+        if self.has_lock {
+            *other = Some(self);
+        }
+    }
+
+    fn lock(&mut self, logger: &Logger, dst: &Site) -> Result<(), StoreError> {
+        if self.has_lock {
+            warn!(logger, "already acquired copy lock for {}", dst);
+            return Ok(());
+        }
+        advisory_lock::lock_copying(&mut self.inner, dst)?;
+        self.has_lock = true;
+        Ok(())
+    }
+
+    fn unlock(&mut self, logger: &Logger, dst: &Site) -> Result<(), StoreError> {
+        if !self.has_lock {
+            error!(
+                logger,
+                "tried to release copy lock for {} even though we are not the owner", dst
+            );
+            return Ok(());
+        }
+        advisory_lock::unlock_copying(&mut self.inner, dst)?;
+        self.has_lock = false;
+        Ok(())
+    }
+}
+
 /// A helper to run copying of one table. We need to thread `conn` and
 /// `table` from the control loop to the background worker and back again to
 /// the control loop. This worker facilitates that
 struct CopyTableWorker {
-    conn: PooledPgConnection,
+    conn: LockTrackingConnection,
     table: TableState,
     result: Result<Status, StoreError>,
 }
 
 impl CopyTableWorker {
-    fn new(conn: PooledPgConnection, table: TableState) -> Self {
+    fn new(conn: LockTrackingConnection, table: TableState) -> Self {
         Self {
             conn,
             table,
@@ -688,24 +743,21 @@ impl CopyTableWorker {
         }
     }
 
-    async fn run(
-        mut self,
-        logger: Logger,
-        progress: Arc<CopyProgress>,
-    ) -> Result<Self, StoreError> {
+    async fn run(mut self, logger: Logger, progress: Arc<CopyProgress>) -> WorkerResult {
         let object = self.table.dst.object.cheap_clone();
         graph::spawn_blocking_allow_panic(move || {
             self.result = self.run_inner(logger, &progress);
             self
         })
         .await
-        .map_err(|e| constraint_violation!("copy worker for {} panicked: {}", object, e))
+        .map_err(|e| internal_error!("copy worker for {} panicked: {}", object, e))
+        .into()
     }
 
     fn run_inner(&mut self, logger: Logger, progress: &CopyProgress) -> Result<Status, StoreError> {
         use Status::*;
 
-        let conn = &mut self.conn;
+        let conn = &mut self.conn.inner;
         progress.start_table(&self.table);
         while !self.table.finished() {
             // It is important that this check happens outside the write
@@ -740,7 +792,7 @@ impl CopyTableWorker {
                     }
 
                     match conn.transaction(|conn| {
-                        if let Some(timeout) = STATEMENT_TIMEOUT.as_ref() {
+                        if let Some(timeout) = BATCH_STATEMENT_TIMEOUT.as_ref() {
                             conn.batch_execute(timeout)?;
                         }
                         self.table.copy_batch(conn)
@@ -795,6 +847,57 @@ impl CopyTableWorker {
     }
 }
 
+/// A helper to manage the workers that are copying data. Besides the actual
+/// workers it also keeps a worker that wakes us up periodically to give us
+/// a chance to create more workers if there are database connections
+/// available
+struct Workers {
+    /// The list of workers that are currently running. This will always
+    /// include a future that wakes us up periodically
+    futures: Vec<Pin<Box<dyn Future<Output = WorkerResult>>>>,
+}
+
+impl Workers {
+    fn new() -> Self {
+        Self {
+            futures: vec![Self::waker()],
+        }
+    }
+
+    fn add(&mut self, worker: Pin<Box<dyn Future<Output = WorkerResult>>>) {
+        self.futures.push(worker);
+    }
+
+    fn has_work(&self) -> bool {
+        self.futures.len() > 1
+    }
+
+    async fn select(&mut self) -> WorkerResult {
+        use WorkerResult::*;
+
+        let futures = std::mem::take(&mut self.futures);
+        let (result, _idx, remaining) = select_all(futures).await;
+        self.futures = remaining;
+        match result {
+            Ok(_) | Err(_) => { /* nothing to do */ }
+            Wake => {
+                self.futures.push(Self::waker());
+            }
+        }
+        result
+    }
+
+    fn waker() -> Pin<Box<dyn Future<Output = WorkerResult>>> {
+        let sleep = tokio::time::sleep(ENV_VARS.store.batch_target_duration);
+        Box::pin(sleep.map(|()| WorkerResult::Wake))
+    }
+
+    /// Return the number of workers that are not the waker
+    fn len(&self) -> usize {
+        self.futures.len() - 1
+    }
+}
+
 /// A helper for copying subgraphs
 pub struct Connection {
     /// The connection pool for the shard that will contain the destination
@@ -810,8 +913,9 @@ pub struct Connection {
     /// individual table. Except for that case, this will always be
     /// `Some(..)`. Most code shouldn't access `self.conn` directly, but use
     /// `self.transaction`
-    conn: Option<PooledPgConnection>,
+    conn: Option<LockTrackingConnection>,
     pool: ConnectionPool,
+    primary: Primary,
     workers: usize,
     src: Arc<Layout>,
     dst: Arc<Layout>,
@@ -829,6 +933,7 @@ impl Connection {
     /// is available.
     pub fn new(
         logger: &Logger,
+        primary: Primary,
         pool: ConnectionPool,
         src: Arc<Layout>,
         dst: Arc<Layout>,
@@ -839,7 +944,7 @@ impl Connection {
         let logger = logger.new(o!("dst" => dst.site.namespace.to_string()));
 
         if src.site.schema_version != dst.site.schema_version {
-            return Err(StoreError::ConstraintViolation(format!(
+            return Err(StoreError::InternalError(format!(
                 "attempted to copy between different schema versions, \
                  source version is {} but destination version is {}",
                 src.site.schema_version, dst.site.schema_version
@@ -854,13 +959,14 @@ impl Connection {
             }
             false
         })?;
-        let conn = Some(conn);
         let src_manifest_idx_and_name = Arc::new(src_manifest_idx_and_name);
         let dst_manifest_idx_and_name = Arc::new(dst_manifest_idx_and_name);
+        let conn = Some(LockTrackingConnection::new(conn));
         Ok(Self {
             logger,
             conn,
             pool,
+            primary,
             workers: ENV_VARS.store.batch_workers,
             src,
             dst,
@@ -875,7 +981,7 @@ impl Connection {
         F: FnOnce(&mut PgConnection) -> Result<T, StoreError>,
     {
         let Some(conn) = self.conn.as_mut() else {
-            return Err(constraint_violation!(
+            return Err(internal_error!(
                 "copy connection has been handed to background task but not returned yet (transaction)"
             ));
         };
@@ -909,11 +1015,12 @@ impl Connection {
         &mut self,
         state: &mut CopyState,
         progress: &Arc<CopyProgress>,
-    ) -> Option<Pin<Box<dyn Future<Output = Result<CopyTableWorker, StoreError>>>>> {
+    ) -> Option<Pin<Box<dyn Future<Output = WorkerResult>>>> {
         let Some(conn) = self.conn.take() else {
             return None;
         };
         let Some(table) = state.unfinished.pop() else {
+            self.conn = Some(conn);
             return None;
         };
 
@@ -930,7 +1037,7 @@ impl Connection {
         &mut self,
         state: &mut CopyState,
         progress: &Arc<CopyProgress>,
-    ) -> Option<Pin<Box<dyn Future<Output = Result<CopyTableWorker, StoreError>>>>> {
+    ) -> Option<Pin<Box<dyn Future<Output = WorkerResult>>>> {
         // It's important that we get the connection before the table since
         // we remove the table from the state and could drop it otherwise
         let Some(conn) = self
@@ -942,6 +1049,7 @@ impl Connection {
         let Some(table) = state.unfinished.pop() else {
             return None;
         };
+        let conn = LockTrackingConnection::new(conn);
 
         let worker = CopyTableWorker::new(conn, table);
         Some(Box::pin(
@@ -958,13 +1066,11 @@ impl Connection {
             // Something bad happened. We should have at least one
             // worker if there are still tables to copy
             if self.conn.is_none() {
-                return Err(constraint_violation!(
+                return Err(internal_error!(
                     "copy connection has been handed to background task but not returned yet (copy_data_internal)"
                 ));
             } else {
-                return Err(constraint_violation!(
-                    "no workers left but still tables to copy"
-                ));
+                return Err(internal_error!("no workers left but still tables to copy"));
             }
         }
         Ok(())
@@ -972,27 +1078,24 @@ impl Connection {
 
     /// Wait for all workers to finish. This is called when we a worker has
     /// failed with an error that forces us to abort copying
-    async fn cancel_workers(
-        &mut self,
-        progress: Arc<CopyProgress>,
-        mut workers: Vec<Pin<Box<dyn Future<Output = Result<CopyTableWorker, StoreError>>>>>,
-    ) {
+    async fn cancel_workers(&mut self, progress: Arc<CopyProgress>, mut workers: Workers) {
         progress.cancel();
         error!(
             self.logger,
             "copying encountered an error; waiting for all workers to finish"
         );
-        while !workers.is_empty() {
-            let (result, _, remaining) = select_all(workers).await;
-            workers = remaining;
+        while workers.has_work() {
+            use WorkerResult::*;
+            let result = workers.select().await;
             match result {
                 Ok(worker) => {
-                    self.conn = Some(worker.conn);
+                    worker.conn.extract(&mut self.conn);
                 }
                 Err(e) => {
                     /* Ignore; we had an error previously */
                     error!(self.logger, "copy worker panicked: {}", e);
                 }
+                Wake => { /* Ignore; this is just a waker */ }
             }
         }
     }
@@ -1001,7 +1104,9 @@ impl Connection {
         let src = self.src.clone();
         let dst = self.dst.clone();
         let target_block = self.target_block.clone();
-        let mut state = self.transaction(|conn| CopyState::new(conn, src, dst, target_block))?;
+        let primary = self.primary.cheap_clone();
+        let mut state =
+            self.transaction(|conn| CopyState::new(conn, primary, src, dst, target_block))?;
 
         let progress = Arc::new(CopyProgress::new(self.logger.cheap_clone(), &state));
         progress.start();
@@ -1014,14 +1119,14 @@ impl Connection {
         //
         // The loop has to be very careful about terminating early so that
         // we do not ever leave the loop with `self.conn == None`
-        let mut workers = Vec::new();
-        while !state.unfinished.is_empty() || !workers.is_empty() {
+        let mut workers = Workers::new();
+        while !state.unfinished.is_empty() || workers.has_work() {
             // We usually add at least one job here, except if we are out of
             // tables to copy. In that case, we go through the `while` loop
             // every time one of the tables we are currently copying
             // finishes
             if let Some(worker) = self.default_worker(&mut state, &progress) {
-                workers.push(worker);
+                workers.add(worker);
             }
             loop {
                 if workers.len() >= self.workers {
@@ -1030,27 +1135,28 @@ impl Connection {
                 let Some(worker) = self.extra_worker(&mut state, &progress) else {
                     break;
                 };
-                workers.push(worker);
+                workers.add(worker);
             }
 
             self.assert_progress(workers.len(), &state)?;
-            let (result, _idx, remaining) = select_all(workers).await;
-            workers = remaining;
+            let result = workers.select().await;
 
             // Analyze `result` and take another trip through the loop if
             // everything is ok; wait for pending workers and return if
             // there was an error or if copying was cancelled.
+            use WorkerResult as W;
             match result {
-                Err(e) => {
+                W::Err(e) => {
                     // This is a panic in the background task. We need to
                     // cancel all other tasks and return the error
+                    error!(self.logger, "copy worker panicked: {}", e);
                     self.cancel_workers(progress, workers).await;
                     return Err(e);
                 }
-                Ok(worker) => {
+                W::Ok(worker) => {
                     // Put the connection back into self.conn so that we can use it
                     // in the next iteration.
-                    self.conn = Some(worker.conn);
+                    worker.conn.extract(&mut self.conn);
 
                     match (worker.result, progress.is_cancelled()) {
                         (Ok(Status::Finished), false) => {
@@ -1068,10 +1174,15 @@ impl Connection {
                             return Ok(Status::Cancelled);
                         }
                         (Err(e), _) => {
+                            error!(self.logger, "copy worker had an error: {}", e);
                             self.cancel_workers(progress, workers).await;
                             return Err(e);
                         }
                     }
+                }
+                W::Wake => {
+                    // nothing to do, just try to create more workers by
+                    // going through the loop again
                 }
             };
         }
@@ -1154,20 +1265,28 @@ impl Connection {
         );
 
         let dst_site = self.dst.site.cheap_clone();
-        self.transaction(|conn| advisory_lock::lock_copying(conn, &dst_site))?;
+        let Some(conn) = self.conn.as_mut() else {
+            return Err(internal_error!("copy connection went missing (copy_data)"));
+        };
+        conn.lock(&self.logger, &dst_site)?;
 
         let res = self.copy_data_internal(index_list).await;
 
-        if self.conn.is_none() {
-            // A background worker panicked and left us without our
-            // dedicated connection, but we still need to release the copy
-            // lock; get a normal connection, not from the fdw pool for that
-            // as that will be much less contended. We won't be holding on
-            // to the connection for long as `res` will be an error and we
-            // will abort starting this subgraph
-            self.conn = Some(self.pool.get()?);
+        match self.conn.as_mut() {
+            None => {
+                // A background worker panicked and left us without our
+                // dedicated connection; we would need to get that
+                // connection to unlock the advisory lock. We can't do that,
+                // so we just log an error
+                warn!(
+                    self.logger,
+                    "can't unlock copy lock since the default worker panicked; lock will linger until session ends"
+                );
+            }
+            Some(conn) => {
+                conn.unlock(&self.logger, &dst_site)?;
+            }
         }
-        self.transaction(|conn| advisory_lock::unlock_copying(conn, &dst_site))?;
 
         if matches!(res, Ok(Status::Cancelled)) {
             warn!(&self.logger, "Copying was cancelled and is incomplete");

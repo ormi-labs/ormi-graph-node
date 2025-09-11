@@ -111,6 +111,13 @@ pub struct EnvVarsStore {
     /// blocks) than its history limit. The default value is 1.2 and the
     /// value must be at least 1.01
     pub history_slack_factor: f64,
+    /// For how many prune runs per deployment to keep status information.
+    /// Set by `GRAPH_STORE_HISTORY_KEEP_STATUS`. The default is 5
+    pub prune_keep_history: usize,
+    /// Temporary switch to disable range bound estimation for pruning.
+    /// Set by `GRAPH_STORE_PRUNE_DISABLE_RANGE_BOUND_ESTIMATION`.
+    /// Defaults to false. Remove after 2025-07-15
+    pub prune_disable_range_bound_estimation: bool,
     /// How long to accumulate changes into a batch before a write has to
     /// happen. Set by the environment variable
     /// `GRAPH_STORE_WRITE_BATCH_DURATION` in seconds. The default is 300s.
@@ -122,6 +129,11 @@ pub struct EnvVarsStore {
     /// is 10_000 which corresponds to 10MB. Setting this to 0 disables
     /// write batching.
     pub write_batch_size: usize,
+    /// Whether to memoize the last operation for each entity in a write
+    /// batch to speed up adding more entities. Set by
+    /// `GRAPH_STORE_WRITE_BATCH_MEMOIZE`. The default is `true`.
+    /// Remove after 2025-07-01 if there have been no issues with it.
+    pub write_batch_memoize: bool,
     /// Whether to create GIN indexes for array attributes. Set by
     /// `GRAPH_STORE_CREATE_GIN_INDEXES`. The default is `false`
     pub create_gin_indexes: bool,
@@ -129,14 +141,6 @@ pub struct EnvVarsStore {
     pub use_brin_for_all_query_types: bool,
     /// Temporary env var to disable certain lookups in the chain store
     pub disable_block_cache_for_lookup: bool,
-    /// Temporary env var to fall back to the old broken way of determining
-    /// the time of the last rollup from the POI table instead of the new
-    /// way that fixes
-    /// https://github.com/graphprotocol/graph-node/issues/5530 Remove this
-    /// and all code that is dead as a consequence once this has been vetted
-    /// sufficiently, probably after 2024-12-01
-    /// Defaults to `false`, i.e. using the new fixed behavior
-    pub last_rollup_from_poi: bool,
     /// Safety switch to increase the number of columns used when
     /// calculating the chunk size in `InsertQuery::chunk_size`. This can be
     /// used to work around Postgres errors complaining 'number of
@@ -185,6 +189,7 @@ impl TryFrom<InnerStore> for EnvVarsStore {
             connection_min_idle: x.connection_min_idle,
             connection_idle_timeout: Duration::from_secs(x.connection_idle_timeout_in_secs),
             write_queue_size: x.write_queue_size,
+            write_batch_memoize: x.write_batch_memoize,
             batch_target_duration: Duration::from_secs(x.batch_target_duration_in_secs),
             batch_timeout: x.batch_timeout_in_secs.map(Duration::from_secs),
             batch_workers: x.batch_workers,
@@ -192,12 +197,13 @@ impl TryFrom<InnerStore> for EnvVarsStore {
             rebuild_threshold: x.rebuild_threshold.0,
             delete_threshold: x.delete_threshold.0,
             history_slack_factor: x.history_slack_factor.0,
+            prune_keep_history: x.prune_keep_status,
+            prune_disable_range_bound_estimation: x.prune_disable_range_bound_estimation,
             write_batch_duration: Duration::from_secs(x.write_batch_duration_in_secs),
             write_batch_size: x.write_batch_size * 1_000,
             create_gin_indexes: x.create_gin_indexes,
             use_brin_for_all_query_types: x.use_brin_for_all_query_types,
             disable_block_cache_for_lookup: x.disable_block_cache_for_lookup,
-            last_rollup_from_poi: x.last_rollup_from_poi,
             insert_extra_cols: x.insert_extra_cols,
             fdw_fetch_size: x.fdw_fetch_size,
         };
@@ -266,18 +272,25 @@ pub struct InnerStore {
     delete_threshold: ZeroToOneF64,
     #[envconfig(from = "GRAPH_STORE_HISTORY_SLACK_FACTOR", default = "1.2")]
     history_slack_factor: HistorySlackF64,
+    #[envconfig(from = "GRAPH_STORE_HISTORY_KEEP_STATUS", default = "5")]
+    prune_keep_status: usize,
+    #[envconfig(
+        from = "GRAPH_STORE_PRUNE_DISABLE_RANGE_BOUND_ESTIMATION",
+        default = "false"
+    )]
+    prune_disable_range_bound_estimation: bool,
     #[envconfig(from = "GRAPH_STORE_WRITE_BATCH_DURATION", default = "300")]
     write_batch_duration_in_secs: u64,
     #[envconfig(from = "GRAPH_STORE_WRITE_BATCH_SIZE", default = "10000")]
     write_batch_size: usize,
+    #[envconfig(from = "GRAPH_STORE_WRITE_BATCH_MEMOIZE", default = "true")]
+    write_batch_memoize: bool,
     #[envconfig(from = "GRAPH_STORE_CREATE_GIN_INDEXES", default = "false")]
     create_gin_indexes: bool,
     #[envconfig(from = "GRAPH_STORE_USE_BRIN_FOR_ALL_QUERY_TYPES", default = "false")]
     use_brin_for_all_query_types: bool,
     #[envconfig(from = "GRAPH_STORE_DISABLE_BLOCK_CACHE_FOR_LOOKUP", default = "false")]
     disable_block_cache_for_lookup: bool,
-    #[envconfig(from = "GRAPH_STORE_LAST_ROLLUP_FROM_POI", default = "false")]
-    last_rollup_from_poi: bool,
     #[envconfig(from = "GRAPH_STORE_INSERT_EXTRA_COLS", default = "0")]
     insert_extra_cols: usize,
     #[envconfig(from = "GRAPH_STORE_FDW_FETCH_SIZE", default = "1000")]

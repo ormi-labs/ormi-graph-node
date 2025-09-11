@@ -86,8 +86,17 @@ those.
   may use (in bytes, defaults to 256MB).
 - `GRAPH_MAX_IPFS_CACHE_SIZE`: maximum number of files cached (defaults to 50).
 - `GRAPH_MAX_IPFS_CACHE_FILE_SIZE`: maximum size of each cached file (in bytes, defaults to 1MiB).
-- `GRAPH_IPFS_REQUEST_LIMIT`: Limits the number of requests per second to IPFS for file data sources.
-  Defaults to 100.
+- `GRAPH_IPFS_REQUEST_LIMIT`: Limits the number of requests per second to IPFS for file data sources. Defaults to 100.
+- `GRAPH_IPFS_MAX_ATTEMPTS`: This limits the IPFS retry requests in case of a
+  file not found or logical issue working as a safety mechanism to
+  prevent infinite spamming of IPFS servers and network congestion
+  (default: 100 000).
+- `GRAPH_IPFS_CACHE_LOCATION`: When set, files retrieved from IPFS will be
+  cached in that location; future accesses to the same file will be served
+  from cache rather than IPFS. This can either be a URL starting with
+  `redis://`, in which case there must be a Redis instance running at that
+  URL, or an absolute file system path which must be a directory writable
+  by the `graph-node` process (experimental)
 
 ## GraphQL
 
@@ -223,10 +232,10 @@ those.
   copying or grafting should take. This limits how long transactions for
   such long running operations will be, and therefore helps control bloat
   in other tables. Value is in seconds and defaults to 180s.
-- `GRAPH_STORE_BATCH_TIMEOUT`: How long a batch operation during copying or
-  grafting is allowed to take at most. This is meant to guard against
-  batches that are catastrophically big and should be set to a small
-  multiple of `GRAPH_STORE_BATCH_TARGET_DURATION`, like 10 times that
+- `GRAPH_STORE_BATCH_TIMEOUT`: How long a batch operation during copying,
+  grafting, or pruning is allowed to take at most. This is meant to guard
+  against batches that are catastrophically big and should be set to a
+  small multiple of `GRAPH_STORE_BATCH_TARGET_DURATION`, like 10 times that
   value, and needs to be at least 2 times that value when set. If this
   timeout is hit, the batch size is reset to 1 so we can be sure that
   batches stay below `GRAPH_STORE_BATCH_TARGET_DURATION` and the smaller

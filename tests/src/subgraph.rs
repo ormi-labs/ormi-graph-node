@@ -4,7 +4,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::anyhow;
+use anyhow::{anyhow, bail};
 
 use graph::prelude::serde_json::{self, Value};
 use serde::Deserialize;
@@ -26,7 +26,7 @@ pub struct Subgraph {
 }
 
 impl Subgraph {
-    fn dir(name: &str) -> TestFile {
+    pub fn dir(name: &str) -> TestFile {
         TestFile::new(&format!("integration-tests/{name}"))
     }
 
@@ -47,8 +47,11 @@ impl Subgraph {
         Ok(())
     }
 
-    /// Deploy the subgraph by running the required `graph` commands
-    pub async fn deploy(name: &str, contracts: &[Contract]) -> anyhow::Result<String> {
+    /// Prepare the subgraph for deployment by patching contracts and checking for subgraph datasources
+    pub async fn prepare(
+        name: &str,
+        contracts: &[Contract],
+    ) -> anyhow::Result<(TestFile, String, bool)> {
         let dir = Self::dir(name);
         let name = format!("test/{name}");
 
@@ -61,6 +64,13 @@ impl Subgraph {
             .as_sequence()
             .and_then(|ds| ds.iter().find(|d| d["kind"].as_str() == Some("subgraph")))
             .is_some();
+
+        Ok((dir, name, has_subgraph_datasource))
+    }
+
+    /// Deploy the subgraph by running the required `graph` commands
+    pub async fn deploy(name: &str, contracts: &[Contract]) -> anyhow::Result<String> {
+        let (dir, name, has_subgraph_datasource) = Self::prepare(name, contracts).await?;
 
         // graph codegen subgraph.yaml
         let mut prog = Command::new(&CONFIG.graph_cli);
@@ -164,8 +174,43 @@ impl Subgraph {
     }
 
     /// Make a GraphQL query to the index node API
-    pub async fn index_with_vars(&self, text: &str, vars: Value) -> anyhow::Result<Value> {
+    pub async fn query_with_vars(text: &str, vars: Value) -> anyhow::Result<Value> {
         let endpoint = CONFIG.graph_node.index_node_uri();
         graphql_query_with_vars(&endpoint, text, vars).await
+    }
+
+    /// Poll the subgraph's data API until the `query` returns non-empty
+    /// results for any of the specified `keys`. The `keys` must be the
+    /// toplevel entries in the GraphQL `query`. The return value is a
+    /// vector of vectors, where each inner vector contains the results for
+    /// one of the specified `keys`, in the order in which they appear in
+    /// `keys`.
+    pub async fn polling_query(
+        &self,
+        query: &str,
+        keys: &[&str],
+    ) -> anyhow::Result<Vec<Vec<Value>>> {
+        let start = Instant::now();
+        loop {
+            let resp = self.query(query).await?;
+
+            if let Some(errors) = resp.get("errors") {
+                bail!("GraphQL errors: {:?}", errors);
+            }
+            let data = resp["data"].as_object().unwrap();
+            let values = keys
+                .into_iter()
+                .map(|key| data[*key].as_array().unwrap().clone())
+                .collect::<Vec<_>>();
+
+            if !values.iter().all(|item| item.is_empty()) {
+                break Ok(values);
+            }
+
+            if start.elapsed() > Duration::from_secs(30) {
+                bail!("Timed out waiting for declared calls to be indexed");
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
     }
 }

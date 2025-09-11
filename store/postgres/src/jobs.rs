@@ -10,7 +10,7 @@ use graph::prelude::{error, Logger, MetricsRegistry, StoreError, ENV_VARS};
 use graph::prometheus::Gauge;
 use graph::util::jobs::{Job, Runner};
 
-use crate::connection_pool::ConnectionPool;
+use crate::ConnectionPool;
 use crate::{unused, Store, SubgraphStore};
 
 pub fn register(
@@ -49,10 +49,11 @@ pub fn register(
     );
 }
 
-/// A job that vacuums `subgraphs.subgraph_deployment`. With a large number
-/// of subgraphs, the autovacuum daemon might not run often enough to keep
-/// this table, which is _very_ write-heavy, from getting bloated. We
-/// therefore set up a separate job that vacuums the table once a minute
+/// A job that vacuums `subgraphs.deployment` and `subgraphs.head`. With a
+/// large number of subgraphs, the autovacuum daemon might not run often
+/// enough to keep this table, which is _very_ write-heavy, from getting
+/// bloated. We therefore set up a separate job that vacuums the table once
+/// a minute
 struct VacuumDeploymentsJob {
     store: Arc<SubgraphStore>,
 }
@@ -66,16 +67,13 @@ impl VacuumDeploymentsJob {
 #[async_trait]
 impl Job for VacuumDeploymentsJob {
     fn name(&self) -> &str {
-        "Vacuum subgraphs.subgraph_deployment"
+        "Vacuum subgraphs.deployment and subgraphs.head"
     }
 
     async fn run(&self, logger: &Logger) {
         for res in self.store.vacuum().await {
             if let Err(e) = res {
-                error!(
-                    logger,
-                    "Vacuum of subgraphs.subgraph_deployment failed: {}", e
-                );
+                error!(logger, "Vacuum of subgraphs.deployment failed: {}", e);
             }
         }
     }

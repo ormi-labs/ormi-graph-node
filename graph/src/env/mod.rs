@@ -15,8 +15,15 @@ use crate::{
     runtime::gas::CONST_MAX_GAS_PER_HANDLER,
 };
 
+#[cfg(debug_assertions)]
+use std::sync::Mutex;
+
 lazy_static! {
     pub static ref ENV_VARS: EnvVars = EnvVars::from_env().unwrap();
+}
+#[cfg(debug_assertions)]
+lazy_static! {
+    pub static ref TEST_WITH_NO_REORG: Mutex<bool> = Mutex::new(false);
 }
 
 /// Panics if:
@@ -181,7 +188,7 @@ pub struct EnvVars {
     pub static_filters_threshold: usize,
     /// Set by the environment variable `ETHEREUM_REORG_THRESHOLD`. The default
     /// value is 250 blocks.
-    pub reorg_threshold: BlockNumber,
+    reorg_threshold: BlockNumber,
     /// The time to wait between polls when using polling block ingestor.
     /// The value is set by `ETHERUM_POLLING_INTERVAL` in millis and the
     /// default is 1000.
@@ -218,6 +225,12 @@ pub struct EnvVars {
     /// if no genesis hash can be retrieved from an adapter. If enabled, the adapter is
     /// ignored if unable to produce a genesis hash or produces a different an unexpected hash.
     pub genesis_validation_enabled: bool,
+    /// Whether to enforce deployment hash validation rules.
+    /// When disabled, any string can be used as a deployment hash.
+    /// When enabled, deployment hashes must meet length and character constraints.
+    ///
+    /// Set by the flag `GRAPH_NODE_DISABLE_DEPLOYMENT_HASH_VALIDATION`. Enabled by default.
+    pub disable_deployment_hash_validation: bool,
     /// How long do we wait for a response from the provider before considering that it is unavailable.
     /// Default is 30s.
     pub genesis_validation_timeout: Duration,
@@ -250,24 +263,29 @@ pub struct EnvVars {
     /// Set by the environment variable `GRAPH_FIREHOSE_BLOCK_BATCH_SIZE`.
     /// The default value is 10.
     pub firehose_block_batch_size: usize,
+    /// Timeouts to use for various IPFS requests set by
+    /// `GRAPH_IPFS_REQUEST_TIMEOUT`. Defaults to 60 seconds for release
+    /// builds and one second for debug builds to speed up tests. The value
+    /// is in seconds.
+    pub ipfs_request_timeout: Duration,
 }
 
 impl EnvVars {
     pub fn from_env() -> Result<Self, anyhow::Error> {
         let inner = Inner::init_from_env()?;
         let graphql = InnerGraphQl::init_from_env()?.into();
-        let mapping_handlers = InnerMappingHandlers::init_from_env()?.into();
+        let mapping_handlers = InnerMappingHandlers::init_from_env()?.try_into()?;
         let store = InnerStore::init_from_env()?.try_into()?;
-
-        // The default reorganization (reorg) threshold is set to 250.
-        // For testing purposes, we need to set this threshold to 0 because:
-        // 1. Many tests involve reverting blocks.
-        // 2. Blocks cannot be reverted below the reorg threshold.
-        // Therefore, during tests, we want to set the reorg threshold to 0.
-        let reorg_threshold =
-            inner
-                .reorg_threshold
-                .unwrap_or_else(|| if cfg!(debug_assertions) { 0 } else { 250 });
+        let ipfs_request_timeout = match inner.ipfs_request_timeout {
+            Some(timeout) => Duration::from_secs(timeout),
+            None => {
+                if cfg!(debug_assertions) {
+                    Duration::from_secs(1)
+                } else {
+                    Duration::from_secs(60)
+                }
+            }
+        };
 
         Ok(Self {
             graphql,
@@ -322,17 +340,20 @@ impl EnvVars {
             external_http_base_url: inner.external_http_base_url,
             external_ws_base_url: inner.external_ws_base_url,
             static_filters_threshold: inner.static_filters_threshold,
-            reorg_threshold,
+            reorg_threshold: inner.reorg_threshold,
             ingestor_polling_interval: Duration::from_millis(inner.ingestor_polling_interval),
             subgraph_settings: inner.subgraph_settings,
             prefer_substreams_block_streams: inner.prefer_substreams_block_streams,
             enable_dips_metrics: inner.enable_dips_metrics.0,
             history_blocks_override: inner.history_blocks_override,
-            min_history_blocks: inner.min_history_blocks.unwrap_or(2 * reorg_threshold),
+            min_history_blocks: inner
+                .min_history_blocks
+                .unwrap_or(2 * inner.reorg_threshold),
             dips_metrics_object_store_url: inner.dips_metrics_object_store_url,
             section_map: inner.section_map,
             firehose_grpc_max_decode_size_mb: inner.firehose_grpc_max_decode_size_mb,
             genesis_validation_enabled: inner.genesis_validation_enabled.0,
+            disable_deployment_hash_validation: inner.disable_deployment_hash_validation.0,
             genesis_validation_timeout: Duration::from_secs(inner.genesis_validation_timeout),
             graphman_server_auth_token: inner.graphman_server_auth_token,
             firehose_disable_extended_blocks_for_chains:
@@ -343,6 +364,7 @@ impl EnvVars {
             firehose_block_fetch_retry_limit: inner.firehose_block_fetch_retry_limit,
             firehose_block_fetch_timeout: inner.firehose_block_fetch_timeout,
             firehose_block_batch_size: inner.firehose_block_fetch_batch_size,
+            ipfs_request_timeout,
         })
     }
 
@@ -375,6 +397,23 @@ impl EnvVars {
             .filter(|x| !x.is_empty())
             .collect()
     }
+    #[cfg(debug_assertions)]
+    pub fn reorg_threshold(&self) -> i32 {
+        // The default reorganization (reorg) threshold is set to 250.
+        // For testing purposes, we need to set this threshold to 0 because:
+        // 1. Many tests involve reverting blocks.
+        // 2. Blocks cannot be reverted below the reorg threshold.
+        // Therefore, during tests, we want to set the reorg threshold to 0.
+        if *TEST_WITH_NO_REORG.lock().unwrap() {
+            0
+        } else {
+            self.reorg_threshold
+        }
+    }
+    #[cfg(not(debug_assertions))]
+    pub fn reorg_threshold(&self) -> i32 {
+        self.reorg_threshold
+    }
 }
 
 impl Default for EnvVars {
@@ -403,7 +442,7 @@ struct Inner {
         default = "false"
     )]
     allow_non_deterministic_fulltext_search: EnvVarBoolean,
-    #[envconfig(from = "GRAPH_MAX_SPEC_VERSION", default = "1.3.0")]
+    #[envconfig(from = "GRAPH_MAX_SPEC_VERSION", default = "1.4.0")]
     max_spec_version: Version,
     #[envconfig(from = "GRAPH_LOAD_WINDOW_SIZE", default = "300")]
     load_window_size_in_secs: u64,
@@ -473,8 +512,8 @@ struct Inner {
     #[envconfig(from = "GRAPH_STATIC_FILTERS_THRESHOLD", default = "10000")]
     static_filters_threshold: usize,
     // JSON-RPC specific.
-    #[envconfig(from = "ETHEREUM_REORG_THRESHOLD")]
-    reorg_threshold: Option<BlockNumber>,
+    #[envconfig(from = "ETHEREUM_REORG_THRESHOLD", default = "250")]
+    reorg_threshold: BlockNumber,
     #[envconfig(from = "ETHEREUM_POLLING_INTERVAL", default = "1000")]
     ingestor_polling_interval: u64,
     #[envconfig(from = "GRAPH_EXPERIMENTAL_SUBGRAPH_SETTINGS")]
@@ -512,6 +551,13 @@ struct Inner {
     firehose_block_fetch_timeout: u64,
     #[envconfig(from = "GRAPH_FIREHOSE_FETCH_BLOCK_BATCH_SIZE", default = "10")]
     firehose_block_fetch_batch_size: usize,
+    #[envconfig(from = "GRAPH_IPFS_REQUEST_TIMEOUT")]
+    ipfs_request_timeout: Option<u64>,
+    #[envconfig(
+        from = "GRAPH_NODE_DISABLE_DEPLOYMENT_HASH_VALIDATION",
+        default = "false"
+    )]
+    disable_deployment_hash_validation: EnvVarBoolean,
 }
 
 #[derive(Clone, Debug)]

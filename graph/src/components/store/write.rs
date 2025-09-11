@@ -1,14 +1,18 @@
 //! Data structures and helpers for writing subgraph changes to the store
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use crate::{
     blockchain::{block_stream::FirehoseCursor, BlockPtr, BlockTime},
     cheap_clone::CheapClone,
     components::subgraph::Entity,
-    constraint_violation,
     data::{store::Id, subgraph::schema::SubgraphError},
     data_source::CausalityRegion,
     derive::CacheWeight,
+    env::ENV_VARS,
+    internal_error,
     util::cache_weight::CacheWeight,
 };
 
@@ -141,7 +145,7 @@ impl EntityModification {
 
     /// Return the details of the write if `self` is a write operation for a
     /// new or an existing entity
-    fn as_write(&self) -> Option<EntityWrite> {
+    fn as_write(&self) -> Option<EntityWrite<'_>> {
         EntityWrite::try_from(self).ok()
     }
 
@@ -154,9 +158,10 @@ impl EntityModification {
     }
 
     pub fn creates_entity(&self) -> bool {
+        use EntityModification::*;
         match self {
-            EntityModification::Insert { .. } => true,
-            EntityModification::Overwrite { .. } | EntityModification::Remove { .. } => false,
+            Insert { .. } => true,
+            Overwrite { .. } | Remove { .. } => false,
         }
     }
 
@@ -182,7 +187,7 @@ impl EntityModification {
         match self {
             Insert { end, .. } | Overwrite { end, .. } => {
                 if end.is_some() {
-                    return Err(constraint_violation!(
+                    return Err(internal_error!(
                         "can not clamp {:?} to block {}",
                         self,
                         block
@@ -191,7 +196,7 @@ impl EntityModification {
                 *end = Some(block);
             }
             Remove { .. } => {
-                return Err(constraint_violation!(
+                return Err(internal_error!(
                     "can not clamp block range for removal of {:?} to {}",
                     self,
                     block
@@ -219,7 +224,7 @@ impl EntityModification {
                 end,
             }),
             Remove { key, .. } => {
-                return Err(constraint_violation!(
+                return Err(internal_error!(
                     "a remove for {}[{}] can not be converted into an insert",
                     entity_type,
                     key.entity_id
@@ -310,6 +315,10 @@ pub struct RowGroup {
     rows: Vec<EntityModification>,
 
     immutable: bool,
+
+    /// Map the `key.entity_id` of all entries in `rows` to the index with
+    /// the most recent entry for that id to speed up lookups
+    last_mod: HashMap<Id, usize>,
 }
 
 impl RowGroup {
@@ -318,6 +327,7 @@ impl RowGroup {
             entity_type,
             rows: Vec::new(),
             immutable,
+            last_mod: HashMap::new(),
         }
     }
 
@@ -330,7 +340,7 @@ impl RowGroup {
         if !is_forward {
             // unwrap: we only get here when `last()` is `Some`
             let last_block = self.rows.last().map(|emod| emod.block()).unwrap();
-            return Err(constraint_violation!(
+            return Err(internal_error!(
                 "we already have a modification for block {}, can not append {:?}",
                 last_block,
                 emod
@@ -374,6 +384,21 @@ impl RowGroup {
     }
 
     pub fn last_op(&self, key: &EntityKey, at: BlockNumber) -> Option<EntityOp<'_>> {
+        if ENV_VARS.store.write_batch_memoize {
+            let idx = *self.last_mod.get(&key.entity_id)?;
+            if let Some(op) = self.rows.get(idx).and_then(|emod| {
+                if emod.block() <= at {
+                    Some(emod.as_entity_op(at))
+                } else {
+                    None
+                }
+            }) {
+                return Some(op);
+            }
+        }
+        // We are looking for the change at a block `at` that is before the
+        // change we remember in `last_mod`, and therefore have to scan
+        // through all changes
         self.rows
             .iter()
             // We are scanning backwards, i.e., in descendng order of
@@ -383,7 +408,14 @@ impl RowGroup {
             .map(|emod| emod.as_entity_op(at))
     }
 
+    /// Return an iterator over all changes that are effective at `at`. That
+    /// makes it possible to construct the state that the deployment will
+    /// have once all changes for block `at` have been written.
     pub fn effective_ops(&self, at: BlockNumber) -> impl Iterator<Item = EntityOp<'_>> {
+        // We don't use `self.last_mod` here, because we need to return
+        // operations for all entities that have pending changes at block
+        // `at`, and there is no guarantee that `self.last_mod` is visible
+        // at `at` since the change in `self.last_mod` might come after `at`
         let mut seen = HashSet::new();
         self.rows
             .iter()
@@ -400,7 +432,12 @@ impl RowGroup {
 
     /// Find the most recent entry for `id`
     fn prev_row_mut(&mut self, id: &Id) -> Option<&mut EntityModification> {
-        self.rows.iter_mut().rfind(|emod| emod.id() == id)
+        if ENV_VARS.store.write_batch_memoize {
+            let idx = *self.last_mod.get(id)?;
+            self.rows.get_mut(idx)
+        } else {
+            self.rows.iter_mut().rfind(|emod| emod.id() == id)
+        }
     }
 
     /// Append `row` to `self.rows` by combining it with a previously
@@ -409,10 +446,10 @@ impl RowGroup {
         if self.immutable {
             match row {
                 EntityModification::Insert { .. } => {
-                    self.rows.push(row);
+                    self.push_row(row);
                 }
                 EntityModification::Overwrite { .. } | EntityModification::Remove { .. } => {
-                    return Err(constraint_violation!(
+                    return Err(internal_error!(
                         "immutable entity type {} only allows inserts, not {:?}",
                         self.entity_type,
                         row
@@ -426,10 +463,18 @@ impl RowGroup {
             use EntityModification::*;
 
             if row.block() <= prev_row.block() {
-                return Err(constraint_violation!(
+                return Err(internal_error!(
                     "can not append operations that go backwards from {:?} to {:?}",
                     prev_row,
                     row
+                ));
+            }
+
+            if row.id() != prev_row.id() {
+                return Err(internal_error!(
+                    "last_mod map is corrupted: got id {} looking up id {}",
+                    prev_row.id(),
+                    row.id()
                 ));
             }
 
@@ -439,44 +484,55 @@ impl RowGroup {
             // clamping an old version
             match (&*prev_row, &row) {
                 (Insert { end: None, .. } | Overwrite { end: None, .. }, Insert { .. })
-                | (Remove { .. }, Overwrite { .. } | Remove { .. })
+                | (Remove { .. }, Overwrite { .. })
                 | (
                     Insert { end: Some(_), .. } | Overwrite { end: Some(_), .. },
                     Overwrite { .. } | Remove { .. },
                 ) => {
-                    return Err(constraint_violation!(
+                    return Err(internal_error!(
                         "impossible combination of entity operations: {:?} and then {:?}",
                         prev_row,
                         row
                     ))
+                }
+                (Remove { .. }, Remove { .. }) => {
+                    // Ignore the new row, since prev_row is already a
+                    // delete. This can happen when subgraphs delete
+                    // entities without checking if they even exist
                 }
                 (
                     Insert { end: Some(_), .. } | Overwrite { end: Some(_), .. } | Remove { .. },
                     Insert { .. },
                 ) => {
                     // prev_row was deleted
-                    self.rows.push(row);
+                    self.push_row(row);
                 }
                 (
                     Insert { end: None, .. } | Overwrite { end: None, .. },
                     Overwrite { block, .. },
                 ) => {
                     prev_row.clamp(*block)?;
-                    self.rows.push(row.as_insert(&self.entity_type)?);
+                    let row = row.as_insert(&self.entity_type)?;
+                    self.push_row(row);
                 }
                 (Insert { end: None, .. } | Overwrite { end: None, .. }, Remove { block, .. }) => {
                     prev_row.clamp(*block)?;
                 }
             }
         } else {
-            self.rows.push(row);
+            self.push_row(row);
         }
         Ok(())
     }
 
+    fn push_row(&mut self, row: EntityModification) {
+        self.last_mod.insert(row.id().clone(), self.rows.len());
+        self.rows.push(row);
+    }
+
     fn append(&mut self, group: RowGroup) -> Result<(), StoreError> {
         if self.entity_type != group.entity_type {
-            return Err(constraint_violation!(
+            return Err(internal_error!(
                 "Can not append a row group for {} to a row group for {}",
                 group.entity_type,
                 self.entity_type
@@ -493,6 +549,22 @@ impl RowGroup {
 
     pub fn ids(&self) -> impl Iterator<Item = &Id> {
         self.rows.iter().map(|emod| emod.id())
+    }
+}
+
+pub struct RowGroupForPerfTest(RowGroup);
+
+impl RowGroupForPerfTest {
+    pub fn new(entity_type: EntityType, immutable: bool) -> Self {
+        Self(RowGroup::new(entity_type, immutable))
+    }
+
+    pub fn push(&mut self, emod: EntityModification, block: BlockNumber) -> Result<(), StoreError> {
+        self.0.push(emod, block)
+    }
+
+    pub fn append_row(&mut self, row: EntityModification) -> Result<(), StoreError> {
+        self.0.append_row(row)
     }
 }
 
@@ -638,7 +710,7 @@ pub struct Batch {
     pub first_block: BlockNumber,
     /// The firehose cursor corresponding to `block_ptr`
     pub firehose_cursor: FirehoseCursor,
-    mods: RowGroups,
+    pub mods: RowGroups,
     /// New data sources
     pub data_sources: DataSources,
     pub deterministic_errors: Vec<SubgraphError>,
@@ -705,7 +777,7 @@ impl Batch {
 
     fn append_inner(&mut self, mut batch: Batch) -> Result<(), StoreError> {
         if batch.block_ptr.number <= self.block_ptr.number {
-            return Err(constraint_violation!("Batches must go forward. Can't append a batch with block pointer {} to one with block pointer {}", batch.block_ptr, self.block_ptr));
+            return Err(internal_error!("Batches must go forward. Can't append a batch with block pointer {} to one with block pointer {}", batch.block_ptr, self.block_ptr));
         }
 
         self.block_ptr = batch.block_ptr;
@@ -751,7 +823,7 @@ impl Batch {
         &self,
         entity_type: &EntityType,
         at: BlockNumber,
-    ) -> impl Iterator<Item = EntityOp> {
+    ) -> impl Iterator<Item = EntityOp<'_>> {
         self.mods
             .group(entity_type)
             .map(|group| group.effective_ops(at))
@@ -903,6 +975,7 @@ impl<'a> Iterator for WriteChunkIter<'a> {
 
 #[cfg(test)]
 mod test {
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     use crate::{
@@ -926,7 +999,7 @@ mod test {
 
         assert_eq!(values.len(), blocks.len());
 
-        let rows = values
+        let rows: Vec<_> = values
             .iter()
             .zip(blocks.iter())
             .map(|(value, block)| EntityModification::Remove {
@@ -934,10 +1007,19 @@ mod test {
                 block: *block,
             })
             .collect();
+        let last_mod = rows
+            .iter()
+            .enumerate()
+            .fold(HashMap::new(), |mut map, (idx, emod)| {
+                map.insert(emod.id().clone(), idx);
+                map
+            });
+
         let group = RowGroup {
             entity_type: ENTRY_TYPE.clone(),
             rows,
             immutable: false,
+            last_mod,
         };
         let act = group
             .clamps_by_block()
