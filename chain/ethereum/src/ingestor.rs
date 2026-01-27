@@ -164,11 +164,7 @@ impl PollingBlockIngestor {
             debug!(&logger, "Fetched missing block hash parent"; "missing_block_hash" => ?missing_block_hash, "ingested_blocks" => ingested_blocks);
             ingested_blocks += 1;
         }
-        info!(
-            &logger,
-            "Synced {} blocks from Ethereum",
-            ingested_blocks
-        );
+        info!(&logger, "Synced {} blocks from Ethereum", ingested_blocks);
         Ok(())
     }
 
