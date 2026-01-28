@@ -350,7 +350,7 @@ impl Value {
             ("BigDecimal", Value::Int(i)) => Ok(Value::String(i.to_string())),
             ("BigDecimal", Value::String(s)) => Ok(Value::String(s)),
             ("Int", Value::Int(num)) => {
-                if i32::min_value() as i64 <= num && num <= i32::max_value() as i64 {
+                if i32::MIN as i64 <= num && num <= i32::MAX as i64 {
                     Ok(Value::Int(num))
                 } else {
                     Err(Value::Int(num))
@@ -409,7 +409,7 @@ impl std::fmt::Display for Value {
                 write!(f, "}}")
             }
             Value::Timestamp(ref ts) => {
-                write!(f, "\"{}\"", ts.as_microseconds_since_epoch().to_string())
+                write!(f, "\"{}\"", ts.as_microseconds_since_epoch())
             }
         }
     }
@@ -433,7 +433,7 @@ impl Serialize for Value {
                 seq.end()
             }
             Value::Timestamp(ts) => {
-                serializer.serialize_str(&ts.as_microseconds_since_epoch().to_string().as_str())
+                serializer.serialize_str(ts.as_microseconds_since_epoch().to_string().as_str())
             }
             Value::Null => serializer.serialize_none(),
             Value::String(s) => serializer.serialize_str(s),

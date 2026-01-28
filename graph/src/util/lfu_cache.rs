@@ -179,7 +179,7 @@ impl<K: Clone + Ord + Eq + Hash + Debug + CacheWeight, V: CacheWeight + Default>
         })
     }
 
-    pub fn iter<'a>(&'a self) -> impl Iterator<Item = (&'a K, &'a V)> {
+    pub fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
         self.queue
             .iter()
             .map(|entry| (&entry.0.key, &entry.0.value))
@@ -194,7 +194,7 @@ impl<K: Clone + Ord + Eq + Hash + Debug + CacheWeight, V: CacheWeight + Default>
         // the absolute minimum and popping.
         let key_entry = CacheEntry::cache_key(key.clone());
         self.queue
-            .change_priority(&key_entry, (true, Reverse(u64::min_value())))
+            .change_priority(&key_entry, (true, Reverse(u64::MIN)))
             .and_then(|_| {
                 self.queue.pop().map(|(e, _)| {
                     assert_eq!(e.key, key_entry.key);

@@ -86,7 +86,7 @@ impl PruneReporter for Progress {
 
     fn start_analyze(&mut self) {
         if !self.initial_analyze {
-            println!("");
+            println!();
         }
         print!("Analyze tables");
         self.analyze_start = Instant::now();
@@ -105,7 +105,7 @@ impl PruneReporter for Progress {
         let stats: Vec<_> = stats
             .iter()
             .filter(|stat| self.initial_analyze || analyzed.contains(&stat.tablename.as_str()))
-            .map(|stats| stats.clone())
+            .cloned()
             .collect();
         println!(
             "\rAnalyzed {} tables in {}s{: ^30}",
@@ -169,16 +169,17 @@ struct Args {
     latest_block: BlockNumber,
 }
 
-fn check_args(
+async fn check_args(
     store: &Arc<Store>,
     primary_pool: ConnectionPool,
     search: DeploymentSearch,
     history: usize,
 ) -> Result<Args, anyhow::Error> {
     let history = history as BlockNumber;
-    let deployment = search.locate_unique(&primary_pool)?;
+    let deployment = search.locate_unique(&primary_pool).await?;
     let mut info = store
-        .status(status::Filter::DeploymentIds(vec![deployment.id]))?
+        .status(status::Filter::DeploymentIds(vec![deployment.id]))
+        .await?
         .pop()
         .ok_or_else(|| anyhow!("deployment {deployment} not found"))?;
     if info.chains.len() > 1 {
@@ -250,7 +251,7 @@ async fn run_inner(
     once: bool,
     do_first_prune: bool,
 ) -> Result<(), anyhow::Error> {
-    let args = check_args(&store, primary_pool, search, history)?;
+    let args = check_args(&store, primary_pool, search, history).await?;
 
     if do_first_prune {
         first_prune(&store, &args, rebuild_threshold, delete_threshold).await?;
@@ -258,11 +259,10 @@ async fn run_inner(
 
     // Only after everything worked out, make the history setting permanent
     if !once {
-        store.subgraph_store().set_history_blocks(
-            &args.deployment,
-            args.history,
-            ENV_VARS.reorg_threshold(),
-        )?;
+        store
+            .subgraph_store()
+            .set_history_blocks(&args.deployment, args.history, ENV_VARS.reorg_threshold())
+            .await?;
     }
 
     Ok(())
@@ -333,15 +333,15 @@ pub async fn status(
 
     let mut term = Terminal::new();
 
-    let deployment = search.locate_unique(&primary_pool)?;
+    let deployment = search.locate_unique(&primary_pool).await?;
 
     let viewer = store.subgraph_store().prune_viewer(&deployment).await?;
-    let runs = viewer.runs()?;
+    let runs = viewer.runs().await?;
     if runs.is_empty() {
         return Err(anyhow!("No prune runs found for deployment {deployment}"));
     }
     let run = run.unwrap_or(*runs.last().unwrap());
-    let Some((state, table_states)) = viewer.state(run)? else {
+    let Some((state, table_states)) = viewer.state(run).await? else {
         let runs = match runs.len() {
             0 => unreachable!("we checked that runs is not empty"),
             1 => format!("There is only one prune run #{}", runs[0]),
@@ -424,7 +424,7 @@ pub async fn status(
         let table_name = fmt::abbreviate(&table_name, 30);
         let rows = rows.map_or_null(|rows| rows.to_string());
         let batch_size = batch_size.map_or_null(|b| b.to_string());
-        let duration = started_at.map_or_null(|s| fmt::duration(&s, &finished_at));
+        let duration = started_at.map_or_null(|s| fmt::duration(s, &finished_at));
         let phase = phase.as_str();
         writeln!(term,
             "{table_name:<30} | {:<15} {complete:>6} | {rows:>8} | {batch_size:>11} | {duration:>8}",

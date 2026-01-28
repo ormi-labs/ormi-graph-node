@@ -3,6 +3,7 @@ mod err;
 mod traits;
 pub mod write;
 
+use alloy::primitives::Address;
 use diesel::deserialize::FromSql;
 use diesel::pg::Pg;
 use diesel::serialize::{Output, ToSql};
@@ -10,6 +11,7 @@ use diesel::sql_types::Integer;
 use diesel_derives::{AsExpression, FromSqlRow};
 pub use entity_cache::{EntityCache, EntityLfuCache, GetScope, ModificationsAndCache};
 use slog::Logger;
+use tokio_stream::wrappers::ReceiverStream;
 
 pub use super::subgraph::Entity;
 pub use err::{StoreError, StoreResult};
@@ -18,15 +20,16 @@ use strum_macros::Display;
 pub use traits::*;
 pub use write::Batch;
 
-use futures01::{Async, Stream};
 use serde::{Deserialize, Serialize};
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt;
 use std::fmt::Display;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Duration;
+
+use async_trait::async_trait;
 
 use crate::blockchain::{Block, BlockHash, BlockPtr};
 use crate::cheap_clone::CheapClone;
@@ -40,7 +43,7 @@ use crate::env::ENV_VARS;
 use crate::internal_error;
 use crate::prelude::{s, Attribute, DeploymentHash, ValueType};
 use crate::schema::{ast as sast, EntityKey, EntityType, InputSchema};
-use crate::util::stats::MovingStats;
+use crate::util::stats::AtomicMovingStats;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct EntityFilterDerivative(bool);
@@ -425,13 +428,14 @@ impl EntityCollection {
 /// be enough for everybody
 pub type BlockNumber = i32;
 
-pub const BLOCK_NUMBER_MAX: BlockNumber = std::i32::MAX;
+pub const BLOCK_NUMBER_MAX: BlockNumber = i32::MAX;
 
 /// A query for entities in a store.
 ///
 /// Details of how query generation for `EntityQuery` works can be found
 /// at https://github.com/graphprotocol/rfcs/blob/master/engineering-plans/0001-graphql-query-prefetching.md
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct EntityQuery {
     /// ID of the subgraph.
     pub subgraph_id: DeploymentHash,
@@ -462,8 +466,6 @@ pub struct EntityQuery {
     pub query_id: Option<String>,
 
     pub trace: bool,
-
-    _force_use_of_new: (),
 }
 
 impl EntityQuery {
@@ -482,7 +484,6 @@ impl EntityQuery {
             logger: None,
             query_id: None,
             trace: false,
-            _force_use_of_new: (),
         }
     }
 
@@ -633,37 +634,8 @@ impl PartialEq for StoreEvent {
     }
 }
 
-/// A `StoreEventStream` produces the `StoreEvents`. Various filters can be applied
-/// to it to reduce which and how many events are delivered by the stream.
-pub struct StoreEventStream<S> {
-    source: S,
-}
-
 /// A boxed `StoreEventStream`
-pub type StoreEventStreamBox =
-    StoreEventStream<Box<dyn Stream<Item = Arc<StoreEvent>, Error = ()> + Send>>;
-
-impl<S> Stream for StoreEventStream<S>
-where
-    S: Stream<Item = Arc<StoreEvent>, Error = ()> + Send,
-{
-    type Item = Arc<StoreEvent>;
-    type Error = ();
-
-    fn poll(&mut self) -> Result<Async<Option<Self::Item>>, Self::Error> {
-        self.source.poll()
-    }
-}
-
-impl<S> StoreEventStream<S>
-where
-    S: Stream<Item = Arc<StoreEvent>, Error = ()> + Send + 'static,
-{
-    // Create a new `StoreEventStream` from another such stream
-    pub fn new(source: S) -> Self {
-        StoreEventStream { source }
-    }
-}
+pub type StoreEventStreamBox = ReceiverStream<Arc<StoreEvent>>;
 
 /// An entity operation that can be transacted into the store.
 #[derive(Clone, Debug, PartialEq)]
@@ -771,8 +743,8 @@ impl Display for DeploymentLocator {
 }
 
 // The type that the connection pool uses to track wait times for
-// connection checkouts
-pub type PoolWaitStats = Arc<RwLock<MovingStats>>;
+// connection checkouts. Uses lock-free atomic operations internally.
+pub type PoolWaitStats = Arc<AtomicMovingStats>;
 
 /// Determines which columns should be selected in a table.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -896,16 +868,20 @@ impl EmptyStore {
     }
 }
 
+#[async_trait]
 impl ReadStore for EmptyStore {
-    fn get(&self, _key: &EntityKey) -> Result<Option<Entity>, StoreError> {
+    async fn get(&self, _key: &EntityKey) -> Result<Option<Entity>, StoreError> {
         Ok(None)
     }
 
-    fn get_many(&self, _: BTreeSet<EntityKey>) -> Result<BTreeMap<EntityKey, Entity>, StoreError> {
+    async fn get_many(
+        &self,
+        _: BTreeSet<EntityKey>,
+    ) -> Result<BTreeMap<EntityKey, Entity>, StoreError> {
         Ok(BTreeMap::new())
     }
 
-    fn get_derived(
+    async fn get_derived(
         &self,
         _query: &DerivedEntityQuery,
     ) -> Result<BTreeMap<EntityKey, Entity>, StoreError> {
@@ -1040,12 +1016,12 @@ impl PruneRequest {
     ) -> Result<Self, StoreError> {
         let rebuild_threshold = ENV_VARS.store.rebuild_threshold;
         let delete_threshold = ENV_VARS.store.delete_threshold;
-        if rebuild_threshold < 0.0 || rebuild_threshold > 1.0 {
+        if !(0.0..=1.0).contains(&rebuild_threshold) {
             return Err(internal_error!(
                 "the copy threshold must be between 0 and 1 but is {rebuild_threshold}"
             ));
         }
-        if delete_threshold < 0.0 || delete_threshold > 1.0 {
+        if !(0.0..=1.0).contains(&delete_threshold) {
             return Err(internal_error!(
                 "the delete threshold must be between 0 and 1 but is {delete_threshold}"
             ));
@@ -1163,7 +1139,7 @@ pub struct CachedEthereumCall {
     pub block_ptr: BlockPtr,
 
     /// The address to the called contract.
-    pub contract_address: ethabi::Address,
+    pub contract_address: Address,
 
     /// The encoded return value of this call.
     pub return_value: Vec<u8>,

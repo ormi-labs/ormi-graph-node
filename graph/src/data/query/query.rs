@@ -1,7 +1,8 @@
 use serde::de::Deserializer;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::convert::TryFrom;
+use std::hash::{DefaultHasher, Hash as _, Hasher as _};
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
@@ -126,6 +127,7 @@ impl QueryTarget {
 
 /// A GraphQL query as submitted by a client, either directly or through a subscription.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct Query {
     pub document: q::Document,
     pub variables: Option<QueryVariables>,
@@ -133,7 +135,6 @@ pub struct Query {
     pub query_text: Arc<String>,
     pub variables_text: Arc<String>,
     pub trace: bool,
-    _force_use_of_new: (),
 }
 
 impl Query {
@@ -146,7 +147,7 @@ impl Query {
         {
             (
                 document
-                    .format(graphql_parser::Style::default().indent(0))
+                    .format(graphql_tools::parser::Style::default().indent(0))
                     .replace('\n', " "),
                 serde_json::to_string(&variables).unwrap_or_default(),
             )
@@ -161,7 +162,29 @@ impl Query {
             query_text: Arc::new(query_text),
             variables_text: Arc::new(variables_text),
             trace,
-            _force_use_of_new: (),
         }
+    }
+}
+
+#[derive(Copy, Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SqlQueryMode {
+    Data,
+    Info,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SqlQueryReq {
+    pub deployment: DeploymentHash,
+    pub query: String,
+    pub mode: SqlQueryMode,
+}
+
+impl SqlQueryReq {
+    pub fn query_hash(&self) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        self.deployment.hash(&mut hasher);
+        self.query.hash(&mut hasher);
+        hasher.finish()
     }
 }

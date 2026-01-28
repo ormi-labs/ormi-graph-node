@@ -5,7 +5,6 @@ use std::time::Duration;
 
 use derivative::Derivative;
 use itertools::Itertools;
-use slog::error;
 use slog::info;
 use slog::warn;
 use slog::Logger;
@@ -127,7 +126,7 @@ impl<T: NetworkDetails> ProviderManager<T> {
         };
 
         let mut validations: Vec<Validation> = Vec::new();
-        let adapters = Self::adapters_by_chain_names(adapters, &mut validations, &enabled_checks);
+        let adapters = Self::adapters_by_chain_names(adapters, &mut validations, enabled_checks);
 
         let inner = Inner {
             logger,
@@ -429,7 +428,7 @@ mod tests {
                 provider_name_calls,
             } = self;
 
-            assert!(provider_name_calls.lock().unwrap().is_empty());
+            assert!(provider_name_calls.get_mut().unwrap().is_empty());
         }
     }
 
@@ -494,7 +493,7 @@ mod tests {
         adapters.map(|adapter| adapter.id).collect()
     }
 
-    #[tokio::test]
+    #[crate::test]
     async fn no_providers() {
         let manager: ProviderManager<Arc<TestAdapter>> =
             ProviderManager::new(discard(), [], ProviderCheckStrategy::MarkAsValid);
@@ -504,7 +503,7 @@ mod tests {
         assert_eq!(manager.providers(&chain_name()).await.unwrap().count(), 0);
     }
 
-    #[tokio::test]
+    #[crate::test]
     async fn no_providers_for_chain() {
         let adapter_1 = Arc::new(TestAdapter::new(1));
         adapter_1.provider_name_call("provider_1".into());
@@ -533,7 +532,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[crate::test]
     async fn multiple_providers() {
         let adapter_1 = Arc::new(TestAdapter::new(1));
         adapter_1.provider_name_call("provider_1".into());
@@ -557,7 +556,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[crate::test]
     async fn providers_unchecked_skips_provider_checks() {
         let adapter_1 = Arc::new(TestAdapter::new(1));
         adapter_1.provider_name_call("provider_1".into());
@@ -567,13 +566,14 @@ mod tests {
         let manager: ProviderManager<Arc<TestAdapter>> = ProviderManager::new(
             discard(),
             [(chain_name(), vec![adapter_1.clone()])],
+            #[allow(clippy::cloned_ref_to_slice_refs)]
             ProviderCheckStrategy::RequireAll(&[check_1.clone()]),
         );
 
         assert_eq!(ids(manager.providers_unchecked(&chain_name())), vec![1]);
     }
 
-    #[tokio::test]
+    #[crate::test]
     async fn successful_provider_check() {
         let adapter_1 = Arc::new(TestAdapter::new(1));
         adapter_1.provider_name_call("provider_1".into());
@@ -584,6 +584,7 @@ mod tests {
         let manager: ProviderManager<Arc<TestAdapter>> = ProviderManager::new(
             discard(),
             [(chain_name(), vec![adapter_1.clone()])],
+            #[allow(clippy::cloned_ref_to_slice_refs)]
             ProviderCheckStrategy::RequireAll(&[check_1.clone()]),
         );
 
@@ -599,7 +600,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[crate::test]
     async fn multiple_successful_provider_checks() {
         let adapter_1 = Arc::new(TestAdapter::new(1));
         adapter_1.provider_name_call("provider_1".into());
@@ -628,7 +629,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[crate::test]
     async fn multiple_successful_provider_checks_on_multiple_adapters() {
         let adapter_1 = Arc::new(TestAdapter::new(1));
         adapter_1.provider_name_call("provider_1".into());
@@ -662,7 +663,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[crate::test]
     async fn successful_provider_check_for_a_pool_of_adapters_for_a_provider() {
         let adapter_1 = Arc::new(TestAdapter::new(1));
         adapter_1.provider_name_call("provider_1".into());
@@ -676,6 +677,7 @@ mod tests {
         let manager: ProviderManager<Arc<TestAdapter>> = ProviderManager::new(
             discard(),
             [(chain_name(), vec![adapter_1.clone(), adapter_2.clone()])],
+            #[allow(clippy::cloned_ref_to_slice_refs)]
             ProviderCheckStrategy::RequireAll(&[check_1.clone()]),
         );
 
@@ -691,7 +693,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[crate::test]
     async fn multiple_successful_provider_checks_for_a_pool_of_adapters_for_a_provider() {
         let adapter_1 = Arc::new(TestAdapter::new(1));
         adapter_1.provider_name_call("provider_1".into());
@@ -723,7 +725,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[crate::test]
     async fn provider_validation_timeout() {
         let adapter_1 = Arc::new(TestAdapter::new(1));
         adapter_1.provider_name_call("provider_1".into());
@@ -737,6 +739,7 @@ mod tests {
         let mut manager: ProviderManager<Arc<TestAdapter>> = ProviderManager::new(
             discard(),
             [(chain_name(), vec![adapter_1.clone()])],
+            #[allow(clippy::cloned_ref_to_slice_refs)]
             ProviderCheckStrategy::RequireAll(&[check_1.clone()]),
         );
 
@@ -753,7 +756,7 @@ mod tests {
         };
     }
 
-    #[tokio::test]
+    #[crate::test]
     async fn no_providers_available() {
         let adapter_1 = Arc::new(TestAdapter::new(1));
         adapter_1.provider_name_call("provider_1".into());
@@ -767,6 +770,7 @@ mod tests {
         let manager: ProviderManager<Arc<TestAdapter>> = ProviderManager::new(
             discard(),
             [(chain_name(), vec![adapter_1.clone()])],
+            #[allow(clippy::cloned_ref_to_slice_refs)]
             ProviderCheckStrategy::RequireAll(&[check_1.clone()]),
         );
 
@@ -781,7 +785,7 @@ mod tests {
         };
     }
 
-    #[tokio::test]
+    #[crate::test]
     async fn all_providers_failed() {
         let adapter_1 = Arc::new(TestAdapter::new(1));
         adapter_1.provider_name_call("provider_1".into());
@@ -794,6 +798,7 @@ mod tests {
         let manager: ProviderManager<Arc<TestAdapter>> = ProviderManager::new(
             discard(),
             [(chain_name(), vec![adapter_1.clone()])],
+            #[allow(clippy::cloned_ref_to_slice_refs)]
             ProviderCheckStrategy::RequireAll(&[check_1.clone()]),
         );
 
@@ -808,7 +813,7 @@ mod tests {
         };
     }
 
-    #[tokio::test]
+    #[crate::test]
     async fn temporary_provider_check_failures_are_retried() {
         let adapter_1 = Arc::new(TestAdapter::new(1));
         adapter_1.provider_name_call("provider_1".into());
@@ -823,6 +828,7 @@ mod tests {
         let mut manager: ProviderManager<Arc<TestAdapter>> = ProviderManager::new(
             discard(),
             [(chain_name(), vec![adapter_1.clone()])],
+            #[allow(clippy::cloned_ref_to_slice_refs)]
             ProviderCheckStrategy::RequireAll(&[check_1.clone()]),
         );
 
@@ -838,7 +844,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[crate::test]
     async fn final_provider_check_failures_are_not_retried() {
         let adapter_1 = Arc::new(TestAdapter::new(1));
         adapter_1.provider_name_call("provider_1".into());
@@ -851,6 +857,7 @@ mod tests {
         let mut manager: ProviderManager<Arc<TestAdapter>> = ProviderManager::new(
             discard(),
             [(chain_name(), vec![adapter_1.clone()])],
+            #[allow(clippy::cloned_ref_to_slice_refs)]
             ProviderCheckStrategy::RequireAll(&[check_1.clone()]),
         );
 
@@ -863,7 +870,7 @@ mod tests {
         assert!(manager.providers(&chain_name()).await.is_err());
     }
 
-    #[tokio::test]
+    #[crate::test]
     async fn mix_valid_and_invalid_providers() {
         let adapter_1 = Arc::new(TestAdapter::new(1));
         adapter_1.provider_name_call("provider_1".into());
@@ -890,6 +897,7 @@ mod tests {
                 chain_name(),
                 vec![adapter_1.clone(), adapter_2.clone(), adapter_3.clone()],
             )],
+            #[allow(clippy::cloned_ref_to_slice_refs)]
             ProviderCheckStrategy::RequireAll(&[check_1.clone()]),
         );
 
@@ -899,7 +907,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[crate::test]
     async fn one_provider_check_failure_is_enough_to_mark_an_provider_as_invalid() {
         let adapter_1 = Arc::new(TestAdapter::new(1));
         adapter_1.provider_name_call("provider_1".into());
@@ -923,7 +931,7 @@ mod tests {
         assert!(manager.providers(&chain_name()).await.is_err());
     }
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[crate::test]
     async fn concurrent_providers_access_does_not_trigger_multiple_validations() {
         let adapter_1 = Arc::new(TestAdapter::new(1));
         adapter_1.provider_name_call("provider_1".into());
@@ -934,6 +942,7 @@ mod tests {
         let manager: ProviderManager<Arc<TestAdapter>> = ProviderManager::new(
             discard(),
             [(chain_name(), vec![adapter_1.clone()])],
+            #[allow(clippy::cloned_ref_to_slice_refs)]
             ProviderCheckStrategy::RequireAll(&[check_1.clone()]),
         );
 

@@ -31,15 +31,13 @@ pub struct RequestLabels {
 #[derive(Clone)]
 pub enum ConnectionType {
     Firehose,
-    Substreams,
     Rpc,
 }
 
-impl Into<&str> for &ConnectionType {
-    fn into(self) -> &'static str {
-        match self {
+impl From<&ConnectionType> for &str {
+    fn from(val: &ConnectionType) -> Self {
+        match val {
             ConnectionType::Firehose => "firehose",
-            ConnectionType::Substreams => "substreams",
             ConnectionType::Rpc => "rpc",
         }
     }
@@ -178,7 +176,7 @@ mod test {
         endpoint::{EndpointMetrics, ProviderName},
     };
 
-    #[tokio::test]
+    #[crate::test]
     async fn should_increment_and_reset() {
         let (a, b, c): (ProviderName, ProviderName, ProviderName) =
             ("a".into(), "b".into(), "c".into());

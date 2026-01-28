@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use graph::components::graphql::GraphQLMetrics as _;
 use graph::components::store::QueryPermit;
 use graph::data::graphql::load_manager::LoadManager;
@@ -9,6 +10,7 @@ use graph::data::query::{CacheStatus, QueryResults, Trace};
 use graph::data::store::ID;
 use graph::data::value::{Object, Word};
 use graph::derive::CheapClone;
+use graph::prelude::alloy::primitives::B256;
 use graph::prelude::*;
 use graph::schema::{
     ast as sast, INTROSPECTION_SCHEMA_FIELD_NAME, INTROSPECTION_TYPE_FIELD_NAME, META_FIELD_NAME,
@@ -163,8 +165,7 @@ impl StoreResolver {
             let Some(block) = field
                 .selection_set
                 .fields()
-                .map(|(_, iter)| iter)
-                .flatten()
+                .flat_map(|(_, iter)| iter)
                 .find(|f| f.name == BLOCK)
             else {
                 return false;
@@ -172,8 +173,7 @@ impl StoreResolver {
             block
                 .selection_set
                 .fields()
-                .map(|(_, iter)| iter)
-                .flatten()
+                .flat_map(|(_, iter)| iter)
                 .any(|f| f.name == TIMESTAMP || f.name == PARENT_HASH)
         }
 
@@ -203,11 +203,11 @@ impl StoreResolver {
                 // locate_block indicates that we do not have a block hash
                 // by setting the hash to `zero`
                 // See 7a7b9708-adb7-4fc2-acec-88680cb07ec1
-                let hash_h256 = ptr.hash_as_h256();
-                if hash_h256 == web3::types::H256::zero() {
+                let hash_b256 = ptr.hash.as_b256();
+                if hash_b256 == B256::ZERO {
                     None
                 } else {
-                    Some(r::Value::String(format!("0x{:x}", hash_h256)))
+                    Some(r::Value::String(format!("0x{:x}", hash_b256)))
                 }
             })
             .unwrap_or(r::Value::Null);
@@ -247,7 +247,7 @@ impl StoreResolver {
             "__typename".into(),
             r::Value::String(META_FIELD_TYPE.to_string()),
         );
-        return Ok(r::Value::object(map));
+        Ok(r::Value::object(map))
     }
 }
 
@@ -259,12 +259,13 @@ impl Resolver for StoreResolver {
         self.store.query_permit().await
     }
 
-    fn prefetch(
+    async fn prefetch(
         &self,
         ctx: &ExecutionContext<Self>,
         selection_set: &a::SelectionSet,
     ) -> Result<(Option<r::Value>, Trace), Vec<QueryExecutionError>> {
         super::prefetch::run(self, ctx, selection_set, &self.graphql_metrics)
+            .await
             .map(|(value, trace)| (Some(value), trace))
     }
 
@@ -297,7 +298,7 @@ impl Resolver for StoreResolver {
         fn child_id(child: &r::Value) -> String {
             match child {
                 r::Value::Object(child) => child
-                    .get(&*ID)
+                    .get(&ID)
                     .map(|id| id.to_string())
                     .unwrap_or("(no id)".to_string()),
                 _ => "(no child object)".to_string(),

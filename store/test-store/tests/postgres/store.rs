@@ -3,6 +3,7 @@ use graph::blockchain::BlockTime;
 use graph::data::graphql::ext::TypeDefinitionExt;
 use graph::data::subgraph::schema::DeploymentCreate;
 use graph::data_source::common::MappingABI;
+use graph::prelude::alloy::primitives::{Address, B256};
 use graph::schema::{EntityType, InputSchema};
 use graph_chain_ethereum::Mapping;
 use hex_literal::hex;
@@ -15,13 +16,11 @@ use graph::data::subgraph::*;
 use graph::{
     blockchain::DataSource,
     components::store::{BlockStore as _, EntityFilter, EntityOrder, EntityQuery, StatusStore},
-    prelude::ethabi::Contract,
 };
 use graph::{data::store::scalar, semver::Version};
 use graph::{entity, prelude::*};
 use graph_store_postgres::layout_for_tests::STRING_PREFIX_SIZE;
 use graph_store_postgres::{Store as DieselStore, SubgraphStore as DieselSubgraphStore};
-use web3::types::{Address, H256};
 
 const USER_GQL: &str = "
     interface ColorAndAge {
@@ -65,56 +64,56 @@ lazy_static! {
         InputSchema::parse_latest(USER_GQL, TEST_SUBGRAPH_ID.clone())
             .expect("Failed to parse user schema");
     static ref TEST_BLOCK_0_PTR: BlockPtr = (
-        H256::from(hex!(
+        B256::from(hex!(
             "bd34884280958002c51d3f7b5f853e6febeba33de0f40d15b0363006533c924f"
         )),
         0u64
     )
         .into();
     static ref TEST_BLOCK_1_PTR: BlockPtr = (
-        H256::from(hex!(
+        B256::from(hex!(
             "8511fa04b64657581e3f00e14543c1d522d5d7e771b54aa3060b662ade47da13"
         )),
         1u64
     )
         .into();
     static ref TEST_BLOCK_2_PTR: BlockPtr = (
-        H256::from(hex!(
+        B256::from(hex!(
             "b98fb783b49de5652097a989414c767824dff7e7fd765a63b493772511db81c1"
         )),
         2u64
     )
         .into();
     static ref TEST_BLOCK_3_PTR: BlockPtr = (
-        H256::from(hex!(
+        B256::from(hex!(
             "977c084229c72a0fa377cae304eda9099b6a2cb5d83b25cdf0f0969b69874255"
         )),
         3u64
     )
         .into();
     static ref TEST_BLOCK_3A_PTR: BlockPtr = (
-        H256::from(hex!(
+        B256::from(hex!(
             "d163aec0592c7cb00c2700ab65dcaac93289f5d250b3b889b39198b07e1fbe4a"
         )),
         3u64
     )
         .into();
     static ref TEST_BLOCK_4_PTR: BlockPtr = (
-        H256::from(hex!(
+        B256::from(hex!(
             "007a03cdf635ebb66f5e79ae66cc90ca23d98031665649db056ff9c6aac2d74d"
         )),
         4u64
     )
         .into();
     static ref TEST_BLOCK_4A_PTR: BlockPtr = (
-        H256::from(hex!(
+        B256::from(hex!(
             "8fab27e9e9285b0a39110f4d9877f05d0f43d2effa157e55f4dcc49c3cf8cbd7"
         )),
         4u64
     )
         .into();
     static ref TEST_BLOCK_5_PTR: BlockPtr = (
-        H256::from(hex!(
+        B256::from(hex!(
             "e8b3b02b936c4a4a331ac691ac9a86e197fb7731f14e3108602c87d4dac55160"
         )),
         5u64
@@ -133,7 +132,7 @@ where
     run_test_sequentially(|store| async move {
         let subgraph_store = store.subgraph_store();
         // Reset state before starting
-        remove_test_data(subgraph_store.clone());
+        remove_subgraphs().await;
 
         // Seed database with test data
         let deployment = insert_test_data(subgraph_store.clone()).await;
@@ -182,11 +181,12 @@ async fn insert_test_data(store: Arc<DieselSubgraphStore>) -> DeploymentLocator 
             NETWORK_NAME.to_string(),
             SubgraphVersionSwitchingMode::Instant,
         )
+        .await
         .unwrap();
 
     let test_entity_1 = create_test_entity(
         "1",
-        &*USER_TYPE,
+        &USER_TYPE,
         "Johnton",
         "tonofjohn@email.com",
         67_i32,
@@ -206,7 +206,7 @@ async fn insert_test_data(store: Arc<DieselSubgraphStore>) -> DeploymentLocator 
 
     let test_entity_2 = create_test_entity(
         "2",
-        &*USER_TYPE,
+        &USER_TYPE,
         "Cindini",
         "dinici@email.com",
         43_i32,
@@ -217,7 +217,7 @@ async fn insert_test_data(store: Arc<DieselSubgraphStore>) -> DeploymentLocator 
     );
     let test_entity_3_1 = create_test_entity(
         "3",
-        &*USER_TYPE,
+        &USER_TYPE,
         "Shaqueeena",
         "queensha@email.com",
         28_i32,
@@ -237,7 +237,7 @@ async fn insert_test_data(store: Arc<DieselSubgraphStore>) -> DeploymentLocator 
 
     let test_entity_3_2 = create_test_entity(
         "3",
-        &*USER_TYPE,
+        &USER_TYPE,
         "Shaqueeena",
         "teeko@email.com",
         28_i32,
@@ -290,16 +290,10 @@ fn create_test_entity(
     }
 }
 
-/// Removes test data from the database behind the store.
-fn remove_test_data(store: Arc<DieselSubgraphStore>) {
-    store
-        .delete_all_entities_for_test_use_only()
-        .expect("deleting test entities succeeds");
-}
-
-fn get_entity_count(store: Arc<DieselStore>, subgraph_id: &DeploymentHash) -> u64 {
+async fn get_entity_count(store: Arc<DieselStore>, subgraph_id: &DeploymentHash) -> u64 {
     let info = store
         .status(status::Filter::Deployments(vec![subgraph_id.to_string()]))
+        .await
         .unwrap();
     let info = info.first().unwrap();
     info.entity_count
@@ -311,9 +305,9 @@ fn delete_entity() {
         let entity_key = USER_TYPE.parse_key("3").unwrap();
 
         // Check that there is an entity to remove.
-        writable.get(&entity_key).unwrap().unwrap();
+        writable.get(&entity_key).await.unwrap().unwrap();
 
-        let count = get_entity_count(store.clone(), &deployment.hash);
+        let count = get_entity_count(store.clone(), &deployment.hash).await;
         transact_and_wait(
             &store.subgraph_store(),
             &deployment,
@@ -324,10 +318,13 @@ fn delete_entity() {
         )
         .await
         .unwrap();
-        assert_eq!(count, get_entity_count(store.clone(), &deployment.hash) + 1);
+        assert_eq!(
+            count,
+            get_entity_count(store.clone(), &deployment.hash).await + 1
+        );
 
         // Check that that the deleted entity id is not present
-        assert!(writable.get(&entity_key).unwrap().is_none());
+        assert!(writable.get(&entity_key).await.unwrap().is_none());
     })
 }
 
@@ -338,7 +335,7 @@ fn get_entity_1() {
         let schema = ReadStore::input_schema(&writable);
 
         let key = USER_TYPE.parse_key("1").unwrap();
-        let result = writable.get(&key).unwrap();
+        let result = writable.get(&key).await.unwrap();
 
         let bin_name = Value::Bytes("Johnton".as_bytes().into());
         let expected_entity = entity! { schema =>
@@ -365,7 +362,7 @@ fn get_entity_3() {
     run_test(|_, writable, _| async move {
         let schema = ReadStore::input_schema(&writable);
         let key = USER_TYPE.parse_key("3").unwrap();
-        let result = writable.get(&key).unwrap();
+        let result = writable.get(&key).await.unwrap();
 
         let expected_entity = entity! { schema =>
            id: "3",
@@ -391,7 +388,7 @@ fn insert_entity() {
         let entity_key = USER_TYPE.parse_key("7").unwrap();
         let test_entity = create_test_entity(
             "7",
-            &*USER_TYPE,
+            &USER_TYPE,
             "Wanjon",
             "wanawana@email.com",
             76_i32,
@@ -400,7 +397,7 @@ fn insert_entity() {
             Some("green"),
             5,
         );
-        let count = get_entity_count(store.clone(), &deployment.hash);
+        let count = get_entity_count(store.clone(), &deployment.hash).await;
         transact_and_wait(
             &store.subgraph_store(),
             &deployment,
@@ -409,10 +406,13 @@ fn insert_entity() {
         )
         .await
         .unwrap();
-        assert_eq!(count + 1, get_entity_count(store.clone(), &deployment.hash));
+        assert_eq!(
+            count + 1,
+            get_entity_count(store.clone(), &deployment.hash).await
+        );
 
         // Check that new record is in the store
-        writable.get(&entity_key).unwrap().unwrap();
+        writable.get(&entity_key).await.unwrap().unwrap();
     })
 }
 
@@ -423,7 +423,7 @@ fn update_existing() {
 
         let op = create_test_entity(
             "1",
-            &*USER_TYPE,
+            &USER_TYPE,
             "Wanjon",
             "wanawana@email.com",
             76_i32,
@@ -438,10 +438,10 @@ fn update_existing() {
         };
 
         // Verify that the entity before updating is different from what we expect afterwards
-        assert_ne!(writable.get(&entity_key).unwrap().unwrap(), new_data);
+        assert_ne!(writable.get(&entity_key).await.unwrap().unwrap(), new_data);
 
         // Set test entity; as the entity already exists an update should be performed
-        let count = get_entity_count(store.clone(), &deployment.hash);
+        let count = get_entity_count(store.clone(), &deployment.hash).await;
         transact_entity_operations(
             &store.subgraph_store(),
             &deployment,
@@ -450,7 +450,10 @@ fn update_existing() {
         )
         .await
         .unwrap();
-        assert_eq!(count, get_entity_count(store.clone(), &deployment.hash));
+        assert_eq!(
+            count,
+            get_entity_count(store.clone(), &deployment.hash).await
+        );
 
         // Verify that the entity in the store has changed to what we have set.
         let bin_name = match new_data.get("bin_name") {
@@ -459,7 +462,7 @@ fn update_existing() {
         };
 
         new_data.insert("bin_name", Value::Bytes(bin_name)).unwrap();
-        assert_eq!(writable.get(&entity_key).unwrap(), Some(new_data));
+        assert_eq!(writable.get(&entity_key).await.unwrap(), Some(new_data));
     })
 }
 
@@ -474,6 +477,7 @@ fn partially_update_existing() {
 
         let original_entity = writable
             .get(&entity_key)
+            .await
             .unwrap()
             .expect("entity not found");
 
@@ -493,6 +497,7 @@ fn partially_update_existing() {
         // Obtain the updated entity from the store
         let updated_entity = writable
             .get(&entity_key)
+            .await
             .unwrap()
             .expect("entity not found");
 
@@ -518,7 +523,7 @@ impl QueryChecker {
         Self { store }
     }
 
-    fn check(self, expected_entity_ids: Vec<&str>, query: EntityQuery) -> Self {
+    async fn check(self, expected_entity_ids: Vec<&str>, query: EntityQuery) -> Self {
         let expected_entity_ids: Vec<String> =
             expected_entity_ids.into_iter().map(str::to_owned).collect();
 
@@ -526,6 +531,7 @@ impl QueryChecker {
             .store
             .subgraph_store()
             .find(query)
+            .await
             .expect("store.find failed to execute query");
 
         let entity_ids: Vec<_> = entities
@@ -576,32 +582,38 @@ fn find() {
                 vec!["2"],
                 user_query().filter(EntityFilter::Contains("name".into(), "ind".into())),
             )
+            .await
             .check(
                 vec!["2"],
                 user_query().filter(EntityFilter::Equal("name".to_owned(), "Cindini".into())),
             )
+            .await
             .check(
                 vec!["1", "3"],
                 user_query()
                     .filter(EntityFilter::Not("name".to_owned(), "Cindini".into()))
                     .asc("name"),
             )
+            .await
             .check(
                 vec!["3"],
                 user_query().filter(EntityFilter::GreaterThan("name".to_owned(), "Kundi".into())),
             )
+            .await
             .check(
                 vec!["2", "1"],
                 user_query()
                     .filter(EntityFilter::LessThan("name".to_owned(), "Kundi".into()))
                     .asc("name"),
             )
+            .await
             .check(
                 vec!["1", "2"],
                 user_query()
                     .filter(EntityFilter::LessThan("name".to_owned(), "Kundi".into()))
                     .desc("name"),
             )
+            .await
             .check(
                 vec!["1"],
                 user_query()
@@ -610,6 +622,7 @@ fn find() {
                     .first(1)
                     .skip(1),
             )
+            .await
             .check(
                 vec!["2"],
                 user_query()
@@ -619,24 +632,28 @@ fn find() {
                     ]))
                     .desc("name"),
             )
+            .await
             .check(
                 vec!["2"],
                 user_query()
                     .filter(EntityFilter::EndsWith("name".to_owned(), "ini".into()))
                     .desc("name"),
             )
+            .await
             .check(
                 vec!["3", "1"],
                 user_query()
                     .filter(EntityFilter::NotEndsWith("name".to_owned(), "ini".into()))
                     .desc("name"),
             )
+            .await
             .check(
                 vec!["1"],
                 user_query()
                     .filter(EntityFilter::In("name".to_owned(), vec!["Johnton".into()]))
                     .desc("name"),
             )
+            .await
             .check(
                 vec!["1", "2"],
                 user_query()
@@ -645,7 +662,8 @@ fn find() {
                         vec!["Shaqueeena".into()],
                     ))
                     .desc("name"),
-            );
+            )
+            .await;
 
         // Filter tests with float attributes
         QueryChecker::new(store.clone())
@@ -656,6 +674,7 @@ fn find() {
                     Value::BigDecimal(184.4.into()),
                 )),
             )
+            .await
             .check(
                 vec!["3", "2"],
                 user_query()
@@ -665,6 +684,7 @@ fn find() {
                     ))
                     .desc("name"),
             )
+            .await
             .check(
                 vec!["1"],
                 user_query().filter(EntityFilter::GreaterThan(
@@ -672,6 +692,7 @@ fn find() {
                     Value::BigDecimal(160.0.into()),
                 )),
             )
+            .await
             .check(
                 vec!["2", "3"],
                 user_query()
@@ -681,6 +702,7 @@ fn find() {
                     ))
                     .asc("name"),
             )
+            .await
             .check(
                 vec!["3", "2"],
                 user_query()
@@ -690,6 +712,7 @@ fn find() {
                     ))
                     .desc("name"),
             )
+            .await
             .check(
                 vec!["2"],
                 user_query()
@@ -701,6 +724,7 @@ fn find() {
                     .first(1)
                     .skip(1),
             )
+            .await
             .check(
                 vec!["3", "1"],
                 user_query()
@@ -714,6 +738,7 @@ fn find() {
                     .desc("name")
                     .first(5),
             )
+            .await
             .check(
                 vec!["2"],
                 user_query()
@@ -726,7 +751,8 @@ fn find() {
                     ))
                     .desc("name")
                     .first(5),
-            );
+            )
+            .await;
         // Filter tests with int attributes
         QueryChecker::new(store.clone())
             .check(
@@ -735,12 +761,14 @@ fn find() {
                     .filter(EntityFilter::Equal("age".to_owned(), Value::Int(67_i32)))
                     .desc("name"),
             )
+            .await
             .check(
                 vec!["3", "2"],
                 user_query()
                     .filter(EntityFilter::Not("age".to_owned(), Value::Int(67_i32)))
                     .desc("name"),
             )
+            .await
             .check(
                 vec!["1"],
                 user_query().filter(EntityFilter::GreaterThan(
@@ -748,6 +776,7 @@ fn find() {
                     Value::Int(43_i32),
                 )),
             )
+            .await
             .check(
                 vec!["2", "1"],
                 user_query()
@@ -757,12 +786,14 @@ fn find() {
                     ))
                     .asc("name"),
             )
+            .await
             .check(
                 vec!["2", "3"],
                 user_query()
                     .filter(EntityFilter::LessThan("age".to_owned(), Value::Int(50_i32)))
                     .asc("name"),
             )
+            .await
             .check(
                 vec!["2", "3"],
                 user_query()
@@ -772,12 +803,14 @@ fn find() {
                     ))
                     .asc("name"),
             )
+            .await
             .check(
                 vec!["3", "2"],
                 user_query()
                     .filter(EntityFilter::LessThan("age".to_owned(), Value::Int(50_i32)))
                     .desc("name"),
             )
+            .await
             .check(
                 vec!["2"],
                 user_query()
@@ -786,6 +819,7 @@ fn find() {
                     .first(1)
                     .skip(1),
             )
+            .await
             .check(
                 vec!["1", "2"],
                 user_query()
@@ -796,6 +830,7 @@ fn find() {
                     .desc("name")
                     .first(5),
             )
+            .await
             .check(
                 vec!["3"],
                 user_query()
@@ -805,7 +840,8 @@ fn find() {
                     ))
                     .desc("name")
                     .first(5),
-            );
+            )
+            .await;
         // Filter tests with bool attributes
         QueryChecker::new(store.clone())
             .check(
@@ -814,12 +850,14 @@ fn find() {
                     .filter(EntityFilter::Equal("coffee".to_owned(), Value::Bool(true)))
                     .desc("name"),
             )
+            .await
             .check(
                 vec!["1", "3"],
                 user_query()
                     .filter(EntityFilter::Not("coffee".to_owned(), Value::Bool(true)))
                     .asc("name"),
             )
+            .await
             .check(
                 vec!["2"],
                 user_query()
@@ -830,6 +868,7 @@ fn find() {
                     .desc("name")
                     .first(5),
             )
+            .await
             .check(
                 vec!["3", "1"],
                 user_query()
@@ -839,7 +878,8 @@ fn find() {
                     ))
                     .desc("name")
                     .first(5),
-            );
+            )
+            .await;
         // Misc filter tests
         QueryChecker::new(store)
             .check(
@@ -851,6 +891,7 @@ fn find() {
                     ))
                     .desc("name"),
             )
+            .await
             .check(
                 vec!["3", "1"],
                 user_query()
@@ -860,6 +901,7 @@ fn find() {
                     ))
                     .desc("name"),
             )
+            .await
             .check(
                 vec!["3", "1"],
                 user_query()
@@ -869,12 +911,14 @@ fn find() {
                     ))
                     .desc("name"),
             )
+            .await
             .check(
                 vec!["2"],
                 user_query()
                     .filter(EntityFilter::Not("favorite_color".to_owned(), Value::Null))
                     .desc("name"),
             )
+            .await
             .check(
                 vec!["2"],
                 user_query()
@@ -884,14 +928,23 @@ fn find() {
                     ))
                     .desc("name"),
             )
+            .await
             .check(vec!["3", "2", "1"], user_query().asc("weight"))
+            .await
             .check(vec!["1", "2", "3"], user_query().desc("weight"))
+            .await
             .check(vec!["1", "2", "3"], user_query().asc("id"))
+            .await
             .check(vec!["3", "2", "1"], user_query().desc("id"))
+            .await
             .check(vec!["3", "2", "1"], user_query().asc("age"))
+            .await
             .check(vec!["1", "2", "3"], user_query().desc("age"))
+            .await
             .check(vec!["2", "1", "3"], user_query().asc("name"))
+            .await
             .check(vec!["3", "1", "2"], user_query().desc("name"))
+            .await
             .check(
                 vec!["1", "2"],
                 user_query()
@@ -900,7 +953,8 @@ fn find() {
                         EntityFilter::Equal("id".to_owned(), Value::from("2")),
                     ])]))
                     .asc("id"),
-            );
+            )
+            .await;
     });
 }
 
@@ -921,6 +975,7 @@ async fn check_basic_revert(store: Arc<DieselStore>, deployment: &DeploymentLoca
     let returned_entities = store
         .subgraph_store()
         .find(this_query.clone())
+        .await
         .expect("store.find operation failed");
 
     // There should be 1 user returned in results
@@ -939,9 +994,12 @@ async fn check_basic_revert(store: Arc<DieselStore>, deployment: &DeploymentLoca
 #[test]
 fn revert_block_basic_user() {
     run_test(|store, _, deployment| async move {
-        let count = get_entity_count(store.clone(), &deployment.hash);
+        let count = get_entity_count(store.clone(), &deployment.hash).await;
         check_basic_revert(store.clone(), &deployment).await;
-        assert_eq!(count, get_entity_count(store.clone(), &deployment.hash));
+        assert_eq!(
+            count,
+            get_entity_count(store.clone(), &deployment.hash).await
+        );
     })
 }
 
@@ -969,14 +1027,18 @@ fn revert_block_with_delete() {
         .unwrap();
 
         // Revert deletion
-        let count = get_entity_count(store.clone(), &deployment.hash);
+        let count = get_entity_count(store.clone(), &deployment.hash).await;
         revert_block(&store, &deployment, &TEST_BLOCK_2_PTR).await;
-        assert_eq!(count + 1, get_entity_count(store.clone(), &deployment.hash));
+        assert_eq!(
+            count + 1,
+            get_entity_count(store.clone(), &deployment.hash).await
+        );
 
         // Query after revert
         let returned_entities = store
             .subgraph_store()
             .find(this_query.clone())
+            .await
             .expect("store.find operation failed");
 
         // There should be 1 entity returned in results
@@ -999,7 +1061,11 @@ fn revert_block_with_partial_update() {
         let partial_entity =
             entity! { schema => id: "1", name: "Johnny Boy", email: Value::Null, vid: 5i64 };
 
-        let original_entity = writable.get(&entity_key).unwrap().expect("missing entity");
+        let original_entity = writable
+            .get(&entity_key)
+            .await
+            .unwrap()
+            .expect("missing entity");
 
         // Set test entity; as the entity already exists an update should be performed
         transact_entity_operations(
@@ -1015,12 +1081,19 @@ fn revert_block_with_partial_update() {
         .unwrap();
 
         // Perform revert operation, reversing the partial update
-        let count = get_entity_count(store.clone(), &deployment.hash);
+        let count = get_entity_count(store.clone(), &deployment.hash).await;
         revert_block(&store, &deployment, &TEST_BLOCK_2_PTR).await;
-        assert_eq!(count, get_entity_count(store.clone(), &deployment.hash));
+        assert_eq!(
+            count,
+            get_entity_count(store.clone(), &deployment.hash).await
+        );
 
         // Obtain the reverted entity from the store
-        let reverted_entity = writable.get(&entity_key).unwrap().expect("missing entity");
+        let reverted_entity = writable
+            .get(&entity_key)
+            .await
+            .unwrap()
+            .expect("missing entity");
 
         // Verify that the entity has been returned to its original state
         assert_eq!(reverted_entity, original_entity);
@@ -1059,19 +1132,18 @@ fn mock_data_source() -> graph_chain_ethereum::DataSource {
 fn mock_abi() -> MappingABI {
     MappingABI {
         name: "mock_abi".to_string(),
-        contract: Contract::load(
+        contract: serde_json::from_str(
             r#"[
-            {
-                "inputs": [
-                    {
-                        "name": "a",
-                        "type": "address"
-                    }
-                ],
-                "type": "constructor"
-            }
-        ]"#
-            .as_bytes(),
+                {
+                    "inputs": [
+                        {
+                            "name": "a",
+                            "type": "address"
+                        }
+                    ],
+                    "type": "constructor"
+                }
+            ]"#,
         )
         .unwrap(),
     }
@@ -1089,7 +1161,11 @@ fn revert_block_with_dynamic_data_source_operations() {
             entity! { schema => id: "1", name: "Johnny Boy", email: Value::Null, vid: 5i64 };
 
         // Get the original user for comparisons
-        let original_user = writable.get(&user_key).unwrap().expect("missing entity");
+        let original_user = writable
+            .get(&user_key)
+            .await
+            .unwrap()
+            .expect("missing entity");
 
         // Create operations to add a dynamic data source
         let mut data_source = mock_data_source();
@@ -1115,7 +1191,11 @@ fn revert_block_with_dynamic_data_source_operations() {
 
         // Verify that the user is no longer the original
         assert_ne!(
-            writable.get(&user_key).unwrap().expect("missing entity"),
+            writable
+                .get(&user_key)
+                .await
+                .unwrap()
+                .expect("missing entity"),
             original_user
         );
 
@@ -1135,7 +1215,11 @@ fn revert_block_with_dynamic_data_source_operations() {
 
         // Verify that the user is the original again
         assert_eq!(
-            writable.get(&user_key).unwrap().expect("missing entity"),
+            writable
+                .get(&user_key)
+                .await
+                .unwrap()
+                .expect("missing entity"),
             original_user
         );
 
@@ -1154,6 +1238,7 @@ fn subgraph_schema_types_have_subgraph_id_directive() {
         let schema = store
             .subgraph_store()
             .api_schema(&deployment.hash, &Default::default())
+            .await
             .expect("test subgraph should have a schema");
         for typedef in schema
             .definitions()
@@ -1231,7 +1316,7 @@ fn handle_large_string_with_index() {
         writable
             .transact_block_operations(
                 TEST_BLOCK_3_PTR.clone(),
-                BlockTime::for_test(&*TEST_BLOCK_3_PTR),
+                BlockTime::for_test(&TEST_BLOCK_3_PTR),
                 FirehoseCursor::None,
                 vec![
                     make_insert_op(ONE, &long_text, &schema, block, 11),
@@ -1260,6 +1345,7 @@ fn handle_large_string_with_index() {
         let ids: Vec<_> = store
             .subgraph_store()
             .find(query)
+            .await
             .expect("Could not find entity")
             .iter()
             .map(|e| e.id())
@@ -1278,6 +1364,7 @@ fn handle_large_string_with_index() {
         let ids: Vec<_> = store
             .subgraph_store()
             .find(query)
+            .await
             .expect("Could not find entity")
             .iter()
             .map(|e| e.id())
@@ -1337,7 +1424,7 @@ fn handle_large_bytea_with_index() {
         writable
             .transact_block_operations(
                 TEST_BLOCK_3_PTR.clone(),
-                BlockTime::for_test(&*TEST_BLOCK_3_PTR),
+                BlockTime::for_test(&TEST_BLOCK_3_PTR),
                 FirehoseCursor::None,
                 vec![
                     make_insert_op(ONE, &long_bytea, &schema, block, 10),
@@ -1365,6 +1452,7 @@ fn handle_large_bytea_with_index() {
         let ids: Vec<_> = store
             .subgraph_store()
             .find(query)
+            .await
             .expect("Could not find entity")
             .iter()
             .map(|e| e.id())
@@ -1383,6 +1471,7 @@ fn handle_large_bytea_with_index() {
         let ids: Vec<_> = store
             .subgraph_store()
             .find(query)
+            .await
             .expect("Could not find entity")
             .iter()
             .map(|e| e.id())
@@ -1480,12 +1569,13 @@ impl WindowQuery {
         WindowQuery(query, self.1).default_window()
     }
 
-    fn expect(&self, mut expected_ids: Vec<&str>, qid: &str) {
+    async fn expect(&self, mut expected_ids: Vec<&str>, qid: &str) {
         let query = self.0.clone();
         let store = &self.1;
         let unordered = matches!(query.order, EntityOrder::Unordered);
         let mut entity_ids = store
             .find(query)
+            .await
             .expect("store.find failed to execute query")
             .into_iter()
             .map(|entity| match entity.get("id") {
@@ -1521,11 +1611,11 @@ fn window() {
     }
 
     fn make_user(id: &str, color: &str, age: i32, vid: i64) -> EntityOperation {
-        make_color_and_age(&*USER_TYPE, id, color, age, vid)
+        make_color_and_age(&USER_TYPE, id, color, age, vid)
     }
 
     fn make_person(id: &str, color: &str, age: i32, vid: i64) -> EntityOperation {
-        make_color_and_age(&*PERSON_TYPE, id, color, age, vid)
+        make_color_and_age(&PERSON_TYPE, id, color, age, vid)
     }
 
     let ops = vec![
@@ -1554,35 +1644,41 @@ fn window() {
         // Get the first 2 entries in each 'color group'
         WindowQuery::new(&store)
             .first(2)
-            .expect(vec!["10", "11", "4", "5", "2", "7", "9"], "q1");
+            .expect(vec!["10", "11", "4", "5", "2", "7", "9"], "q1")
+            .await;
 
         WindowQuery::new(&store)
             .first(1)
-            .expect(vec!["10", "4", "2", "9"], "q2");
+            .expect(vec!["10", "4", "2", "9"], "q2")
+            .await;
 
         WindowQuery::new(&store)
             .first(1)
             .skip(1)
-            .expect(vec!["11", "5", "7"], "q3");
+            .expect(vec!["11", "5", "7"], "q3")
+            .await;
 
         WindowQuery::new(&store)
             .first(1)
             .skip(1)
             .desc("id")
-            .expect(vec!["10", "5", "7"], "q4");
+            .expect(vec!["10", "5", "7"], "q4")
+            .await;
 
         WindowQuery::new(&store)
             .first(1)
             .skip(1)
             .desc("favorite_color")
-            .expect(vec!["10", "5", "7"], "q5");
+            .expect(vec!["10", "5", "7"], "q5")
+            .await;
 
         WindowQuery::new(&store)
             .first(1)
             .skip(1)
             .desc("favorite_color")
             .above(25)
-            .expect(vec!["4", "2"], "q6");
+            .expect(vec!["4", "2"], "q6")
+            .await;
 
         // Check queries for interfaces
         WindowQuery::new(&store)
@@ -1591,14 +1687,16 @@ fn window() {
             .desc("favorite_color")
             .above(12)
             .against_color_and_age()
-            .expect(vec!["10", "5", "8"], "q7");
+            .expect(vec!["10", "5", "8"], "q7")
+            .await;
 
         WindowQuery::new(&store)
             .first(1)
             .asc("age")
             .above(12)
             .against_color_and_age()
-            .expect(vec!["11", "5", "p2", "9"], "q8");
+            .expect(vec!["11", "5", "p2", "9"], "q8")
+            .await;
 
         WindowQuery::new(&store)
             .unordered()
@@ -1607,7 +1705,8 @@ fn window() {
             .expect(
                 vec!["10", "11", "2", "4", "5", "6", "7", "8", "9", "p2"],
                 "q9",
-            );
+            )
+            .await;
     });
 }
 
@@ -1623,6 +1722,7 @@ fn find_at_block() {
             let entities = store
                 .subgraph_store()
                 .find(query)
+                .await
                 .expect("store.find failed to execute query");
 
             assert_eq!(1, entities.len());
@@ -1658,9 +1758,11 @@ fn cleanup_cached_blocks() {
         let chain_store = store
             .block_store()
             .chain_store(NETWORK_NAME)
+            .await
             .expect("fake chain store");
         let cleaned = chain_store
             .cleanup_cached_blocks(10)
+            .await
             .expect("cleanup succeeds");
         assert_eq!(Some((2, 1)), cleaned);
     })
@@ -1690,6 +1792,7 @@ fn parse_timestamp() {
         let chain_store = store
             .block_store()
             .chain_store(NETWORK_NAME)
+            .await
             .expect("fake chain store");
 
         let (_network, number, timestamp, _) = chain_store
@@ -1724,6 +1827,7 @@ fn parse_timestamp_firehose() {
         let chain_store = store
             .block_store()
             .chain_store(NETWORK_NAME)
+            .await
             .expect("fake chain store");
 
         let (_network, number, timestamp, _) = chain_store
@@ -1758,6 +1862,7 @@ fn parse_null_timestamp() {
         let chain_store = store
             .block_store()
             .chain_store(NETWORK_NAME)
+            .await
             .expect("fake chain store");
 
         let (_network, number, timestamp, _) = chain_store
@@ -1766,7 +1871,7 @@ fn parse_null_timestamp() {
             .expect("block_number to return correct number and timestamp")
             .unwrap();
         assert_eq!(number, 3);
-        assert_eq!(true, timestamp.is_none());
+        assert!(timestamp.is_none());
     })
 }
 #[test]
@@ -1780,7 +1885,7 @@ fn reorg_tracking() {
     ) {
         let test_entity_1 = create_test_entity(
             "1",
-            &*USER_TYPE,
+            &USER_TYPE,
             "Johnton",
             "tonofjohn@email.com",
             age,

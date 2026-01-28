@@ -15,6 +15,7 @@ use graph::hyper::header::{
 };
 use graph::hyper::{body::Body, Method, Request, Response, StatusCode};
 
+use graph::amp;
 use graph::components::{server::query::ServerError, store::Store};
 use graph::data::query::{Query, QueryError, QueryResult, QueryResults};
 use graph::prelude::{q, serde_json};
@@ -39,23 +40,26 @@ impl GraphQLMetrics for NoopGraphQLMetrics {
 
 /// A Hyper Service that serves GraphQL over a POST / endpoint.
 #[derive(Debug)]
-pub struct IndexNodeService<S> {
+pub struct IndexNodeService<S, AC> {
     logger: Logger,
     blockchain_map: Arc<BlockchainMap>,
     store: Arc<S>,
     explorer: Arc<Explorer<S>>,
     link_resolver: Arc<dyn LinkResolver>,
+    amp_client: Option<Arc<AC>>,
 }
 
-impl<S> IndexNodeService<S>
+impl<S, AC> IndexNodeService<S, AC>
 where
     S: Store,
+    AC: amp::Client + Send + Sync + 'static,
 {
     pub fn new(
         logger: Logger,
         blockchain_map: Arc<BlockchainMap>,
         store: Arc<S>,
         link_resolver: Arc<dyn LinkResolver>,
+        amp_client: Option<Arc<AC>>,
     ) -> Self {
         let explorer = Arc::new(Explorer::new(store.clone()));
 
@@ -65,6 +69,7 @@ where
             store,
             explorer,
             link_resolver,
+            amp_client,
         }
     }
 
@@ -138,14 +143,15 @@ where
                 &logger,
                 store,
                 self.link_resolver.clone(),
+                self.amp_client.cheap_clone(),
                 validated.bearer_token,
                 self.blockchain_map.clone(),
             );
             let options = QueryExecutionOptions {
                 resolver,
                 deadline: None,
-                max_first: std::u32::MAX,
-                max_skip: std::u32::MAX,
+                max_first: u32::MAX,
+                max_skip: u32::MAX,
                 trace: false,
             };
             let (result, _) = execute_query(query_clone.cheap_clone(), None, None, options).await;
@@ -229,7 +235,9 @@ where
             }
             (Method::OPTIONS, ["graphql"]) => Ok(Self::handle_graphql_options(req)),
 
-            (Method::GET, ["explorer", rest @ ..]) => self.explorer.handle(&self.logger, rest),
+            (Method::GET, ["explorer", rest @ ..]) => {
+                self.explorer.handle(&self.logger, rest).await
+            }
 
             _ => Ok(Self::handle_not_found()),
         }
@@ -424,19 +432,16 @@ mod tests {
         let query = request.expect("Should accept valid queries");
 
         let expected_query = q::parse_query("{ user { name } }").unwrap().into_static();
-        let expected_variables = QueryVariables::new(HashMap::from_iter(
-            vec![
-                (String::from("string"), r::Value::String(String::from("s"))),
-                (
-                    String::from("map"),
-                    r::Value::Object(Object::from_iter(
-                        vec![(Word::from("k"), r::Value::String(String::from("v")))].into_iter(),
-                    )),
-                ),
-                (String::from("int"), r::Value::Int(5)),
-            ]
-            .into_iter(),
-        ));
+        let expected_variables = QueryVariables::new(HashMap::from_iter(vec![
+            (String::from("string"), r::Value::String(String::from("s"))),
+            (
+                String::from("map"),
+                r::Value::Object(Object::from_iter(
+                    vec![(Word::from("k"), r::Value::String(String::from("v")))].into_iter(),
+                )),
+            ),
+            (String::from("int"), r::Value::Int(5)),
+        ]));
 
         assert_eq!(query.document, expected_query);
         assert_eq!(query.variables, Some(expected_variables));

@@ -1,13 +1,15 @@
 use std::collections::BTreeMap;
-use std::convert::TryInto;
 
+use async_trait::async_trait;
 use graph::data::query::Trace;
 use graph::data::store::Id;
+use graph::prelude::alloy::primitives::Address;
 use graph::schema::EntityType;
-use web3::types::Address;
 
 use git_testament::{git_testament, CommitKind};
+use graph::amp;
 use graph::blockchain::{Blockchain, BlockchainKind, BlockchainMap};
+use graph::components::link_resolver::LinkResolverContext;
 use graph::components::store::{BlockPtrForNumber, BlockStore, QueryPermit, Store};
 use graph::components::versions::VERSIONS;
 use graph::data::graphql::{object, IntoValue, ObjectOrInterface, ValueMap};
@@ -94,19 +96,25 @@ impl IntoValue for PublicProofOfIndexingResult {
 
 /// Resolver for the index node GraphQL API.
 #[derive(Clone)]
-pub struct IndexNodeResolver<S: Store> {
+pub struct IndexNodeResolver<S: Store, AC> {
     logger: Logger,
     blockchain_map: Arc<BlockchainMap>,
     store: Arc<S>,
     link_resolver: Arc<dyn LinkResolver>,
+    amp_client: Option<Arc<AC>>,
     bearer_token: Option<String>,
 }
 
-impl<S: Store> IndexNodeResolver<S> {
+impl<S, AC> IndexNodeResolver<S, AC>
+where
+    S: Store,
+    AC: amp::Client + Send + Sync + 'static,
+{
     pub fn new(
         logger: &Logger,
         store: Arc<S>,
         link_resolver: Arc<dyn LinkResolver>,
+        amp_client: Option<Arc<AC>>,
         bearer_token: Option<String>,
         blockchain_map: Arc<BlockchainMap>,
     ) -> Self {
@@ -117,11 +125,15 @@ impl<S: Store> IndexNodeResolver<S> {
             blockchain_map,
             store,
             link_resolver,
+            amp_client,
             bearer_token,
         }
     }
 
-    fn resolve_indexing_statuses(&self, field: &a::Field) -> Result<r::Value, QueryExecutionError> {
+    async fn resolve_indexing_statuses(
+        &self,
+        field: &a::Field,
+    ) -> Result<r::Value, QueryExecutionError> {
         let deployments = field
             .argument_value("subgraphs")
             .map(|value| match value {
@@ -134,15 +146,16 @@ impl<S: Store> IndexNodeResolver<S> {
                     .collect(),
                 _ => unreachable!(),
             })
-            .unwrap_or_else(Vec::new);
+            .unwrap_or_default();
 
         let infos = self
             .store
-            .status(status::Filter::Deployments(deployments))?;
+            .status(status::Filter::Deployments(deployments))
+            .await?;
         Ok(infos.into_value())
     }
 
-    fn resolve_indexing_statuses_for_subgraph_name(
+    async fn resolve_indexing_statuses_for_subgraph_name(
         &self,
         field: &a::Field,
     ) -> Result<r::Value, QueryExecutionError> {
@@ -161,12 +174,13 @@ impl<S: Store> IndexNodeResolver<S> {
 
         let infos = self
             .store
-            .status(status::Filter::SubgraphName(subgraph_name))?;
+            .status(status::Filter::SubgraphName(subgraph_name))
+            .await?;
 
         Ok(infos.into_value())
     }
 
-    fn resolve_entity_changes_in_block(
+    async fn resolve_entity_changes_in_block(
         &self,
         field: &a::Field,
     ) -> Result<r::Value, QueryExecutionError> {
@@ -181,7 +195,8 @@ impl<S: Store> IndexNodeResolver<S> {
         let entity_changes = self
             .store
             .subgraph_store()
-            .entity_changes_in_block(&subgraph_id, block_number)?;
+            .entity_changes_in_block(&subgraph_id, block_number)
+            .await?;
 
         Ok(entity_changes_to_graphql(entity_changes))
     }
@@ -195,7 +210,7 @@ impl<S: Store> IndexNodeResolver<S> {
             .get_required::<BlockHash>("blockHash")
             .expect("Valid blockHash required");
 
-        let chain_store = if let Some(cs) = self.store.block_store().chain_store(&network) {
+        let chain_store = if let Some(cs) = self.store.block_store().chain_store(&network).await {
             cs
         } else {
             error!(
@@ -304,7 +319,7 @@ impl<S: Store> IndexNodeResolver<S> {
         };
         let block_ptr = BlockPtr::new(block_hash.cheap_clone(), block_number);
 
-        let calls = match call_cache.get_calls_in_block(block_ptr) {
+        let calls = match call_cache.get_calls_in_block(block_ptr).await {
             Ok(c) => c,
             Err(e) => {
                 error!(
@@ -344,9 +359,7 @@ impl<S: Store> IndexNodeResolver<S> {
 
         let block_number: i32 = field
             .get_required::<i32>("blockNumber")
-            .expect("Valid blockNumber required")
-            .try_into()
-            .unwrap();
+            .expect("Valid blockNumber required");
 
         let block_hash = field
             .get_required::<BlockHash>("blockHash")
@@ -362,7 +375,7 @@ impl<S: Store> IndexNodeResolver<S> {
         if !poi_protection.validate_access_token(self.bearer_token.as_deref()) {
             // Let's sign the POI with a zero'd address when the access token is
             // invalid.
-            indexer = Some(Address::zero());
+            indexer = Some(Address::ZERO);
         }
 
         let poi_fut = self
@@ -438,7 +451,7 @@ impl<S: Store> IndexNodeResolver<S> {
         Ok(r::Value::List(public_poi_results))
     }
 
-    fn resolve_indexing_status_for_version(
+    async fn resolve_indexing_status_for_version(
         &self,
         field: &a::Field,
 
@@ -455,10 +468,13 @@ impl<S: Store> IndexNodeResolver<S> {
             "current_version" => current_version,
         );
 
-        let infos = self.store.status(status::Filter::SubgraphVersion(
-            subgraph_name,
-            current_version,
-        ))?;
+        let infos = self
+            .store
+            .status(status::Filter::SubgraphVersion(
+                subgraph_name,
+                current_version,
+            ))
+            .await?;
 
         Ok(infos
             .into_iter()
@@ -491,7 +507,10 @@ impl<S: Store> IndexNodeResolver<S> {
         let raw_yaml: serde_yaml::Mapping = {
             let file_bytes = self
                 .link_resolver
-                .cat(&self.logger, &deployment_hash.to_ipfs_link())
+                .cat(
+                    &LinkResolverContext::new(deployment_hash, &self.logger),
+                    &deployment_hash.to_ipfs_link(),
+                )
                 .await
                 .map_err(SubgraphManifestResolveError::ResolveError)?;
 
@@ -510,6 +529,7 @@ impl<S: Store> IndexNodeResolver<S> {
                         deployment_hash.clone(),
                         raw_yaml,
                         &self.link_resolver,
+                        self.amp_client.cheap_clone(),
                         &self.logger,
                         max_spec_version,
                     )
@@ -527,23 +547,7 @@ impl<S: Store> IndexNodeResolver<S> {
                         deployment_hash.clone(),
                         raw_yaml,
                         &self.link_resolver,
-                        &self.logger,
-                        max_spec_version,
-                    )
-                    .await?;
-
-                Self::validate_and_extract_features(
-                    &self.store.subgraph_store(),
-                    unvalidated_subgraph_manifest,
-                )
-                .await?
-            }
-            BlockchainKind::Substreams => {
-                let unvalidated_subgraph_manifest =
-                    UnvalidatedSubgraphManifest::<graph_chain_substreams::Chain>::resolve(
-                        deployment_hash.clone(),
-                        raw_yaml,
-                        &self.link_resolver,
+                        self.amp_client.cheap_clone(),
                         &self.logger,
                         max_spec_version,
                     )
@@ -669,7 +673,7 @@ impl<S: Store> IndexNodeResolver<S> {
         // type.
         match BlockchainKind::Ethereum {
             // Note: we don't actually care about substreams here.
-            BlockchainKind::Substreams | BlockchainKind::Ethereum | BlockchainKind::Near => (),
+            BlockchainKind::Ethereum | BlockchainKind::Near => (),
         }
 
         // The given network does not exist.
@@ -678,7 +682,11 @@ impl<S: Store> IndexNodeResolver<S> {
 }
 
 #[async_trait]
-impl<S: Store> BlockPtrForNumber for IndexNodeResolver<S> {
+impl<S, AC> BlockPtrForNumber for IndexNodeResolver<S, AC>
+where
+    S: Store,
+    AC: amp::Client + Send + Sync + 'static,
+{
     async fn block_ptr_for_number(
         &self,
         network: String,
@@ -727,7 +735,7 @@ fn entity_changes_to_graphql(entity_changes: Vec<EntityOperation>) -> r::Value {
                         r::Value::object(
                             e.sorted()
                                 .into_iter()
-                                .map(|(name, value)| (name.into(), value.into()))
+                                .map(|(name, value)| (name, value.into()))
                                 .collect(),
                         )
                     })
@@ -751,14 +759,18 @@ fn entity_changes_to_graphql(entity_changes: Vec<EntityOperation>) -> r::Value {
 }
 
 #[async_trait]
-impl<S: Store> Resolver for IndexNodeResolver<S> {
+impl<S, AC> Resolver for IndexNodeResolver<S, AC>
+where
+    S: Store,
+    AC: amp::Client + Send + Sync + 'static,
+{
     const CACHEABLE: bool = false;
 
     async fn query_permit(&self) -> QueryPermit {
         self.store.query_permit().await
     }
 
-    fn prefetch(
+    async fn prefetch(
         &self,
         _: &ExecutionContext<Self>,
         _: &a::SelectionSet,
@@ -803,10 +815,11 @@ impl<S: Store> Resolver for IndexNodeResolver<S> {
         // Resolves the `field.name` top-level field.
         match (prefetched_objects, object_type.name(), field.name.as_str()) {
             (None, "SubgraphIndexingStatus", "indexingStatuses") => {
-                self.resolve_indexing_statuses(field)
+                self.resolve_indexing_statuses(field).await
             }
             (None, "SubgraphIndexingStatus", "indexingStatusesForSubgraphName") => {
                 self.resolve_indexing_statuses_for_subgraph_name(field)
+                    .await
             }
             (None, "CachedEthereumCall", "cachedEthereumCalls") => {
                 self.resolve_cached_ethereum_calls(field).await
@@ -832,13 +845,13 @@ impl<S: Store> Resolver for IndexNodeResolver<S> {
         // Resolves the `field.name` top-level field.
         match (prefetched_object, field.name.as_str()) {
             (None, "indexingStatusForCurrentVersion") => {
-                self.resolve_indexing_status_for_version(field, true)
+                self.resolve_indexing_status_for_version(field, true).await
             }
             (None, "indexingStatusForPendingVersion") => {
-                self.resolve_indexing_status_for_version(field, false)
+                self.resolve_indexing_status_for_version(field, false).await
             }
             (None, "subgraphFeatures") => self.resolve_subgraph_features(field).await,
-            (None, "entityChangesInBlock") => self.resolve_entity_changes_in_block(field),
+            (None, "entityChangesInBlock") => self.resolve_entity_changes_in_block(field).await,
             // The top-level `subgraphVersions` field
             (None, "apiVersions") => self.resolve_api_versions(field),
             (None, "version") => self.version(),

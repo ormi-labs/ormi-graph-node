@@ -6,13 +6,15 @@ use graph::data::subgraph::API_VERSION_0_0_8;
 use graph::data::value::Word;
 
 use graph::futures03::stream::StreamExt;
+use graph::prelude::alloy::primitives::Address;
 use graph::schema::EntityType;
 use never::Never;
 use semver::Version;
-use web3::types::H160;
 
+use graph::abi;
 use graph::blockchain::BlockTime;
 use graph::blockchain::Blockchain;
+use graph::components::link_resolver::LinkResolverContext;
 use graph::components::store::{EnsLookup, GetScope, LoadRelatedRequest};
 use graph::components::subgraph::{
     InstanceDSTemplate, PoICausalityRegion, ProofOfIndexingEvent, SharedProofOfIndexing,
@@ -20,8 +22,6 @@ use graph::components::subgraph::{
 use graph::data::store::{self};
 use graph::data_source::{CausalityRegion, DataSource, EntityTypeAccess};
 use graph::ensure;
-use graph::prelude::ethabi::param_type::Reader;
-use graph::prelude::ethabi::{decode, encode, Token};
 use graph::prelude::serde_json;
 use graph::prelude::{slog::b, slog::record_static, *};
 use graph::runtime::gas::{self, complexity, Gas, GasCounter};
@@ -174,7 +174,7 @@ impl HostExports {
                 !state
                     .entity_cache
                     .schema
-                    .has_field_with_name(entity_type, &field_name)
+                    .has_field_with_name(entity_type, field_name)
             });
 
             if has_invalid_fields {
@@ -184,7 +184,7 @@ impl HostExports {
                         if !state
                             .entity_cache
                             .schema
-                            .has_field_with_name(entity_type, &field_name)
+                            .has_field_with_name(entity_type, field_name)
                         {
                             Some(field_name.clone())
                         } else {
@@ -221,7 +221,7 @@ impl HostExports {
         )))
     }
 
-    pub(crate) fn store_set(
+    pub(crate) async fn store_set(
         &self,
         logger: &Logger,
         block: BlockNumber,
@@ -325,7 +325,7 @@ impl HostExports {
         let poi_section = stopwatch.start_section("host_export_store_set__proof_of_indexing");
         proof_of_indexing.write_event(
             &ProofOfIndexingEvent::SetEntity {
-                entity_type: &key.entity_type.typename(),
+                entity_type: key.entity_type.typename(),
                 id: &key.entity_id.to_string(),
                 data: &entity,
             },
@@ -336,12 +336,15 @@ impl HostExports {
 
         state.metrics.track_entity_write(&entity_type, &entity);
 
-        state.entity_cache.set(
-            key,
-            entity,
-            block,
-            Some(&mut state.write_capacity_remaining),
-        )?;
+        state
+            .entity_cache
+            .set(
+                key,
+                entity,
+                block,
+                Some(&mut state.write_capacity_remaining),
+            )
+            .await?;
 
         Ok(())
     }
@@ -381,9 +384,9 @@ impl HostExports {
         Ok(())
     }
 
-    pub(crate) fn store_get<'a>(
+    pub(crate) async fn store_get(
         &self,
-        state: &'a mut BlockState,
+        state: &mut BlockState,
         entity_type: String,
         entity_id: String,
         gas: &GasCounter,
@@ -395,7 +398,7 @@ impl HostExports {
         let store_key = entity_type.parse_key_in(entity_id, self.data_source.causality_region)?;
         self.check_entity_type_access(&store_key.entity_type)?;
 
-        let result = state.entity_cache.get(&store_key, scope)?;
+        let result = state.entity_cache.get(&store_key, scope).await?;
 
         Self::track_gas_and_ops(
             gas,
@@ -408,13 +411,13 @@ impl HostExports {
         )?;
 
         if let Some(ref entity) = result {
-            state.metrics.track_entity_read(&entity_type, &entity)
+            state.metrics.track_entity_read(&entity_type, entity)
         }
 
         Ok(result)
     }
 
-    pub(crate) fn store_load_related(
+    pub(crate) async fn store_load_related(
         &self,
         state: &mut BlockState,
         entity_type: String,
@@ -432,7 +435,7 @@ impl HostExports {
         };
         self.check_entity_type_access(&store_key.entity_type)?;
 
-        let result = state.entity_cache.load_related(&store_key)?;
+        let result = state.entity_cache.load_related(&store_key).await?;
 
         Self::track_gas_and_ops(
             gas,
@@ -475,14 +478,7 @@ impl HostExports {
         ))
     }
 
-    pub(crate) fn ipfs_cat(&self, logger: &Logger, link: String) -> Result<Vec<u8>, anyhow::Error> {
-        // Does not consume gas because this is not a part of the deterministic feature set.
-        // Ideally this would first consume gas for fetching the file stats, and then again
-        // for the bytes of the file.
-        graph::block_on(self.link_resolver.cat(logger, &Link { link }))
-    }
-
-    pub(crate) fn ipfs_get_block(
+    pub(crate) async fn ipfs_cat(
         &self,
         logger: &Logger,
         link: String,
@@ -490,7 +486,28 @@ impl HostExports {
         // Does not consume gas because this is not a part of the deterministic feature set.
         // Ideally this would first consume gas for fetching the file stats, and then again
         // for the bytes of the file.
-        graph::block_on(self.link_resolver.get_block(logger, &Link { link }))
+        self.link_resolver
+            .cat(
+                &LinkResolverContext::new(&self.subgraph_id, logger),
+                &Link { link },
+            )
+            .await
+    }
+
+    pub(crate) async fn ipfs_get_block(
+        &self,
+        logger: &Logger,
+        link: String,
+    ) -> Result<Vec<u8>, anyhow::Error> {
+        // Does not consume gas because this is not a part of the deterministic feature set.
+        // Ideally this would first consume gas for fetching the file stats, and then again
+        // for the bytes of the file.
+        self.link_resolver
+            .get_block(
+                &LinkResolverContext::new(&self.subgraph_id, logger),
+                &Link { link },
+            )
+            .await
     }
 
     // Read the IPFS file `link`, split it into JSON objects, and invoke the
@@ -500,8 +517,8 @@ impl HostExports {
     // which is identical to `module` when it was first started. The signature
     // of the callback must be `callback(JSONValue, Value)`, and the `userData`
     // parameter is passed to the callback without any changes
-    pub(crate) fn ipfs_map(
-        link_resolver: &Arc<dyn LinkResolver>,
+    pub(crate) async fn ipfs_map(
+        &self,
         wasm_ctx: &WasmInstanceData,
         link: String,
         callback: &str,
@@ -533,18 +550,26 @@ impl HostExports {
         let logger = ctx.logger.new(o!("ipfs_map" => link.clone()));
 
         let result = {
-            let mut stream: JsonValueStream =
-                graph::block_on(link_resolver.json_stream(&logger, &Link { link }))?;
+            let mut stream: JsonValueStream = self
+                .link_resolver
+                .json_stream(
+                    &LinkResolverContext::new(&self.subgraph_id, &logger),
+                    &Link { link },
+                )
+                .await?;
             let mut v = Vec::new();
-            while let Some(sv) = graph::block_on(stream.next()) {
+            while let Some(sv) = stream.next().await {
                 let sv = sv?;
-                let module = WasmInstance::from_valid_module_with_ctx(
+                let module = WasmInstance::from_valid_module_with_ctx_boxed(
                     valid_module.clone(),
                     ctx.derive_with_empty_block_state(),
                     host_metrics.clone(),
                     wasm_ctx.experimental_features,
-                )?;
-                let result = module.handle_json_callback(&callback, &sv.value, &user_data)?;
+                )
+                .await?;
+                let result = module
+                    .handle_json_callback(&callback, &sv.value, &user_data)
+                    .await?;
                 // Log progress every 15s
                 if last_log.elapsed() > Duration::from_secs(15) {
                     debug!(
@@ -559,7 +584,7 @@ impl HostExports {
             }
             Ok(v)
         };
-        result.map_err(move |e: Error| anyhow::anyhow!("{}: {}", errmsg, e.to_string()))
+        result.map_err(move |e: Error| anyhow::anyhow!("{}: {}", errmsg, e))
     }
 
     /// Expects a decimal string.
@@ -1033,18 +1058,18 @@ impl HostExports {
         Ok(())
     }
 
-    pub(crate) fn ens_name_by_hash(
+    pub(crate) async fn ens_name_by_hash(
         &self,
         hash: &str,
         gas: &GasCounter,
         state: &mut BlockState,
     ) -> Result<Option<String>, anyhow::Error> {
         Self::track_gas_and_ops(gas, state, gas::ENS_NAME_BY_HASH, "ens_name_by_hash")?;
-        Ok(self.ens_lookup.find_name(hash)?)
+        Ok(self.ens_lookup.find_name(hash).await?)
     }
 
-    pub(crate) fn is_ens_data_empty(&self) -> Result<bool, anyhow::Error> {
-        Ok(self.ens_lookup.is_table_empty()?)
+    pub(crate) async fn is_ens_data_empty(&self) -> Result<bool, anyhow::Error> {
+        Ok(self.ens_lookup.is_table_empty().await?)
     }
 
     pub(crate) fn log_log(
@@ -1138,28 +1163,29 @@ impl HostExports {
         )?;
 
         if bytes.len() > MAX_JSON_SIZE {
-            return Err(DeterministicHostError::Other(
-                anyhow!("JSON size exceeds max size of {}", MAX_JSON_SIZE).into(),
-            ));
+            return Err(DeterministicHostError::Other(anyhow!(
+                "JSON size exceeds max size of {}",
+                MAX_JSON_SIZE
+            )));
         }
 
         serde_json::from_slice(bytes.as_slice())
             .map_err(|e| DeterministicHostError::from(Error::from(e)))
     }
 
-    pub(crate) fn string_to_h160(
+    pub(crate) fn string_to_address(
         &self,
         string: &str,
         gas: &GasCounter,
         state: &mut BlockState,
-    ) -> Result<H160, DeterministicHostError> {
+    ) -> Result<Address, DeterministicHostError> {
         Self::track_gas_and_ops(
             gas,
             state,
             gas::DEFAULT_GAS_OP.with_args(complexity::Size, &string),
             "string_to_h160",
         )?;
-        string_to_h160(string)
+        string_to_address(string)
     }
 
     pub(crate) fn bytes_to_string(
@@ -1181,11 +1207,11 @@ impl HostExports {
 
     pub(crate) fn ethereum_encode(
         &self,
-        token: Token,
+        value: abi::DynSolValue,
         gas: &GasCounter,
         state: &mut BlockState,
     ) -> Result<Vec<u8>, DeterministicHostError> {
-        let encoded = encode(&[token]);
+        let encoded = value.abi_encode();
 
         Self::track_gas_and_ops(
             gas,
@@ -1203,7 +1229,7 @@ impl HostExports {
         data: Vec<u8>,
         gas: &GasCounter,
         state: &mut BlockState,
-    ) -> Result<Token, anyhow::Error> {
+    ) -> Result<abi::DynSolValue, anyhow::Error> {
         Self::track_gas_and_ops(
             gas,
             state,
@@ -1211,15 +1237,9 @@ impl HostExports {
             "ethereum_decode",
         )?;
 
-        let param_types =
-            Reader::read(&types).map_err(|e| anyhow::anyhow!("Failed to read types: {}", e))?;
+        let ty: abi::DynSolType = types.parse().context("Failed to read types")?;
 
-        decode(&[param_types], &data)
-            // The `.pop().unwrap()` here is ok because we're always only passing one
-            // `param_types` to `decode`, so the returned `Vec` has always size of one.
-            // We can't do `tokens[0]` because the value can't be moved out of the `Vec`.
-            .map(|mut tokens| tokens.pop().unwrap())
-            .context("Failed to decode")
+        ty.abi_decode(&data).context("Failed to decode")
     }
 
     pub(crate) fn yaml_from_bytes(
@@ -1238,13 +1258,10 @@ impl HostExports {
         )?;
 
         if bytes.len() > YAML_MAX_SIZE_BYTES {
-            return Err(DeterministicHostError::Other(
-                anyhow!(
-                    "YAML size exceeds max size of {} bytes",
-                    YAML_MAX_SIZE_BYTES
-                )
-                .into(),
-            ));
+            return Err(DeterministicHostError::Other(anyhow!(
+                "YAML size exceeds max size of {} bytes",
+                YAML_MAX_SIZE_BYTES
+            )));
         }
 
         serde_yaml::from_slice(bytes)
@@ -1253,11 +1270,9 @@ impl HostExports {
     }
 }
 
-fn string_to_h160(string: &str) -> Result<H160, DeterministicHostError> {
-    // `H160::from_str` takes a hex string with no leading `0x`.
-    let s = string.trim_start_matches("0x");
-    H160::from_str(s)
-        .with_context(|| format!("Failed to convert string to Address/H160: '{}'", s))
+fn string_to_address(string: &str) -> Result<Address, DeterministicHostError> {
+    Address::from_str(string)
+        .with_context(|| format!("Failed to convert string to Address: '{}'", string))
         .map_err(DeterministicHostError::from)
 }
 
@@ -1312,7 +1327,7 @@ pub mod test_support {
             }
         }
 
-        pub fn store_set(
+        pub async fn store_set(
             &self,
             logger: &Logger,
             block: BlockNumber,
@@ -1324,21 +1339,23 @@ pub mod test_support {
             stopwatch: &StopwatchMetrics,
             gas: &GasCounter,
         ) -> Result<(), HostExportError> {
-            self.host_exports.store_set(
-                logger,
-                block,
-                state,
-                proof_of_indexing,
-                self.block_time,
-                entity_type,
-                entity_id,
-                data,
-                stopwatch,
-                gas,
-            )
+            self.host_exports
+                .store_set(
+                    logger,
+                    block,
+                    state,
+                    proof_of_indexing,
+                    self.block_time,
+                    entity_type,
+                    entity_id,
+                    data,
+                    stopwatch,
+                    gas,
+                )
+                .await
         }
 
-        pub fn store_get(
+        pub async fn store_get(
             &self,
             state: &mut BlockState,
             entity_type: String,
@@ -1347,14 +1364,15 @@ pub mod test_support {
         ) -> Result<Option<Arc<Entity>>, anyhow::Error> {
             self.host_exports
                 .store_get(state, entity_type, entity_id, gas, GetScope::Store)
+                .await
         }
     }
 }
 #[test]
 fn test_string_to_h160_with_0x() {
     assert_eq!(
-        H160::from_str("A16081F360e3847006dB660bae1c6d1b2e17eC2A").unwrap(),
-        string_to_h160("0xA16081F360e3847006dB660bae1c6d1b2e17eC2A").unwrap()
+        Address::from_str("A16081F360e3847006dB660bae1c6d1b2e17eC2A").unwrap(),
+        string_to_address("0xA16081F360e3847006dB660bae1c6d1b2e17eC2A").unwrap()
     )
 }
 

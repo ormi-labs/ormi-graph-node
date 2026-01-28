@@ -89,12 +89,12 @@ impl IdType {
     }
 }
 
-impl<'a> TryFrom<&s::ObjectType> for IdType {
+impl TryFrom<&s::ObjectType> for IdType {
     type Error = Error;
 
     fn try_from(obj_type: &s::ObjectType) -> Result<Self, Self::Error> {
         let base_type = obj_type
-            .field(&*ID)
+            .field(&ID)
             .ok_or_else(|| anyhow!("Type {} does not have an `id` field", obj_type.name))?
             .field_type
             .get_base_type();
@@ -484,7 +484,7 @@ impl IdList {
     }
 
     pub fn first(&self) -> Option<IdRef<'_>> {
-        if self.len() > 0 {
+        if !self.is_empty() {
             Some(self.index(0))
         } else {
             None
@@ -566,7 +566,7 @@ mod tests {
         assert_eq!(exp, id);
 
         let id = IdType::Int8.generate_id(3, 2).unwrap();
-        let exp = Id::Int8(0x0000_0003__0000_0002);
+        let exp = Id::Int8(0x0000_0003_0000_0002);
         assert_eq!(exp, id);
 
         // Should be id + 1

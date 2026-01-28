@@ -1,40 +1,30 @@
 use std::collections::HashSet;
-use std::time::Instant;
 
 use async_trait::async_trait;
-use graph::blockchain::Blockchain;
-use graph::blockchain::BlockchainKind;
-use graph::blockchain::BlockchainMap;
-use graph::components::store::{DeploymentId, DeploymentLocator, SubscriptionManager};
-use graph::components::subgraph::Settings;
-use graph::data::subgraph::schema::DeploymentCreate;
-use graph::data::subgraph::Graft;
-use graph::data::value::Word;
-use graph::futures01;
-use graph::futures01::future;
-use graph::futures01::stream;
-use graph::futures01::Future;
-use graph::futures01::Stream;
-use graph::futures03::compat::Future01CompatExt;
-use graph::futures03::compat::Stream01CompatExt;
-use graph::futures03::future::FutureExt;
-use graph::futures03::future::TryFutureExt;
-use graph::futures03::stream::TryStreamExt;
-use graph::prelude::{
-    CreateSubgraphResult, SubgraphAssignmentProvider as SubgraphAssignmentProviderTrait,
-    SubgraphRegistrar as SubgraphRegistrarTrait, *,
+use graph::amp;
+use graph::blockchain::{Blockchain, BlockchainKind, BlockchainMap};
+use graph::components::{
+    link_resolver::LinkResolverContext,
+    store::{DeploymentId, DeploymentLocator, SubscriptionManager},
+    subgraph::Settings,
 };
-use graph::tokio_retry::Retry;
-use graph::util::futures::retry_strategy;
-use graph::util::futures::RETRY_DEFAULT_LIMIT;
+use graph::data::{
+    subgraph::{schema::DeploymentCreate, Graft},
+    value::Word,
+};
+use graph::futures03::{self, future::TryFutureExt, Stream, StreamExt};
+use graph::prelude::{CreateSubgraphResult, SubgraphRegistrar as SubgraphRegistrarTrait, *};
+use graph::util::futures::{retry_strategy, RETRY_DEFAULT_LIMIT};
+use tokio_retry::Retry;
 
-pub struct SubgraphRegistrar<P, S, SM> {
+pub struct SubgraphRegistrar<P, S, SM, AC> {
     logger: Logger,
     logger_factory: LoggerFactory,
     resolver: Arc<dyn LinkResolver>,
     provider: Arc<P>,
     store: Arc<S>,
     subscription_manager: Arc<SM>,
+    amp_client: Option<Arc<AC>>,
     chains: Arc<BlockchainMap>,
     node_id: NodeId,
     version_switching_mode: SubgraphVersionSwitchingMode,
@@ -42,11 +32,12 @@ pub struct SubgraphRegistrar<P, S, SM> {
     settings: Arc<Settings>,
 }
 
-impl<P, S, SM> SubgraphRegistrar<P, S, SM>
+impl<P, S, SM, AC> SubgraphRegistrar<P, S, SM, AC>
 where
-    P: SubgraphAssignmentProviderTrait,
+    P: graph::components::subgraph::SubgraphInstanceManager,
     S: SubgraphStore,
     SM: SubscriptionManager,
+    AC: amp::Client + Send + Sync + 'static,
 {
     pub fn new(
         logger_factory: &LoggerFactory,
@@ -54,6 +45,7 @@ where
         provider: Arc<P>,
         store: Arc<S>,
         subscription_manager: Arc<SM>,
+        amp_client: Option<Arc<AC>>,
         chains: Arc<BlockchainMap>,
         node_id: NodeId,
         version_switching_mode: SubgraphVersionSwitchingMode,
@@ -71,6 +63,7 @@ where
             provider,
             store,
             subscription_manager,
+            amp_client,
             chains,
             node_id,
             version_switching_mode,
@@ -79,14 +72,7 @@ where
         }
     }
 
-    pub fn start(&self) -> impl Future<Item = (), Error = Error> {
-        let logger_clone1 = self.logger.clone();
-        let logger_clone2 = self.logger.clone();
-        let provider = self.provider.clone();
-        let node_id = self.node_id.clone();
-        let assignment_event_stream_cancel_handle =
-            self.assignment_event_stream_cancel_guard.handle();
-
+    pub async fn start(self: Arc<Self>) -> Result<(), Error> {
         // The order of the following three steps is important:
         // - Start assignment event stream
         // - Read assignments table and start assigned subgraphs
@@ -101,168 +87,153 @@ where
         //
         // The discrepancy between the start time of the event stream and the table read can result
         // in some extraneous events on start up. Examples:
-        // - The event stream sees an Add event for subgraph A, but the table query finds that
+        // - The event stream sees an 'set' event for subgraph A, but the table query finds that
         //   subgraph A is already in the table.
-        // - The event stream sees a Remove event for subgraph B, but the table query finds that
+        // - The event stream sees a 'removed' event for subgraph B, but the table query finds that
         //   subgraph B has already been removed.
-        // The `handle_assignment_events` function handles these cases by ignoring AlreadyRunning
-        // (on subgraph start) which makes the operations idempotent. Subgraph stop is already idempotent.
+        // The `change_assignment` function handles these cases by ignoring
+        // such cases which makes the operations idempotent
 
         // Start event stream
-        let assignment_event_stream = self.assignment_events();
+        let assignment_event_stream = self.cheap_clone().assignment_events().await;
 
         // Deploy named subgraphs found in store
-        self.start_assigned_subgraphs().and_then(move |()| {
-            // Spawn a task to handle assignment events.
-            // Blocking due to store interactions. Won't be blocking after #905.
-            graph::spawn_blocking(
-                assignment_event_stream
-                    .compat()
-                    .map_err(SubgraphAssignmentProviderError::Unknown)
-                    .cancelable(&assignment_event_stream_cancel_handle)
-                    .compat()
-                    .for_each(move |assignment_event| {
-                        assert_eq!(assignment_event.node_id(), &node_id);
-                        handle_assignment_event(
-                            assignment_event,
-                            provider.clone(),
-                            logger_clone1.clone(),
-                        )
-                        .boxed()
-                        .compat()
-                    })
-                    .map_err(move |e| match e {
-                        CancelableError::Cancel => panic!("assignment event stream canceled"),
-                        CancelableError::Error(e) => {
-                            error!(logger_clone2, "Assignment event stream failed: {}", e);
-                            panic!("assignment event stream failed: {}", e);
-                        }
-                    })
-                    .compat(),
-            );
+        self.start_assigned_subgraphs().await?;
 
-            Ok(())
-        })
+        let cancel_handle = self.assignment_event_stream_cancel_guard.handle();
+
+        // Spawn a task to handle assignment events.
+        let fut = assignment_event_stream.for_each({
+            move |event| {
+                // The assignment stream should run forever. If it gets
+                // cancelled, that probably indicates a serious problem and
+                // we panic
+                if cancel_handle.is_canceled() {
+                    panic!("assignment event stream canceled");
+                }
+
+                let this = self.cheap_clone();
+                async move {
+                    this.change_assignment(event).await;
+                }
+            }
+        });
+
+        graph::spawn(fut);
+        Ok(())
     }
 
-    pub fn assignment_events(&self) -> impl Stream<Item = AssignmentEvent, Error = Error> + Send {
-        let store = self.store.clone();
-        let node_id = self.node_id.clone();
-        let logger = self.logger.clone();
+    /// Start/stop subgraphs as needed, considering the current assignment
+    /// state in the database, ignoring changes that do not affect this
+    /// node, do not require anything to change, or for which we can not
+    /// find the assignment status from the database
+    async fn change_assignment(&self, change: AssignmentChange) {
+        let (deployment, operation) = change.into_parts();
 
+        trace!(self.logger, "Received assignment change";
+           "deployment" => %deployment,
+           "operation" => format!("{:?}", operation),
+        );
+
+        match operation {
+            AssignmentOperation::Set => {
+                let assigned = match self.store.assignment_status(&deployment).await {
+                    Ok(assigned) => assigned,
+                    Err(e) => {
+                        error!(
+                            self.logger,
+                            "Failed to get subgraph assignment entity"; "deployment" => deployment, "error" => e.to_string()
+                        );
+                        return;
+                    }
+                };
+
+                let logger = self.logger.new(o!("subgraph_id" => deployment.hash.to_string(), "node_id" => self.node_id.to_string()));
+                if let Some((assigned, is_paused)) = assigned {
+                    if assigned == self.node_id {
+                        if is_paused {
+                            // Subgraph is paused, so we don't start it
+                            debug!(logger, "Deployment assignee is this node"; "assigned_to" => assigned, "paused" => is_paused, "action" => "ignore");
+                            return;
+                        }
+
+                        // Start subgraph on this node
+                        debug!(logger, "Deployment assignee is this node"; "assigned_to" => assigned, "action" => "add");
+                        self.provider
+                            .cheap_clone()
+                            .start_subgraph(deployment, None)
+                            .await;
+                    } else {
+                        // Ensure it is removed from this node
+                        debug!(logger, "Deployment assignee is not this node"; "assigned_to" => assigned, "action" => "remove");
+                        self.provider.stop_subgraph(deployment).await
+                    }
+                } else {
+                    // Was added/updated, but is now gone.
+                    debug!(self.logger, "Deployment assignee not found in database"; "action" => "ignore");
+                }
+            }
+            AssignmentOperation::Removed => {
+                self.provider.stop_subgraph(deployment).await;
+            }
+        }
+    }
+
+    pub async fn assignment_events(self: Arc<Self>) -> impl Stream<Item = AssignmentChange> + Send {
         self.subscription_manager
             .subscribe()
-            .map_err(|()| anyhow!("Entity change stream failed"))
-            .map(|event| {
-                let changes: Vec<_> = event.changes.iter().cloned().map(AssignmentChange::into_parts).collect();
-                stream::iter_ok(changes)
-            })
-            .flatten()
-            .and_then(
-                move |(deployment, operation)| -> Result<Box<dyn Stream<Item = _, Error = _> + Send>, _> {
-                    trace!(logger, "Received assignment change";
-                                   "deployment" => %deployment,
-                                   "operation" => format!("{:?}", operation),
-                                );
-
-                    match operation {
-                        AssignmentOperation::Set => {
-                            store
-                                .assignment_status(&deployment)
-                                .map_err(|e| {
-                                    anyhow!("Failed to get subgraph assignment entity: {}", e)
-                                })
-                                .map(|assigned| -> Box<dyn Stream<Item = _, Error = _> + Send> {
-                                    if let Some((assigned,is_paused)) = assigned {
-                                        if assigned == node_id {
-
-                                            if is_paused{
-                                                // Subgraph is paused, so we don't start it
-                                                debug!(logger, "Deployment assignee is this node, but it is paused, so we don't start it"; "assigned_to" => assigned, "node_id" => &node_id,"paused" => is_paused);
-                                                return Box::new(stream::empty());
-                                            }
-
-                                            // Start subgraph on this node
-                                            debug!(logger, "Deployment assignee is this node, broadcasting add event"; "assigned_to" => assigned, "node_id" => &node_id);
-                                            Box::new(stream::once(Ok(AssignmentEvent::Add {
-                                                deployment,
-                                                node_id: node_id.clone(),
-                                            })))
-                                        } else {
-                                            // Ensure it is removed from this node
-                                            debug!(logger, "Deployment assignee is not this node, broadcasting remove event"; "assigned_to" => assigned, "node_id" => &node_id);
-                                            Box::new(stream::once(Ok(AssignmentEvent::Remove {
-                                                deployment,
-                                                node_id: node_id.clone(),
-                                            })))
-                                        }
-                                    } else {
-                                        // Was added/updated, but is now gone.
-                                        debug!(logger, "Deployment has not assignee, we will get a separate remove event later"; "node_id" => &node_id);
-                                        Box::new(stream::empty())
-                                    }
-                                })
-                        }
-                        AssignmentOperation::Removed => {
-                            // Send remove event without checking node ID.
-                            // If node ID does not match, then this is a no-op when handled in
-                            // assignment provider.
-                            Ok(Box::new(stream::once(Ok(AssignmentEvent::Remove {
-                                deployment,
-                                node_id: node_id.clone(),
-                            }))))
-                        }
-                    }
-                },
-            )
+            .map(|event| futures03::stream::iter(event.changes.clone()))
             .flatten()
     }
 
-    fn start_assigned_subgraphs(&self) -> impl Future<Item = (), Error = Error> {
-        let provider = self.provider.clone();
+    async fn start_assigned_subgraphs(&self) -> Result<(), Error> {
         let logger = self.logger.clone();
         let node_id = self.node_id.clone();
 
-        future::result(self.store.active_assignments(&self.node_id))
-            .map_err(|e| anyhow!("Error querying subgraph assignments: {}", e))
-            .and_then(move |deployments| {
-                // This operation should finish only after all subgraphs are
-                // started. We wait for the spawned tasks to complete by giving
-                // each a `sender` and waiting for all of them to be dropped, so
-                // the receiver terminates without receiving anything.
-                let deployments = HashSet::<DeploymentLocator>::from_iter(deployments);
-                let deployments_len = deployments.len();
-                let (sender, receiver) = futures01::sync::mpsc::channel::<()>(1);
-                for id in deployments {
-                    let sender = sender.clone();
-                    let logger = logger.clone();
+        let deployments = self
+            .store
+            .active_assignments(&self.node_id)
+            .await
+            .map_err(|e| anyhow!("Error querying subgraph assignments: {}", e))?;
+        // This operation should finish only after all subgraphs are
+        // started. We wait for the spawned tasks to complete by giving
+        // each a `sender` and waiting for all of them to be dropped, so
+        // the receiver terminates without receiving anything.
+        let deployments = HashSet::<DeploymentLocator>::from_iter(deployments);
+        let deployments_len = deployments.len();
+        debug!(logger, "Starting all assigned subgraphs";
+                    "count" => deployments_len, "node_id" => &node_id);
+        let (sender, receiver) = futures03::channel::mpsc::channel::<()>(1);
+        for id in deployments {
+            let sender = sender.clone();
+            let provider = self.provider.cheap_clone();
 
-                    graph::spawn(
-                        start_subgraph(id, provider.clone(), logger).map(move |()| drop(sender)),
-                    );
-                }
-                drop(sender);
-                receiver.collect().then(move |_| {
-                    info!(logger, "Started all assigned subgraphs";
-                                  "count" => deployments_len, "node_id" => &node_id);
-                    future::ok(())
-                })
-            })
+            graph::spawn(async move {
+                provider.start_subgraph(id, None).await;
+                drop(sender)
+            });
+        }
+        drop(sender);
+        let _: Vec<_> = receiver.collect().await;
+        info!(logger, "Started all assigned subgraphs";
+                    "count" => deployments_len, "node_id" => &node_id);
+        Ok(())
     }
 }
 
 #[async_trait]
-impl<P, S, SM> SubgraphRegistrarTrait for SubgraphRegistrar<P, S, SM>
+impl<P, S, SM, AC> SubgraphRegistrarTrait for SubgraphRegistrar<P, S, SM, AC>
 where
-    P: SubgraphAssignmentProviderTrait,
+    P: graph::components::subgraph::SubgraphInstanceManager,
     S: SubgraphStore,
     SM: SubscriptionManager,
+    AC: amp::Client + Send + Sync + 'static,
 {
     async fn create_subgraph(
         &self,
         name: SubgraphName,
     ) -> Result<CreateSubgraphResult, SubgraphRegistrarError> {
-        let id = self.store.create_subgraph(name.clone())?;
+        let id = self.store.create_subgraph(name.clone()).await?;
 
         debug!(self.logger, "Created subgraph"; "subgraph_name" => name.to_string());
 
@@ -295,15 +266,17 @@ where
 
         let raw = {
             let mut raw: serde_yaml::Mapping = {
-                let file_bytes =
-                    resolver
-                        .cat(&logger, &hash.to_ipfs_link())
-                        .await
-                        .map_err(|e| {
-                            SubgraphRegistrarError::ResolveError(
-                                SubgraphManifestResolveError::ResolveError(e),
-                            )
-                        })?;
+                let file_bytes = resolver
+                    .cat(
+                        &LinkResolverContext::new(&hash, &logger),
+                        &hash.to_ipfs_link(),
+                    )
+                    .await
+                    .map_err(|e| {
+                        SubgraphRegistrarError::ResolveError(
+                            SubgraphManifestResolveError::ResolveError(e),
+                        )
+                    })?;
 
                 serde_yaml::from_slice(&file_bytes)
                     .map_err(|e| SubgraphRegistrarError::ResolveError(e.into()))?
@@ -326,7 +299,7 @@ where
 
         let deployment_locator = match kind {
             BlockchainKind::Ethereum => {
-                create_subgraph_version::<graph_chain_ethereum::Chain, _>(
+                create_subgraph_version::<graph_chain_ethereum::Chain, _, _>(
                     &logger,
                     self.store.clone(),
                     self.chains.cheap_clone(),
@@ -339,12 +312,13 @@ where
                     debug_fork,
                     self.version_switching_mode,
                     &resolver,
+                    self.amp_client.cheap_clone(),
                     history_blocks,
                 )
                 .await?
             }
             BlockchainKind::Near => {
-                create_subgraph_version::<graph_chain_near::Chain, _>(
+                create_subgraph_version::<graph_chain_near::Chain, _, _>(
                     &logger,
                     self.store.clone(),
                     self.chains.cheap_clone(),
@@ -357,24 +331,7 @@ where
                     debug_fork,
                     self.version_switching_mode,
                     &resolver,
-                    history_blocks,
-                )
-                .await?
-            }
-            BlockchainKind::Substreams => {
-                create_subgraph_version::<graph_chain_substreams::Chain, _>(
-                    &logger,
-                    self.store.clone(),
-                    self.chains.cheap_clone(),
-                    name.clone(),
-                    hash.cheap_clone(),
-                    start_block_override,
-                    graft_block_override,
-                    raw,
-                    node_id,
-                    debug_fork,
-                    self.version_switching_mode,
-                    &resolver,
+                    self.amp_client.cheap_clone(),
                     history_blocks,
                 )
                 .await?
@@ -392,7 +349,7 @@ where
     }
 
     async fn remove_subgraph(&self, name: SubgraphName) -> Result<(), SubgraphRegistrarError> {
-        self.store.clone().remove_subgraph(name.clone())?;
+        self.store.clone().remove_subgraph(name.clone()).await?;
 
         debug!(self.logger, "Removed subgraph"; "subgraph_name" => name.to_string());
 
@@ -408,93 +365,33 @@ where
         hash: &DeploymentHash,
         node_id: &NodeId,
     ) -> Result<(), SubgraphRegistrarError> {
-        let locator = self.store.active_locator(hash)?;
+        let locator = self.store.active_locator(hash).await?;
         let deployment =
             locator.ok_or_else(|| SubgraphRegistrarError::DeploymentNotFound(hash.to_string()))?;
 
-        self.store.reassign_subgraph(&deployment, node_id)?;
+        self.store.reassign_subgraph(&deployment, node_id).await?;
 
         Ok(())
     }
 
     async fn pause_subgraph(&self, hash: &DeploymentHash) -> Result<(), SubgraphRegistrarError> {
-        let locator = self.store.active_locator(hash)?;
+        let locator = self.store.active_locator(hash).await?;
         let deployment =
             locator.ok_or_else(|| SubgraphRegistrarError::DeploymentNotFound(hash.to_string()))?;
 
-        self.store.pause_subgraph(&deployment)?;
+        self.store.pause_subgraph(&deployment).await?;
 
         Ok(())
     }
 
     async fn resume_subgraph(&self, hash: &DeploymentHash) -> Result<(), SubgraphRegistrarError> {
-        let locator = self.store.active_locator(hash)?;
+        let locator = self.store.active_locator(hash).await?;
         let deployment =
             locator.ok_or_else(|| SubgraphRegistrarError::DeploymentNotFound(hash.to_string()))?;
 
-        self.store.resume_subgraph(&deployment)?;
+        self.store.resume_subgraph(&deployment).await?;
 
         Ok(())
-    }
-}
-
-async fn handle_assignment_event(
-    event: AssignmentEvent,
-    provider: Arc<impl SubgraphAssignmentProviderTrait>,
-    logger: Logger,
-) -> Result<(), CancelableError<SubgraphAssignmentProviderError>> {
-    let logger = logger.clone();
-
-    debug!(logger, "Received assignment event: {:?}", event);
-
-    match event {
-        AssignmentEvent::Add {
-            deployment,
-            node_id: _,
-        } => {
-            start_subgraph(deployment, provider.clone(), logger).await;
-            Ok(())
-        }
-        AssignmentEvent::Remove {
-            deployment,
-            node_id: _,
-        } => match provider.stop(deployment).await {
-            Ok(()) => Ok(()),
-            Err(e) => Err(CancelableError::Error(e)),
-        },
-    }
-}
-
-async fn start_subgraph(
-    deployment: DeploymentLocator,
-    provider: Arc<impl SubgraphAssignmentProviderTrait>,
-    logger: Logger,
-) {
-    let logger = logger
-        .new(o!("subgraph_id" => deployment.hash.to_string(), "sgd" => deployment.id.to_string()));
-
-    trace!(logger, "Start subgraph");
-
-    let start_time = Instant::now();
-    let result = provider.start(deployment.clone(), None).await;
-
-    debug!(
-        logger,
-        "Subgraph started";
-        "start_ms" => start_time.elapsed().as_millis()
-    );
-
-    match result {
-        Ok(()) => (),
-        Err(SubgraphAssignmentProviderError::AlreadyRunning(_)) => (),
-        Err(e) => {
-            // Errors here are likely an issue with the subgraph.
-            error!(
-                logger,
-                "Subgraph instance failed to start";
-                "error" => e.to_string()
-            );
-        }
     }
 }
 
@@ -516,7 +413,7 @@ async fn resolve_start_block(
         0 => Ok(None),
         min_start_block => Retry::spawn(retry_strategy(Some(2), RETRY_DEFAULT_LIMIT), move || {
             chain
-                .block_pointer_from_number(&logger, min_start_block - 1)
+                .block_pointer_from_number(logger, min_start_block - 1)
                 .inspect_err(move |e| warn!(&logger, "Failed to get block number: {}", e))
         })
         .await
@@ -548,7 +445,7 @@ async fn resolve_graft_block(
         })
 }
 
-async fn create_subgraph_version<C: Blockchain, S: SubgraphStore>(
+async fn create_subgraph_version<C: Blockchain, S: SubgraphStore, AC: amp::Client>(
     logger: &Logger,
     store: Arc<S>,
     chains: Arc<BlockchainMap>,
@@ -561,6 +458,7 @@ async fn create_subgraph_version<C: Blockchain, S: SubgraphStore>(
     debug_fork: Option<DeploymentHash>,
     version_switching_mode: SubgraphVersionSwitchingMode,
     resolver: &Arc<dyn LinkResolver>,
+    amp_client: Option<Arc<AC>>,
     history_blocks_override: Option<i32>,
 ) -> Result<DeploymentLocator, SubgraphRegistrarError> {
     let raw_string = serde_yaml::to_string(&raw).unwrap();
@@ -568,7 +466,8 @@ async fn create_subgraph_version<C: Blockchain, S: SubgraphStore>(
     let unvalidated = UnvalidatedSubgraphManifest::<C>::resolve(
         deployment.clone(),
         raw,
-        &resolver,
+        resolver,
+        amp_client,
         logger,
         ENV_VARS.max_spec_version.clone(),
     )
@@ -578,7 +477,7 @@ async fn create_subgraph_version<C: Blockchain, S: SubgraphStore>(
     // Validate the graft_base if there is a pending graft, ensuring its presence.
     // If the subgraph is new (indicated by DeploymentNotFound), the graft_base should be validated.
     // If the subgraph already exists and there is no pending graft, graft_base validation is not required.
-    let should_validate = match store.graft_pending(&deployment) {
+    let should_validate = match store.graft_pending(&deployment).await {
         Ok(graft_pending) => graft_pending,
         Err(StoreError::DeploymentNotFound(_)) => true,
         Err(e) => return Err(SubgraphRegistrarError::StoreError(e)),
@@ -599,7 +498,7 @@ async fn create_subgraph_version<C: Blockchain, S: SubgraphStore>(
     let store = store.clone();
     let deployment_store = store.clone();
 
-    if !store.subgraph_exists(&name)? {
+    if !store.subgraph_exists(&name).await? {
         debug!(
             logger,
             "Subgraph not found, could not create_subgraph_version";
@@ -674,5 +573,6 @@ async fn create_subgraph_version<C: Blockchain, S: SubgraphStore>(
             network_name.into(),
             version_switching_mode,
         )
+        .await
         .map_err(SubgraphRegistrarError::SubgraphDeploymentError)
 }

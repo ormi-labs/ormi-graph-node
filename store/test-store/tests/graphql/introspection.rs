@@ -3,12 +3,13 @@ use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use graph::components::store::QueryPermit;
 use graph::data::graphql::{object_value, ObjectOrInterface};
 use graph::data::query::Trace;
 use graph::prelude::{
-    async_trait, o, q, r, s, serde_json, slog, tokio, DeploymentHash, Logger, Query,
-    QueryExecutionError, QueryResult,
+    o, q, r, s, serde_json, slog, tokio, DeploymentHash, Logger, Query, QueryExecutionError,
+    QueryResult,
 };
 use graph::schema::{ApiSchema, InputSchema};
 
@@ -25,7 +26,7 @@ pub struct MockResolver;
 impl Resolver for MockResolver {
     const CACHEABLE: bool = false;
 
-    fn prefetch(
+    async fn prefetch(
         &self,
         _: &ExecutionContext<Self>,
         _: &a::SelectionSet,
@@ -45,7 +46,7 @@ impl Resolver for MockResolver {
 
     async fn resolve_object(
         &self,
-        __: Option<r::Value>,
+        _: Option<r::Value>,
         _field: &a::Field,
         _field_definition: &s::Field,
         _object_type: ObjectOrInterface<'_>,
@@ -121,8 +122,8 @@ async fn introspection_query(schema: Arc<ApiSchema>, query: &str) -> QueryResult
     let options = QueryExecutionOptions {
         resolver: MockResolver,
         deadline: None,
-        max_first: std::u32::MAX,
-        max_skip: std::u32::MAX,
+        max_first: u32::MAX,
+        max_skip: u32::MAX,
         trace: false,
     };
 
@@ -172,7 +173,7 @@ fn compare(a: &r::Value, b: &r::Value, path: &mut Vec<String>) -> Option<(r::Val
                     path.push(la.len().to_string());
                     return different(&r::Value::Null, &lb[la.len()]);
                 }
-                return None;
+                None
             }
             _ => different(a, b),
         },
@@ -206,7 +207,7 @@ fn compare(a: &r::Value, b: &r::Value, path: &mut Vec<String>) -> Option<(r::Val
                         }
                     }
                 }
-                return None;
+                None
             }
             _ => different(a, b),
         },
@@ -256,7 +257,7 @@ fn maybe_save(data: &r::Value) {
     }
 }
 
-#[tokio::test]
+#[graph::test]
 async fn satisfies_graphiql_introspection_query_without_fragments() {
     let result = introspection_query(
         mock_schema(),
@@ -508,7 +509,7 @@ async fn satisfies_graphiql_introspection_query_without_fragments() {
     assert!(same_value(&data, &expected_mock_schema_introspection()));
 }
 
-#[tokio::test]
+#[graph::test]
 async fn satisfies_graphiql_introspection_query_with_fragments() {
     let result = introspection_query(
         mock_schema(),
@@ -617,6 +618,7 @@ async fn satisfies_graphiql_introspection_query_with_fragments() {
     // needs to be regenerated, uncomment this line, and save the output in
     // mock_introspection.json
     //
+    // println!("{}", graph::prelude::serde_json::to_string(&data).unwrap());
     assert!(same_value(&data, &expected_mock_schema_introspection()));
 }
 
@@ -817,7 +819,7 @@ type Parameter @entity {
 }
 ";
 
-#[tokio::test]
+#[graph::test]
 async fn successfully_runs_introspection_query_against_complex_schema() {
     let schema = api_schema(COMPLEX_SCHEMA, "complexschema");
 
@@ -922,7 +924,7 @@ async fn successfully_runs_introspection_query_against_complex_schema() {
     assert!(!result.has_errors(), "{:#?}", result);
 }
 
-#[tokio::test]
+#[graph::test]
 async fn introspection_possible_types() {
     let schema = api_schema(COMPLEX_SCHEMA, "complexschema");
 

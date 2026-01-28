@@ -58,7 +58,7 @@ impl Timestamp {
     }
 
     pub fn since_epoch(secs: i64, nanos: u32) -> Option<Self> {
-        DateTime::from_timestamp(secs, nanos).map(|dt| Timestamp(dt))
+        DateTime::from_timestamp(secs, nanos).map(Timestamp)
     }
 
     pub fn as_secs_since_epoch(&self) -> i64 {
@@ -87,6 +87,12 @@ impl stable_hash_legacy::StableHash for Timestamp {
             sequence_number,
             state,
         )
+    }
+}
+
+impl From<DateTime<Utc>> for Timestamp {
+    fn from(value: DateTime<Utc>) -> Self {
+        Self(value)
     }
 }
 

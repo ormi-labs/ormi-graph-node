@@ -149,6 +149,34 @@ pub struct EnvVarsStore {
     /// The number of rows to fetch from the foreign data wrapper in one go,
     /// this will be set as the option 'fetch_size' on all foreign servers
     pub fdw_fetch_size: usize,
+    /// Experimental feature to automatically set the account-like flag on eligible tables
+    /// Set by the environment variable `GRAPH_STORE_ACCOUNT_LIKE_SCAN_INTERVAL_HOURS`
+    /// If not set, the job is disabled.
+    /// Utilizes materialized view stats that refresh every 6 hours to discover heavy-write tables.
+    pub account_like_scan_interval_hours: Option<u32>,
+    /// Set by the environment variable `GRAPH_STORE_ACCOUNT_LIKE_MIN_VERSIONS_COUNT`
+    /// Tables must have at least this many total versions to be considered.
+    pub account_like_min_versions_count: Option<u64>,
+    /// Set by the environment variable `GRAPH_STORE_ACCOUNT_LIKE_MAX_UNIQUE_RATIO`
+    /// Defines the maximum share of unique entities (e.g. 0.01 for a 1:100 entity-to-version ratio).
+    pub account_like_max_unique_ratio: Option<f64>,
+    /// Disables storing or reading `eth_call` results from the store call cache.
+    /// Set by `GRAPH_STORE_DISABLE_CALL_CACHE`. Defaults to false.
+    pub disable_call_cache: bool,
+    /// Set by `GRAPH_STORE_DISABLE_CHAIN_HEAD_PTR_CACHE`. Default is false.
+    /// Set to true to disable chain_head_ptr caching (safety escape hatch).
+    pub disable_chain_head_ptr_cache: bool,
+    /// Minimum idle time before running connection health check (SELECT 67).
+    /// Connections used more recently than this threshold skip validation.
+    /// Set to 0 to always validate (previous behavior).
+    /// Set by `GRAPH_STORE_CONNECTION_VALIDATION_IDLE_SECS`. Default is 30 seconds.
+    pub connection_validation_idle_secs: Duration,
+    /// When a database shard is marked unavailable due to connection timeouts,
+    /// this controls how often to allow a single probe request through to check
+    /// if the database has recovered. Only one request per interval will attempt
+    /// a connection; all others fail instantly with DatabaseUnavailable.
+    /// Set by `GRAPH_STORE_CONNECTION_UNAVAILABLE_RETRY`. Default is 2 seconds.
+    pub connection_unavailable_retry: Duration,
 }
 
 // This does not print any values avoid accidentally leaking any sensitive env vars
@@ -206,6 +234,15 @@ impl TryFrom<InnerStore> for EnvVarsStore {
             disable_block_cache_for_lookup: x.disable_block_cache_for_lookup,
             insert_extra_cols: x.insert_extra_cols,
             fdw_fetch_size: x.fdw_fetch_size,
+            account_like_scan_interval_hours: x.account_like_scan_interval_hours,
+            account_like_min_versions_count: x.account_like_min_versions_count,
+            account_like_max_unique_ratio: x.account_like_max_unique_ratio.map(|r| r.0),
+            disable_call_cache: x.disable_call_cache,
+            disable_chain_head_ptr_cache: x.disable_chain_head_ptr_cache,
+            connection_validation_idle_secs: Duration::from_secs(x.connection_validation_idle_secs),
+            connection_unavailable_retry: Duration::from_secs(
+                x.connection_unavailable_retry_in_secs,
+            ),
         };
         if let Some(timeout) = vars.batch_timeout {
             if timeout < 2 * vars.batch_target_duration {
@@ -216,6 +253,16 @@ impl TryFrom<InnerStore> for EnvVarsStore {
         }
         if vars.batch_workers < 1 {
             bail!("GRAPH_STORE_BATCH_WORKERS must be at least 1");
+        }
+        if vars.account_like_scan_interval_hours.is_some()
+            && (vars.account_like_min_versions_count.is_none()
+                || vars.account_like_max_unique_ratio.is_none())
+        {
+            bail!(
+                "Both GRAPH_STORE_ACCOUNT_LIKE_MIN_VERSIONS_COUNT and \
+                     GRAPH_STORE_ACCOUNT_LIKE_MAX_UNIQUE_RATIO must be set when \
+                     GRAPH_STORE_ACCOUNT_LIKE_SCAN_INTERVAL_HOURS is set"
+            );
         }
         Ok(vars)
     }
@@ -295,6 +342,20 @@ pub struct InnerStore {
     insert_extra_cols: usize,
     #[envconfig(from = "GRAPH_STORE_FDW_FETCH_SIZE", default = "1000")]
     fdw_fetch_size: usize,
+    #[envconfig(from = "GRAPH_STORE_ACCOUNT_LIKE_SCAN_INTERVAL_HOURS")]
+    account_like_scan_interval_hours: Option<u32>,
+    #[envconfig(from = "GRAPH_STORE_ACCOUNT_LIKE_MIN_VERSIONS_COUNT")]
+    account_like_min_versions_count: Option<u64>,
+    #[envconfig(from = "GRAPH_STORE_ACCOUNT_LIKE_MAX_UNIQUE_RATIO")]
+    account_like_max_unique_ratio: Option<ZeroToOneF64>,
+    #[envconfig(from = "GRAPH_STORE_DISABLE_CALL_CACHE", default = "false")]
+    disable_call_cache: bool,
+    #[envconfig(from = "GRAPH_STORE_DISABLE_CHAIN_HEAD_PTR_CACHE", default = "false")]
+    disable_chain_head_ptr_cache: bool,
+    #[envconfig(from = "GRAPH_STORE_CONNECTION_VALIDATION_IDLE_SECS", default = "30")]
+    connection_validation_idle_secs: u64,
+    #[envconfig(from = "GRAPH_STORE_CONNECTION_UNAVAILABLE_RETRY", default = "2")]
+    connection_unavailable_retry_in_secs: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -305,7 +366,7 @@ impl FromStr for ZeroToOneF64 {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let f = s.parse::<f64>()?;
-        if f < 0.0 || f > 1.0 {
+        if !(0.0..=1.0).contains(&f) {
             bail!("invalid value: {s} must be between 0 and 1");
         } else {
             Ok(ZeroToOneF64(f))

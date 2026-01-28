@@ -4,8 +4,9 @@ use std::collections::HashMap;
 use std::fmt::{Display, Write};
 use std::sync::Arc;
 
+use diesel::sql_query;
 use diesel::sql_types::{Bool, Text};
-use diesel::{sql_query, Connection, PgConnection, RunQueryDsl};
+use diesel_async::RunQueryDsl;
 use graph::components::store::StoreError;
 use graph::itertools::Itertools;
 use graph::prelude::{
@@ -15,11 +16,11 @@ use graph::prelude::{
 };
 
 use crate::block_range::{BLOCK_COLUMN, BLOCK_RANGE_COLUMN};
-use crate::catalog;
 use crate::command_support::catalog::Site;
 use crate::deployment_store::DeploymentStore;
 use crate::primary::Namespace;
 use crate::relational::{BYTE_ARRAY_PREFIX_SIZE, STRING_PREFIX_SIZE};
+use crate::{catalog, AsyncPgConnection};
 
 use super::{Layout, Table, VID_COLUMN};
 
@@ -48,7 +49,7 @@ impl Display for Method {
 
 impl Method {
     fn parse(method: String) -> Self {
-        method.parse().unwrap_or_else(|()| Method::Unknown(method))
+        method.parse().unwrap_or(Method::Unknown(method))
     }
 }
 
@@ -193,7 +194,7 @@ impl Expr {
     /// Here we check if all the columns expressions of the two indexes are "kind of same".
     /// We ignore the operator class of the expression by checking if the string of the
     /// original expression is a prexif of the string of the current one.
-    fn is_same_kind_columns(current: &Vec<Expr>, orig: &Vec<Expr>) -> bool {
+    fn is_same_kind_columns(current: &[Expr], orig: &[Expr]) -> bool {
         if orig.len() != current.len() {
             return false;
         }
@@ -606,10 +607,8 @@ impl CreateIndex {
         match self {
             CreateIndex::Unknown { .. } => (),
             CreateIndex::Parsed { columns, .. } => {
-                if columns.len() == 1 {
-                    if columns[0].is_id() {
-                        return true;
-                    }
+                if columns.len() == 1 && columns[0].is_id() {
+                    return true;
                 }
             }
         }
@@ -647,15 +646,12 @@ impl CreateIndex {
         }
     }
 
-    pub fn fields_exist_in_dest<'a>(&self, dest_table: &'a Table) -> bool {
+    pub fn fields_exist_in_dest(&self, dest_table: &Table) -> bool {
         fn column_exists<'a>(it: &mut impl Iterator<Item = &'a str>, column_name: &str) -> bool {
             it.any(|c| *c == *column_name)
         }
 
-        fn some_column_contained<'a>(
-            expr: &String,
-            it: &mut impl Iterator<Item = &'a str>,
-        ) -> bool {
+        fn some_column_contained<'a>(expr: &str, it: &mut impl Iterator<Item = &'a str>) -> bool {
             it.any(|c| expr.contains(c))
         }
 
@@ -752,19 +748,19 @@ pub struct IndexList {
     pub(crate) indexes: HashMap<String, Vec<CreateIndex>>,
 }
 
-pub fn load_indexes_from_table(
-    conn: &mut PgConnection,
+pub async fn load_indexes_from_table(
+    conn: &mut AsyncPgConnection,
     table: &Arc<Table>,
     schema_name: &str,
 ) -> Result<Vec<CreateIndex>, StoreError> {
     let table_name = table.name.as_str();
-    let indexes = catalog::indexes_for_table(conn, schema_name, table_name)?;
+    let indexes = catalog::indexes_for_table(conn, schema_name, table_name).await?;
     Ok(indexes.into_iter().map(CreateIndex::parse).collect())
 }
 
 impl IndexList {
-    pub fn load(
-        conn: &mut PgConnection,
+    pub async fn load(
+        conn: &mut AsyncPgConnection,
         site: Arc<Site>,
         store: DeploymentStore,
     ) -> Result<Self, StoreError> {
@@ -772,9 +768,9 @@ impl IndexList {
             indexes: HashMap::new(),
         };
         let schema_name = site.namespace.clone();
-        let layout = store.layout(conn, site)?;
-        for (_, table) in &layout.tables {
-            let indexes = load_indexes_from_table(conn, table, schema_name.as_str())?;
+        let layout = store.layout(conn, site).await?;
+        for table in layout.tables.values() {
+            let indexes = load_indexes_from_table(conn, table, schema_name.as_str()).await?;
             list.indexes.insert(table.name.to_string(), indexes);
         }
         Ok(list)
@@ -818,9 +814,9 @@ impl IndexList {
         Ok(arr)
     }
 
-    pub fn recreate_invalid_indexes(
+    pub async fn recreate_invalid_indexes(
         &self,
-        conn: &mut PgConnection,
+        conn: &mut AsyncPgConnection,
         layout: &Layout,
     ) -> Result<(), StoreError> {
         #[derive(QueryableByName, Debug)]
@@ -851,22 +847,19 @@ impl IndexList {
                         .bind::<Text, _>(namespace.to_string())
                         .bind::<Text, _>(table_name)
                         .bind::<Text, _>(index_name.clone())
-                        .get_results::<IndexInfo>(conn)?
+                        .get_results::<IndexInfo>(conn)
+                        .await?
                         .into_iter()
-                        .map(|ii| ii.into())
                         .collect::<Vec<IndexInfo>>();
                     assert!(ii_vec.len() <= 1);
-                    if ii_vec.len() == 0 || !ii_vec[0].isvalid {
+                    if ii_vec.is_empty() || !ii_vec[0].isvalid {
                         // if a bad index exist lets first drop it
-                        if ii_vec.len() > 0 {
-                            let drop_query = sql_query(format!(
-                                "DROP INDEX {}.{};",
-                                namespace.to_string(),
-                                index_name
-                            ));
-                            conn.transaction(|conn| drop_query.execute(conn))?;
+                        if !ii_vec.is_empty() {
+                            let drop_query =
+                                sql_query(format!("DROP INDEX {}.{};", namespace, index_name));
+                            drop_query.execute(conn).await?;
                         }
-                        sql_query(create_query).execute(conn)?;
+                        sql_query(create_query).execute(conn).await?;
                     }
                 }
             }

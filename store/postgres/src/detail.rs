@@ -4,21 +4,24 @@
 #![allow(unused_macros)]
 use diesel::dsl::sql;
 use diesel::prelude::{
-    ExpressionMethods, JoinOnDsl, NullableExpressionMethods, OptionalExtension, PgConnection,
-    QueryDsl, RunQueryDsl, SelectableHelper as _,
+    ExpressionMethods, JoinOnDsl, NullableExpressionMethods, OptionalExtension, QueryDsl,
+    SelectableHelper as _,
 };
+use diesel::sql_types::{Array, BigInt, Integer};
+use diesel_async::RunQueryDsl;
 use diesel_derives::Associations;
 use git_testament::{git_testament, git_testament_macros};
 use graph::blockchain::BlockHash;
 use graph::data::store::scalar::ToPrimitive;
 use graph::data::subgraph::schema::{SubgraphError, SubgraphManifestEntity};
+use graph::prelude::alloy::primitives::B256;
 use graph::prelude::BlockNumber;
 use graph::prelude::{
     chrono::{DateTime, Utc},
     BlockPtr, DeploymentHash, StoreError, SubgraphDeploymentEntity,
 };
 use graph::schema::InputSchema;
-use graph::{data::subgraph::status, internal_error, prelude::web3::types::H256};
+use graph::{data::subgraph::status, internal_error};
 use itertools::Itertools;
 use std::collections::HashMap;
 use std::convert::TryFrom;
@@ -29,6 +32,7 @@ use crate::deployment::{
     subgraph_manifest, SubgraphHealth as HealthType,
 };
 use crate::primary::{DeploymentId, Site};
+use crate::AsyncPgConnection;
 
 git_testament_macros!(version);
 git_testament!(TESTAMENT);
@@ -130,7 +134,7 @@ impl From<(Deployment, Head)> for DeploymentDetail {
             synced_at,
             synced_at_block_number,
             block_hash: block_hash.clone(),
-            block_number: block_number.clone(),
+            block_number,
             entity_count: entity_count as usize,
         }
     }
@@ -153,8 +157,8 @@ pub(crate) struct ErrorDetail {
 impl ErrorDetail {
     /// Fetches the fatal error, if present, associated with the given
     /// [`DeploymentHash`].
-    pub fn fatal(
-        conn: &mut PgConnection,
+    pub async fn fatal(
+        conn: &mut AsyncPgConnection,
         deployment_id: &DeploymentHash,
     ) -> Result<Option<Self>, StoreError> {
         use subgraph_deployment as d;
@@ -165,6 +169,7 @@ impl ErrorDetail {
             .inner_join(e::table.on(e::id.nullable().eq(d::fatal_error)))
             .select(ErrorDetail::as_select())
             .get_result(conn)
+            .await
             .optional()
             .map_err(StoreError::from)
     }
@@ -187,7 +192,7 @@ impl TryFrom<ErrorDetail> for SubgraphError {
         // FIXME:
         //
         // workaround for arweave
-        let block_hash = block_hash.map(|hash| H256::from_slice(&hash.as_slice()[..32]));
+        let block_hash = block_hash.map(|hash| B256::from_slice(&hash.as_slice()[..32]));
         // In existing databases, we have errors that have a `block_range` of
         // `UNVERSIONED_RANGE`, which leads to `None` as the block number, but
         // has a hash. Conversely, it is also possible for an error to not have a
@@ -239,6 +244,7 @@ pub(crate) fn info_from_details(
     non_fatal: Vec<ErrorDetail>,
     sites: &[Arc<Site>],
     subgraph_history_blocks: i32,
+    subgraph_size: status::SubgraphSize,
 ) -> Result<status::Info, StoreError> {
     let DeploymentDetail {
         id,
@@ -301,12 +307,13 @@ pub(crate) fn info_from_details(
         entity_count,
         node: None,
         history_blocks: subgraph_history_blocks,
+        subgraph_size,
     })
 }
 
 /// Return the details for `deployments`
-pub(crate) fn deployment_details(
-    conn: &mut PgConnection,
+pub(crate) async fn deployment_details(
+    conn: &mut AsyncPgConnection,
     deployments: Vec<String>,
 ) -> Result<Vec<DeploymentDetail>, StoreError> {
     use subgraph_deployment as d;
@@ -319,13 +326,15 @@ pub(crate) fn deployment_details(
         d::table
             .inner_join(h::table)
             .select(cols)
-            .load::<(Deployment, Head)>(conn)?
+            .load::<(Deployment, Head)>(conn)
+            .await?
     } else {
         d::table
             .inner_join(h::table)
             .filter(d::subgraph.eq_any(&deployments))
             .select(cols)
-            .load::<(Deployment, Head)>(conn)?
+            .load::<(Deployment, Head)>(conn)
+            .await?
     }
     .into_iter()
     .map(DeploymentDetail::from)
@@ -334,8 +343,8 @@ pub(crate) fn deployment_details(
 }
 
 /// Return the details for `deployment`
-pub(crate) fn deployment_details_for_id(
-    conn: &mut PgConnection,
+pub(crate) async fn deployment_details_for_id(
+    conn: &mut AsyncPgConnection,
     deployment: &DeploymentId,
 ) -> Result<DeploymentDetail, StoreError> {
     use subgraph_deployment as d;
@@ -348,12 +357,13 @@ pub(crate) fn deployment_details_for_id(
         .filter(d::id.eq(&deployment))
         .select(cols)
         .first::<(Deployment, Head)>(conn)
+        .await
         .map_err(StoreError::from)
         .map(DeploymentDetail::from)
 }
 
-pub(crate) fn deployment_statuses(
-    conn: &mut PgConnection,
+pub(crate) async fn deployment_statuses(
+    conn: &mut AsyncPgConnection,
     sites: &[Arc<Site>],
 ) -> Result<Vec<status::Info>, StoreError> {
     use subgraph_deployment as d;
@@ -376,14 +386,16 @@ pub(crate) fn deployment_statuses(
                 .inner_join(h::table)
                 .left_outer_join(join)
                 .select(cols)
-                .load::<(Deployment, Head, Option<ErrorDetail>)>(conn)?
+                .load::<(Deployment, Head, Option<ErrorDetail>)>(conn)
+                .await?
         } else {
             d::table
                 .inner_join(h::table)
                 .left_outer_join(join)
                 .filter(d::id.eq_any(sites.iter().map(|site| site.id)))
                 .select(cols)
-                .load::<(Deployment, Head, Option<ErrorDetail>)>(conn)?
+                .load::<(Deployment, Head, Option<ErrorDetail>)>(conn)
+                .await?
         }
     };
 
@@ -395,13 +407,15 @@ pub(crate) fn deployment_statuses(
             d::table
                 .inner_join(join)
                 .select((d::id, ErrorDetail::as_select()))
-                .load::<(DeploymentId, ErrorDetail)>(conn)?
+                .load::<(DeploymentId, ErrorDetail)>(conn)
+                .await?
         } else {
             d::table
                 .inner_join(join)
                 .filter(d::id.eq_any(sites.iter().map(|site| site.id)))
                 .select((d::id, ErrorDetail::as_select()))
-                .load::<(DeploymentId, ErrorDetail)>(conn)?
+                .load::<(DeploymentId, ErrorDetail)>(conn)
+                .await?
         }
         .into_iter()
         .into_group_map()
@@ -411,16 +425,20 @@ pub(crate) fn deployment_statuses(
         if sites.is_empty() {
             sm::table
                 .select((sm::id, sm::history_blocks))
-                .load::<(DeploymentId, i32)>(conn)?
+                .load::<(DeploymentId, i32)>(conn)
+                .await?
         } else {
             sm::table
                 .filter(sm::id.eq_any(sites.iter().map(|site| site.id)))
                 .select((sm::id, sm::history_blocks))
-                .load::<(DeploymentId, i32)>(conn)?
+                .load::<(DeploymentId, i32)>(conn)
+                .await?
         }
         .into_iter()
         .collect()
     };
+
+    let mut deployment_sizes = deployment_sizes(conn, sites).await?;
 
     details_with_fatal_error
         .into_iter()
@@ -428,9 +446,84 @@ pub(crate) fn deployment_statuses(
             let detail = DeploymentDetail::from((deployment, head));
             let non_fatal = non_fatal_errors.remove(&detail.id).unwrap_or_default();
             let subgraph_history_blocks = history_blocks_map.remove(&detail.id).unwrap_or_default();
-            info_from_details(detail, fatal, non_fatal, sites, subgraph_history_blocks)
+            let table_sizes = deployment_sizes.remove(&detail.id).unwrap_or_default();
+            info_from_details(
+                detail,
+                fatal,
+                non_fatal,
+                sites,
+                subgraph_history_blocks,
+                table_sizes,
+            )
         })
         .collect()
+}
+
+async fn deployment_sizes(
+    conn: &mut AsyncPgConnection,
+    sites: &[Arc<Site>],
+) -> Result<HashMap<DeploymentId, status::SubgraphSize>, StoreError> {
+    #[derive(QueryableByName)]
+    struct SubgraphSizeRow {
+        #[diesel(sql_type = Integer)]
+        id: DeploymentId,
+        #[diesel(sql_type = BigInt)]
+        row_estimate: i64,
+        #[diesel(sql_type = BigInt)]
+        table_bytes: i64,
+        #[diesel(sql_type = BigInt)]
+        index_bytes: i64,
+        #[diesel(sql_type = BigInt)]
+        toast_bytes: i64,
+        #[diesel(sql_type = BigInt)]
+        total_bytes: i64,
+    }
+
+    let mut query = String::from(
+        r#"
+        SELECT
+            ds.id,
+            ss.row_estimate::bigint,
+            ss.table_bytes::bigint,
+            ss.index_bytes::bigint,
+            ss.toast_bytes::bigint,
+            ss.total_bytes::bigint
+        FROM deployment_schemas ds
+        JOIN info.subgraph_sizes as ss on ss.name = ds.name
+    "#,
+    );
+
+    let result = if sites.is_empty() {
+        diesel::sql_query(query).load::<SubgraphSizeRow>(conn).await
+    } else {
+        query.push_str(" WHERE ds.id = ANY($1)");
+        diesel::sql_query(query)
+            .bind::<Array<Integer>, _>(sites.iter().map(|site| site.id).collect::<Vec<_>>())
+            .load::<SubgraphSizeRow>(conn)
+            .await
+    };
+
+    let rows = match result {
+        Ok(rows) => rows,
+        Err(e) if e.to_string().contains("has not been populated") => Vec::new(),
+        Err(e) => return Err(e.into()),
+    };
+
+    let mut sizes: HashMap<DeploymentId, status::SubgraphSize> = HashMap::new();
+    for row in rows {
+        sizes.insert(
+            row.id,
+            status::SubgraphSize {
+                row_estimate: row.row_estimate,
+                table_bytes: row.table_bytes,
+                index_bytes: row.index_bytes,
+                toast_bytes: row.toast_bytes,
+                total_bytes: row.total_bytes,
+            },
+        );
+    }
+
+    Ok(sizes)
 }
 
 #[derive(Queryable, Selectable, Identifiable, Associations)]
@@ -454,7 +547,7 @@ struct StoredSubgraphManifest {
 }
 
 impl StoredSubgraphManifest {
-    fn as_manifest(self, schema: &InputSchema) -> SubgraphManifestEntity {
+    fn into_manifest_entity(self, schema: &InputSchema) -> SubgraphManifestEntity {
         let e: Vec<_> = self
             .entities_with_causality_region
             .into_iter()
@@ -476,7 +569,7 @@ impl StoredSubgraphManifest {
 struct StoredDeploymentEntity(crate::detail::DeploymentDetail, StoredSubgraphManifest);
 
 impl StoredDeploymentEntity {
-    fn as_subgraph_deployment(
+    fn into_subgraph_deployment_entity(
         self,
         schema: &InputSchema,
     ) -> Result<SubgraphDeploymentEntity, StoreError> {
@@ -486,7 +579,7 @@ impl StoredDeploymentEntity {
             &detail.subgraph,
             "start_block",
             manifest.start_block_hash.clone(),
-            manifest.start_block_number.map(|n| n.into()),
+            manifest.start_block_number,
         )?
         .map(|block| block.to_ptr());
 
@@ -519,7 +612,7 @@ impl StoredDeploymentEntity {
             .map_err(|b| internal_error!("invalid debug fork `{}`", b))?;
 
         Ok(SubgraphDeploymentEntity {
-            manifest: manifest.as_manifest(schema),
+            manifest: manifest.into_manifest_entity(schema),
             failed: detail.failed,
             health: detail.health.into(),
             synced_at: detail.synced_at,
@@ -538,8 +631,8 @@ impl StoredDeploymentEntity {
     }
 }
 
-pub fn deployment_entity(
-    conn: &mut PgConnection,
+pub async fn deployment_entity(
+    conn: &mut AsyncPgConnection,
     site: &Site,
     schema: &InputSchema,
 ) -> Result<SubgraphDeploymentEntity, StoreError> {
@@ -550,16 +643,18 @@ pub fn deployment_entity(
     let manifest = m::table
         .find(site.id)
         .select(StoredSubgraphManifest::as_select())
-        .first::<StoredSubgraphManifest>(conn)?;
+        .first::<StoredSubgraphManifest>(conn)
+        .await?;
 
     let detail = d::table
         .inner_join(h::table)
         .filter(d::id.eq(site.id))
         .select(<(Deployment, Head)>::as_select())
         .first::<(Deployment, Head)>(conn)
+        .await
         .map(DeploymentDetail::from)?;
 
-    StoredDeploymentEntity(detail, manifest).as_subgraph_deployment(schema)
+    StoredDeploymentEntity(detail, manifest).into_subgraph_deployment_entity(schema)
 }
 
 #[derive(Queryable, Identifiable, Insertable)]
@@ -575,7 +670,7 @@ pub struct GraphNodeVersion {
 }
 
 impl GraphNodeVersion {
-    pub(crate) fn create_or_get(conn: &mut PgConnection) -> anyhow::Result<i32> {
+    pub(crate) async fn create_or_get(conn: &mut AsyncPgConnection) -> anyhow::Result<i32> {
         let git_commit_hash = version_commit_hash!();
         let git_repository_dirty = !&TESTAMENT.modifications.is_empty();
         let crate_version = CARGO_PKG_VERSION;
@@ -603,7 +698,8 @@ impl GraphNodeVersion {
                     g::patch.eq(&patch),
                 ))
                 .on_conflict_do_nothing()
-                .execute(conn)?;
+                .execute(conn)
+                .await?;
 
             // select the id for the row we just inserted
             g::graph_node_versions
@@ -614,7 +710,8 @@ impl GraphNodeVersion {
                 .filter(g::major.eq(&major))
                 .filter(g::minor.eq(&minor))
                 .filter(g::patch.eq(&patch))
-                .get_result(conn)?
+                .get_result(conn)
+                .await?
         };
         Ok(graph_node_version_id)
     }

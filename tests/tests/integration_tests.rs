@@ -17,13 +17,13 @@ use anyhow::{anyhow, bail, Context, Result};
 use graph::futures03::StreamExt;
 use graph::itertools::Itertools;
 use graph::prelude::serde_json::{json, Value};
-use graph::prelude::web3::types::U256;
 use graph_tests::contract::Contract;
 use graph_tests::subgraph::Subgraph;
 use graph_tests::{error, status, CONFIG};
 use tokio::process::Child;
 use tokio::task::JoinError;
 use tokio::time::sleep;
+use web3::types::U256;
 
 const SUBGRAPH_LAST_GRAFTING_BLOCK: i32 = 3;
 
@@ -52,10 +52,7 @@ pub struct TestResult {
 
 impl TestResult {
     pub fn success(&self) -> bool {
-        match self.status {
-            TestStatus::Ok => true,
-            _ => false,
-        }
+        matches!(self.status, TestStatus::Ok)
     }
 
     fn print_subgraph(&self) {
@@ -101,7 +98,7 @@ pub enum SourceSubgraph {
 }
 
 impl SourceSubgraph {
-    pub fn from_str(s: &str) -> Self {
+    fn new(s: &str) -> Self {
         if let Some((alias, subgraph)) = s.split_once(':') {
             Self::WithAlias((alias.to_string(), subgraph.to_string()))
         } else {
@@ -147,7 +144,7 @@ impl TestCase {
         T: Future<Output = Result<(), anyhow::Error>> + Send + 'static,
     {
         let mut test_case = Self::new(name, test);
-        test_case.source_subgraph = Some(vec![SourceSubgraph::from_str(base_subgraph)]);
+        test_case.source_subgraph = Some(vec![SourceSubgraph::new(base_subgraph)]);
         test_case
     }
 
@@ -163,7 +160,7 @@ impl TestCase {
         test_case.source_subgraph = Some(
             source_subgraphs
                 .into_iter()
-                .map(SourceSubgraph::from_str)
+                .map(SourceSubgraph::new)
                 .collect(),
         );
         test_case
@@ -175,7 +172,7 @@ impl TestCase {
         contracts: &[Contract],
     ) -> Result<Subgraph> {
         status!(&self.name, "Deploying subgraph");
-        let subgraph_name = match Subgraph::deploy(&subgraph_name, contracts).await {
+        let subgraph_name = match Subgraph::deploy(subgraph_name, contracts).await {
             Ok(name) => name,
             Err(e) => {
                 error!(&self.name, "Deploy failed");
@@ -1119,7 +1116,7 @@ async fn test_declared_calls_basic(ctx: TestContext) -> anyhow::Result<()> {
     assert!(subgraph.healthy);
 
     // Query the results
-    const QUERY: &'static str = "{
+    const QUERY: &str = "{
         transferCalls(first: 1, orderBy: blockNumber) {
             id
             from
@@ -1200,7 +1197,7 @@ async fn test_declared_calls_struct_fields(ctx: TestContext) -> anyhow::Result<(
     sleep(Duration::from_secs(2)).await;
 
     // Query the results
-    const QUERY: &'static str = "{
+    const QUERY: &str = "{
         assetTransferCalls(first: 1, orderBy: blockNumber) {
             id
             assetAddr
@@ -1307,7 +1304,7 @@ async fn wait_for_blockchain_block(block_number: i32) -> bool {
 }
 
 /// The main test entrypoint.
-#[tokio::test]
+#[graph::test]
 async fn integration_tests() -> anyhow::Result<()> {
     let test_name_to_run = std::env::var("TEST_CASE").ok();
 

@@ -1,17 +1,18 @@
 use std::{convert::TryFrom, str::FromStr, sync::Arc};
 
 use graph::blockchain::{BlockTime, ChainIdentifier};
+use graph::prelude::alloy::consensus::Header as ConsensusHeader;
+use graph::prelude::alloy::primitives::{Bloom, B256, U256};
+use graph::prelude::alloy::rpc::types::{Block, Header};
+use graph::prelude::LightEthereumBlock;
 use lazy_static::lazy_static;
 
 use graph::components::store::BlockStore;
 use graph::{
     blockchain::Block as BlockchainBlock,
-    prelude::{
-        serde_json, web3::types::H256, web3::types::U256, BlockHash, BlockNumber, BlockPtr,
-        EthereumBlock, LightEthereumBlock,
-    },
+    prelude::{serde_json, BlockHash, BlockNumber, BlockPtr, EthereumBlock},
 };
-use graph_chain_ethereum::codec::{Block, BlockHeader};
+use graph_chain_ethereum::codec::{Block as FirehoseBlock, BlockHeader};
 use prost_types::Timestamp;
 
 use crate::{GENESIS_PTR, NETWORK_VERSION};
@@ -103,36 +104,48 @@ impl FakeBlock {
     }
 
     pub fn as_ethereum_block(&self) -> EthereumBlock {
-        let parent_hash = H256::from_str(self.parent_hash.as_str()).expect("invalid parent hash");
+        let parent_hash = B256::from_str(self.parent_hash.as_str()).expect("invalid parent hash");
+        let block_hash = B256::from_str(self.hash.as_str()).expect("invalid block hash");
 
-        let mut block = LightEthereumBlock::default();
-        block.number = Some(self.number.into());
-        block.parent_hash = parent_hash;
-        block.hash = Some(H256(self.block_hash().as_slice().try_into().unwrap()));
-        if let Some(ts) = self.timestamp {
-            block.timestamp = ts;
-        }
+        let consensus_header = ConsensusHeader {
+            number: self.number as u64,
+            parent_hash,
+            logs_bloom: Bloom::default(), // Empty bloom filter for test blocks
+            timestamp: self.timestamp.map(|ts| ts.to::<u64>()).unwrap_or_default(),
+            ..Default::default()
+        };
+
+        let rpc_header = Header {
+            hash: block_hash,
+            inner: consensus_header,
+            total_difficulty: None,
+            size: None,
+        };
+
+        let block = Block::empty(rpc_header);
 
         EthereumBlock {
-            block: Arc::new(block),
+            block: Arc::new(LightEthereumBlock::new(block.into())),
             transaction_receipts: Vec::new(),
         }
     }
 
-    pub fn as_firehose_block(&self) -> Block {
-        let mut block = Block::default();
-        block.hash = self.hash.clone().into_bytes();
-        block.number = self.number as u64;
+    pub fn as_firehose_block(&self) -> FirehoseBlock {
+        let header = BlockHeader {
+            parent_hash: self.parent_hash.clone().into_bytes(),
+            timestamp: self.timestamp.map(|ts| Timestamp {
+                seconds: ts.to_string().parse().unwrap(),
+                nanos: 0,
+            }),
+            ..Default::default()
+        };
 
-        let mut header = BlockHeader::default();
-        header.parent_hash = self.parent_hash.clone().into_bytes();
-        header.timestamp = self.timestamp.map(|ts| Timestamp {
-            seconds: i64::from_str_radix(&ts.to_string(), 10).unwrap(),
-            nanos: 0,
-        });
-        block.header = Some(header);
-
-        block
+        FirehoseBlock {
+            hash: self.hash.clone().into_bytes(),
+            number: self.number as u64,
+            header: Some(header),
+            ..Default::default()
+        }
     }
 }
 
@@ -189,7 +202,7 @@ pub type FakeBlockList = Vec<&'static FakeBlock>;
 /// `null`
 pub async fn set_chain(chain: FakeBlockList, network: &str) -> Vec<(BlockPtr, BlockHash)> {
     let block_store = crate::store::STORE.block_store();
-    let store = match block_store.chain_store(network) {
+    let store = match block_store.chain_store(network).await {
         Some(cs) => cs,
         None => block_store
             .create_chain_store(
@@ -199,6 +212,7 @@ pub async fn set_chain(chain: FakeBlockList, network: &str) -> Vec<(BlockPtr, Bl
                     genesis_block_hash: GENESIS_PTR.hash.clone(),
                 },
             )
+            .await
             .unwrap(),
     };
     let chain: Vec<Arc<dyn BlockchainBlock>> = chain

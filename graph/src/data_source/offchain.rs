@@ -2,11 +2,15 @@ use crate::{
     bail,
     blockchain::{BlockPtr, BlockTime, Blockchain},
     components::{
-        link_resolver::LinkResolver,
+        link_resolver::{LinkResolver, LinkResolverContext},
         store::{BlockNumber, StoredDynamicDataSource},
         subgraph::{InstanceDSTemplate, InstanceDSTemplateInfo},
     },
-    data::{store::scalar::Bytes, subgraph::SPEC_VERSION_0_0_7, value::Word},
+    data::{
+        store::scalar::Bytes,
+        subgraph::{DeploymentHash, SPEC_VERSION_0_0_7},
+        value::Word,
+    },
     data_source,
     ipfs::ContentPath,
     prelude::{DataSourceContext, Link},
@@ -59,21 +63,17 @@ impl OffchainDataSourceKind {
     }
 }
 
-impl ToString for OffchainDataSourceKind {
-    fn to_string(&self) -> String {
+impl fmt::Display for OffchainDataSourceKind {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         // This is less performant than hardcoding the values but makes it more difficult
         // to be used incorrectly, since this map is quite small it should be fine.
-        OFFCHAIN_KINDS
+        let label = OFFCHAIN_KINDS
             .iter()
-            .find_map(|(str, kind)| {
-                if kind.eq(self) {
-                    Some(str.to_string())
-                } else {
-                    None
-                }
-            })
+            .find_map(|(str, kind)| if kind.eq(self) { Some(*str) } else { None })
             // the kind is validated based on OFFCHAIN_KINDS so it's guaranteed to exist
-            .unwrap()
+            .unwrap_or("<unknown offchain kind>");
+
+        write!(f, "{}", label)
     }
 }
 
@@ -332,9 +332,9 @@ impl Source {
     }
 }
 
-impl Into<Bytes> for Source {
-    fn into(self) -> Bytes {
-        match self {
+impl From<Source> for Bytes {
+    fn from(val: Source) -> Self {
+        match val {
             Source::Ipfs(ref path) => Bytes::from(path.to_string().as_bytes().to_vec()),
             Source::Arweave(ref base64) => Bytes::from(base64.as_bytes()),
         }
@@ -377,6 +377,7 @@ pub struct UnresolvedMapping {
 impl UnresolvedMapping {
     pub async fn resolve(
         self,
+        deployment_hash: &DeploymentHash,
         resolver: &Arc<dyn LinkResolver>,
         schema: &InputSchema,
         logger: &Logger,
@@ -400,7 +401,14 @@ impl UnresolvedMapping {
             api_version: semver::Version::parse(&self.api_version)?,
             entities,
             handler: self.handler,
-            runtime: Arc::new(resolver.cat(logger, &self.file).await?),
+            runtime: Arc::new(
+                resolver
+                    .cat(
+                        &LinkResolverContext::new(deployment_hash, logger),
+                        &self.file,
+                    )
+                    .await?,
+            ),
             link: self.file,
         })
     }
@@ -423,15 +431,15 @@ pub struct DataSourceTemplate {
     pub mapping: Mapping,
 }
 
-impl Into<DataSourceTemplateInfo> for DataSourceTemplate {
-    fn into(self) -> DataSourceTemplateInfo {
+impl From<DataSourceTemplate> for DataSourceTemplateInfo {
+    fn from(val: DataSourceTemplate) -> Self {
         let DataSourceTemplate {
             kind,
             network: _,
             name,
             manifest_idx,
             mapping,
-        } = self;
+        } = val;
 
         DataSourceTemplateInfo {
             api_version: mapping.api_version.clone(),
@@ -446,6 +454,7 @@ impl Into<DataSourceTemplateInfo> for DataSourceTemplate {
 impl UnresolvedDataSourceTemplate {
     pub async fn resolve(
         self,
+        deployment_hash: &DeploymentHash,
         resolver: &Arc<dyn LinkResolver>,
         logger: &Logger,
         manifest_idx: u32,
@@ -455,7 +464,7 @@ impl UnresolvedDataSourceTemplate {
 
         let mapping = self
             .mapping
-            .resolve(resolver, schema, logger)
+            .resolve(deployment_hash, resolver, schema, logger)
             .await
             .with_context(|| format!("failed to resolve data source template {}", self.name))?;
 

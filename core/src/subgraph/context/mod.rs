@@ -1,16 +1,13 @@
 mod instance;
 
 use crate::polling_monitor::{
-    spawn_monitor, ArweaveService, IpfsService, PollingMonitor, PollingMonitorMetrics,
+    spawn_monitor, ArweaveService, IpfsRequest, IpfsService, PollingMonitor, PollingMonitorMetrics,
 };
 use anyhow::{self, Error};
 use bytes::Bytes;
 use graph::{
-    blockchain::{BlockTime, Blockchain, TriggerFilterWrapper},
-    components::{
-        store::{DeploymentId, SubgraphFork},
-        subgraph::{HostMetrics, MappingError, RuntimeHost as _, SharedProofOfIndexing},
-    },
+    blockchain::{Blockchain, TriggerFilterWrapper},
+    components::{store::DeploymentId, subgraph::HostMetrics},
     data::subgraph::SubgraphManifest,
     data_source::{
         causality_region::CausalityRegionSeq,
@@ -18,20 +15,20 @@ use graph::{
         CausalityRegion, DataSource, DataSourceTemplate,
     },
     derive::CheapClone,
-    ipfs::ContentPath,
+    ipfs::IpfsContext,
     prelude::{
-        BlockNumber, BlockPtr, BlockState, CancelGuard, CheapClone, DeploymentHash,
-        MetricsRegistry, RuntimeHostBuilder, SubgraphCountMetric, SubgraphInstanceMetrics,
-        TriggerProcessor,
+        BlockNumber, CancelGuard, CheapClone, DeploymentHash, MetricsRegistry, RuntimeHostBuilder,
+        SubgraphCountMetric, TriggerProcessor,
     },
     slog::Logger,
-    tokio::sync::mpsc,
 };
-use std::sync::{Arc, RwLock};
-use std::{collections::HashMap, time::Instant};
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use graph::parking_lot::RwLock;
+use tokio::sync::mpsc;
 
 use self::instance::SubgraphInstance;
-
 use super::Decoder;
 
 #[derive(Clone, CheapClone, Debug)]
@@ -49,18 +46,18 @@ impl SubgraphKeepAlive {
     }
 
     pub fn remove(&self, deployment_id: &DeploymentId) {
-        self.alive_map.write().unwrap().remove(deployment_id);
+        self.alive_map.write().remove(deployment_id);
         self.sg_metrics.running_count.dec();
     }
     pub fn insert(&self, deployment_id: DeploymentId, guard: CancelGuard) {
-        let old = self.alive_map.write().unwrap().insert(deployment_id, guard);
+        let old = self.alive_map.write().insert(deployment_id, guard);
         if old.is_none() {
             self.sg_metrics.running_count.inc();
         }
     }
 
     pub fn contains(&self, deployment_id: &DeploymentId) -> bool {
-        self.alive_map.read().unwrap().contains_key(deployment_id)
+        self.alive_map.read().contains_key(deployment_id)
     }
 }
 
@@ -108,59 +105,6 @@ impl<C: Blockchain, T: RuntimeHostBuilder<C>> IndexingContext<C, T> {
             trigger_processor,
             decoder,
         }
-    }
-
-    pub async fn process_block(
-        &self,
-        logger: &Logger,
-        block_ptr: BlockPtr,
-        block_time: BlockTime,
-        block_data: Box<[u8]>,
-        handler: String,
-        mut state: BlockState,
-        proof_of_indexing: &SharedProofOfIndexing,
-        causality_region: &str,
-        debug_fork: &Option<Arc<dyn SubgraphFork>>,
-        subgraph_metrics: &Arc<SubgraphInstanceMetrics>,
-        instrument: bool,
-    ) -> Result<BlockState, MappingError> {
-        let error_count = state.deterministic_errors.len();
-
-        proof_of_indexing.start_handler(causality_region);
-
-        let start = Instant::now();
-
-        // This flow is expected to have a single data source(and a corresponding host) which
-        // gets executed every block.
-        state = self
-            .instance
-            .first_host()
-            .expect("Expected this flow to have exactly one host")
-            .process_block(
-                logger,
-                block_ptr,
-                block_time,
-                block_data,
-                handler,
-                state,
-                proof_of_indexing.cheap_clone(),
-                debug_fork,
-                instrument,
-            )
-            .await?;
-
-        let elapsed = start.elapsed().as_secs_f64();
-        subgraph_metrics.observe_trigger_processing_duration(elapsed);
-
-        if state.deterministic_errors.len() != error_count {
-            assert!(state.deterministic_errors.len() == error_count + 1);
-
-            // If a deterministic error has happened, write a new
-            // ProofOfIndexingEvent::DeterministicError to the SharedProofOfIndexing.
-            proof_of_indexing.write_deterministic_error(logger, causality_region);
-        }
-
-        Ok(state)
     }
 
     /// Removes data sources hosts with a creation block greater or equal to `reverted_block`, so
@@ -224,10 +168,12 @@ impl<C: Blockchain, T: RuntimeHostBuilder<C>> IndexingContext<C, T> {
 }
 
 pub struct OffchainMonitor {
-    ipfs_monitor: PollingMonitor<ContentPath>,
-    ipfs_monitor_rx: mpsc::UnboundedReceiver<(ContentPath, Bytes)>,
+    ipfs_monitor: PollingMonitor<IpfsRequest>,
+    ipfs_monitor_rx: mpsc::UnboundedReceiver<(IpfsRequest, Bytes)>,
     arweave_monitor: PollingMonitor<Base64>,
     arweave_monitor_rx: mpsc::UnboundedReceiver<(Base64, Bytes)>,
+    deployment_hash: DeploymentHash,
+    logger: Logger,
 }
 
 impl OffchainMonitor {
@@ -251,31 +197,42 @@ impl OffchainMonitor {
             metrics.cheap_clone(),
         );
 
-        let arweave_monitor = spawn_monitor(arweave_service, arweave_monitor_tx, logger, metrics);
+        let arweave_monitor = spawn_monitor(
+            arweave_service,
+            arweave_monitor_tx,
+            logger.cheap_clone(),
+            metrics,
+        );
+
         Self {
             ipfs_monitor,
             ipfs_monitor_rx,
             arweave_monitor,
             arweave_monitor_rx,
+            deployment_hash: subgraph_hash.to_owned(),
+            logger,
         }
     }
 
     fn add_source(&mut self, source: offchain::Source) -> Result<(), Error> {
         match source {
-            offchain::Source::Ipfs(cid_file) => self.ipfs_monitor.monitor(cid_file),
+            offchain::Source::Ipfs(path) => self.ipfs_monitor.monitor(IpfsRequest {
+                ctx: IpfsContext::new(&self.deployment_hash, &self.logger),
+                path,
+            }),
             offchain::Source::Arweave(base64) => self.arweave_monitor.monitor(base64),
         };
         Ok(())
     }
 
     pub fn ready_offchain_events(&mut self) -> Result<Vec<offchain::TriggerData>, Error> {
-        use graph::tokio::sync::mpsc::error::TryRecvError;
+        use tokio::sync::mpsc::error::TryRecvError;
 
         let mut triggers = vec![];
         loop {
             match self.ipfs_monitor_rx.try_recv() {
-                Ok((cid_file, data)) => triggers.push(offchain::TriggerData {
-                    source: offchain::Source::Ipfs(cid_file),
+                Ok((req, data)) => triggers.push(offchain::TriggerData {
+                    source: offchain::Source::Ipfs(req.path),
                     data: Arc::new(data),
                 }),
                 Err(TryRecvError::Disconnected) => {

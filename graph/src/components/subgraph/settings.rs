@@ -45,7 +45,7 @@ impl Settings {
         Self::from_str(&read_to_string(path)?)
     }
 
-    pub fn from_str(toml: &str) -> Result<Self, anyhow::Error> {
+    fn from_str(toml: &str) -> Result<Self, anyhow::Error> {
         toml::from_str::<Self>(toml).map_err(anyhow::Error::from)
     }
 
@@ -77,18 +77,12 @@ mod test {
         let section = Settings::from_str(content).unwrap();
         assert_eq!(section.settings.len(), 3);
 
-        let rule1 = match &section.settings[0].pred {
-            Predicate::Name(name) => name,
-        };
+        let Predicate::Name(rule1) = &section.settings[0].pred;
         assert_eq!(rule1.as_str(), ".*");
 
-        let rule2 = match &section.settings[1].pred {
-            Predicate::Name(name) => name,
-        };
+        let Predicate::Name(rule2) = &section.settings[1].pred;
         assert_eq!(rule2.as_str(), "xxxxx");
-        let rule1 = match &section.settings[2].pred {
-            Predicate::Name(name) => name,
-        };
+        let Predicate::Name(rule1) = &section.settings[2].pred;
         assert_eq!(rule1.as_str(), ".*!$");
     }
 }

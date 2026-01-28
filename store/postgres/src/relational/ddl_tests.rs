@@ -26,9 +26,7 @@ fn test_layout(gql: &str) -> Layout {
 #[test]
 fn table_is_sane() {
     let layout = test_layout(THING_GQL);
-    let table = layout
-        .table(&"thing".into())
-        .expect("failed to get 'thing' table");
+    let table = layout.table("thing").expect("failed to get 'thing' table");
     assert_eq!(SqlName::from("thing"), table.name);
     assert_eq!("Thing", table.object.as_str());
 
@@ -417,14 +415,7 @@ fn postponed_indexes_with_block_column() {
 
     let dst_nsp = Namespace::new("sgd2".to_string()).unwrap();
     let arr = index_list()
-        .indexes_for_table(
-            &dst_nsp,
-            &table.name.to_string(),
-            &table,
-            true,
-            false,
-            false,
-        )
+        .indexes_for_table(&dst_nsp, &table.name.to_string(), table, true, false, false)
         .unwrap();
     assert_eq!(1, arr.len());
     assert!(!arr[0].1.contains(BLOCK_IDX));
@@ -434,7 +425,7 @@ fn postponed_indexes_with_block_column() {
         .indexes_for_table(
             &dst_nsp,
             &table.name.to_string(),
-            &table,
+            table,
             false,
             false,
             false,

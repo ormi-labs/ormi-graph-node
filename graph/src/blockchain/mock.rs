@@ -9,13 +9,14 @@ use crate::{
         },
         subgraph::InstanceDSTemplateInfo,
     },
-    data::subgraph::UnifiedMappingApiVersion,
+    data::subgraph::{DeploymentHash, UnifiedMappingApiVersion},
     data_source,
     prelude::{
         transaction_receipt::LightTransactionReceipt, BlockHash, ChainStore,
         DataSourceTemplateInfo, StoreError,
     },
 };
+use alloy::primitives::{B256, U256};
 use anyhow::{Error, Result};
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -26,7 +27,6 @@ use std::{
     convert::TryFrom,
     sync::Arc,
 };
-use web3::types::H256;
 
 use super::{
     block_stream::{self, BlockStream, FirehoseCursor},
@@ -73,7 +73,7 @@ pub fn test_ptr(n: BlockNumber) -> BlockPtr {
 }
 
 pub fn test_ptr_reorged(n: BlockNumber, reorg_n: u32) -> BlockPtr {
-    let mut hash = H256::from_low_u64_be(n as u64);
+    let mut hash = B256::from(U256::from(n as u64));
     hash[0..4].copy_from_slice(&reorg_n.to_be_bytes());
     BlockPtr {
         hash: hash.into(),
@@ -190,6 +190,7 @@ pub struct MockUnresolvedDataSource;
 impl<C: Blockchain> UnresolvedDataSource<C> for MockUnresolvedDataSource {
     async fn resolve(
         self,
+        _deployment_hash: &DeploymentHash,
         _resolver: &Arc<dyn LinkResolver>,
         _logger: &slog::Logger,
         _manifest_idx: u32,
@@ -202,8 +203,8 @@ impl<C: Blockchain> UnresolvedDataSource<C> for MockUnresolvedDataSource {
 #[derive(Debug, Clone)]
 pub struct MockDataSourceTemplate;
 
-impl Into<DataSourceTemplateInfo> for MockDataSourceTemplate {
-    fn into(self) -> DataSourceTemplateInfo {
+impl From<MockDataSourceTemplate> for DataSourceTemplateInfo {
+    fn from(_val: MockDataSourceTemplate) -> Self {
         todo!()
     }
 }
@@ -241,6 +242,7 @@ pub struct MockUnresolvedDataSourceTemplate;
 impl<C: Blockchain> UnresolvedDataSourceTemplate<C> for MockUnresolvedDataSourceTemplate {
     async fn resolve(
         self,
+        _deployment_hash: &DeploymentHash,
         _resolver: &Arc<dyn LinkResolver>,
         _logger: &slog::Logger,
         _manifest_idx: u32,
@@ -456,7 +458,7 @@ impl Blockchain for MockBlockchain {
         todo!()
     }
 
-    fn runtime(
+    async fn runtime(
         &self,
     ) -> anyhow::Result<(std::sync::Arc<dyn RuntimeAdapter<Self>>, Self::DecoderHook)> {
         bail!("mock has no runtime adapter")
@@ -482,7 +484,7 @@ impl ChainHeadStore for MockChainStore {
     async fn chain_head_ptr(self: Arc<Self>) -> Result<Option<BlockPtr>, Error> {
         unimplemented!()
     }
-    fn chain_head_cursor(&self) -> Result<Option<String>, Error> {
+    async fn chain_head_cursor(&self) -> Result<Option<String>, Error> {
         unimplemented!()
     }
     async fn set_chain_head(
@@ -510,19 +512,19 @@ impl ChainStore for MockChainStore {
     }
 
     // Implement other required methods with minimal implementations
-    fn genesis_block_ptr(&self) -> Result<BlockPtr, Error> {
+    async fn genesis_block_ptr(&self) -> Result<BlockPtr, Error> {
         unimplemented!()
     }
     async fn upsert_block(&self, _block: Arc<dyn Block>) -> Result<(), Error> {
         unimplemented!()
     }
-    fn upsert_light_blocks(&self, _blocks: &[&dyn Block]) -> Result<(), Error> {
+    async fn upsert_light_blocks(&self, _blocks: &[&dyn Block]) -> Result<(), Error> {
         unimplemented!()
     }
     async fn attempt_chain_head_update(
         self: Arc<Self>,
         _ancestor_count: BlockNumber,
-    ) -> Result<Option<H256>, Error> {
+    ) -> Result<Option<B256>, Error> {
         unimplemented!()
     }
     async fn blocks(self: Arc<Self>, _hashes: Vec<BlockHash>) -> Result<Vec<Value>, Error> {
@@ -536,16 +538,23 @@ impl ChainStore for MockChainStore {
     ) -> Result<Option<(Value, BlockPtr)>, Error> {
         unimplemented!()
     }
-    fn cleanup_cached_blocks(
+    async fn cleanup_cached_blocks(
         &self,
         _ancestor_count: BlockNumber,
     ) -> Result<Option<(BlockNumber, usize)>, Error> {
         unimplemented!()
     }
-    fn block_hashes_by_block_number(&self, _number: BlockNumber) -> Result<Vec<BlockHash>, Error> {
+    async fn block_hashes_by_block_number(
+        &self,
+        _number: BlockNumber,
+    ) -> Result<Vec<BlockHash>, Error> {
         unimplemented!()
     }
-    fn confirm_block_hash(&self, _number: BlockNumber, _hash: &BlockHash) -> Result<usize, Error> {
+    async fn confirm_block_hash(
+        &self,
+        _number: BlockNumber,
+        _hash: &BlockHash,
+    ) -> Result<usize, Error> {
         unimplemented!()
     }
     async fn block_number(
@@ -562,14 +571,21 @@ impl ChainStore for MockChainStore {
     }
     async fn transaction_receipts_in_block(
         &self,
-        _block_ptr: &H256,
+        _block_ptr: &B256,
     ) -> Result<Vec<LightTransactionReceipt>, StoreError> {
         unimplemented!()
     }
     async fn clear_call_cache(&self, _from: BlockNumber, _to: BlockNumber) -> Result<(), Error> {
         unimplemented!()
     }
-    fn chain_identifier(&self) -> Result<ChainIdentifier, Error> {
+    async fn clear_stale_call_cache(
+        &self,
+        _ttl_days: i32,
+        _ttl_max_contracts: Option<i64>,
+    ) -> Result<(), Error> {
+        unimplemented!()
+    }
+    async fn chain_identifier(&self) -> Result<ChainIdentifier, Error> {
         unimplemented!()
     }
     fn as_head_store(self: Arc<Self>) -> Arc<dyn ChainHeadStore> {
@@ -577,11 +593,12 @@ impl ChainStore for MockChainStore {
     }
 }
 
+#[async_trait]
 impl ChainIdStore for MockChainStore {
-    fn chain_identifier(&self, _name: &ChainName) -> Result<ChainIdentifier, Error> {
+    async fn chain_identifier(&self, _name: &ChainName) -> Result<ChainIdentifier, Error> {
         unimplemented!()
     }
-    fn set_chain_identifier(
+    async fn set_chain_identifier(
         &self,
         _name: &ChainName,
         _ident: &ChainIdentifier,

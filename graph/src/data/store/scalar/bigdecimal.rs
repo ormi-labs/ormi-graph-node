@@ -138,9 +138,21 @@ impl From<i64> for BigDecimal {
     }
 }
 
+impl From<i128> for BigDecimal {
+    fn from(n: i128) -> Self {
+        Self::from(OldBigDecimal::new(BigInt::from(n).inner(), 0))
+    }
+}
+
 impl From<u64> for BigDecimal {
     fn from(n: u64) -> Self {
         Self::from(OldBigDecimal::from(n))
+    }
+}
+
+impl From<f32> for BigDecimal {
+    fn from(n: f32) -> Self {
+        Self::from(OldBigDecimal::from_f32(n).unwrap_or_default())
     }
 }
 
@@ -619,7 +631,7 @@ mod test {
 
     #[test]
     fn big_decimal_stable() {
-        let cases = vec![
+        let cases = [
             (
                 "28b09c9c3f3e2fe037631b7fbccdf65c37594073016d8bf4bb0708b3fda8066a",
                 "0.1",

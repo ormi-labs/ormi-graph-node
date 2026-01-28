@@ -64,10 +64,10 @@ impl FirehoseBlockStreamMetrics {
 
     fn observe_successful_connection(&self, time: &mut Instant, provider: &str) {
         self.restarts
-            .with_label_values(&[self.deployment.as_str(), &provider, "true"])
+            .with_label_values(&[self.deployment.as_str(), provider, "true"])
             .inc();
         self.connect_duration
-            .with_label_values(&[self.deployment.as_str(), &provider])
+            .with_label_values(&[self.deployment.as_str(), provider])
             .set(time.elapsed().as_secs_f64());
 
         // Reset last connection timestamp
@@ -76,10 +76,10 @@ impl FirehoseBlockStreamMetrics {
 
     fn observe_failed_connection(&self, time: &mut Instant, provider: &str) {
         self.restarts
-            .with_label_values(&[self.deployment.as_str(), &provider, "false"])
+            .with_label_values(&[self.deployment.as_str(), provider, "false"])
             .inc();
         self.connect_duration
-            .with_label_values(&[self.deployment.as_str(), &provider])
+            .with_label_values(&[self.deployment.as_str(), provider])
             .set(time.elapsed().as_secs_f64());
 
         // Reset last connection timestamp
@@ -88,10 +88,10 @@ impl FirehoseBlockStreamMetrics {
 
     fn observe_response(&self, kind: &str, time: &mut Instant, provider: &str) {
         self.time_between_responses
-            .with_label_values(&[self.deployment.as_str(), &provider])
+            .with_label_values(&[self.deployment.as_str(), provider])
             .observe(time.elapsed().as_secs_f64());
         self.responses
-            .with_label_values(&[self.deployment.as_str(), &provider, kind])
+            .with_label_values(&[self.deployment.as_str(), provider, kind])
             .inc();
 
         // Reset last response timestamp
@@ -208,11 +208,11 @@ fn stream_blocks<C: Blockchain, F: FirehoseMapper<C>>(
     // Back off exponentially whenever we encounter a connection error or a stream with bad data
     let mut backoff = ExponentialBackoff::new(Duration::from_millis(500), Duration::from_secs(45));
 
-    // This attribute is needed because `try_stream!` seems to break detection of `skip_backoff` assignments
-    #[allow(unused_assignments)]
-    let mut skip_backoff = false;
-
     try_stream! {
+        // This attribute is needed because `try_stream!` seems to break detection of `skip_backoff` assignments
+        #[allow(unused_assignments)]
+        let mut skip_backoff = false;
+
         loop {
             let endpoint = client.firehose_endpoint().await?;
             let logger = logger.new(o!("deployment" => deployment.clone(), "provider" => endpoint.provider.to_string()));
@@ -366,10 +366,12 @@ async fn process_firehose_response<C: Blockchain, F: FirehoseMapper<C>>(
             let previous_block_ptr = block.parent_ptr();
             if previous_block_ptr.is_some() && previous_block_ptr.as_ref() != subgraph_current_block
             {
+                #[allow(clippy::unnecessary_unwrap)]
+                let firehose_start_block = previous_block_ptr.unwrap();
                 warn!(&logger,
                     "Firehose selected first streamed block's parent should match subgraph start block, reverting to last know final chain segment";
                     "subgraph_current_block" => &subgraph_current_block.unwrap(),
-                    "firehose_start_block" => &previous_block_ptr.unwrap(),
+                    "firehose_start_block" => &firehose_start_block,
                 );
 
                 let mut revert_to = mapper
@@ -463,48 +465,64 @@ mod tests {
 
         // Nothing
 
-        assert_eq!(
-            must_check_subgraph_continuity(&logger, &no_current_block, &no_cursor, 10),
-            false,
-        );
+        assert!(!must_check_subgraph_continuity(
+            &logger,
+            &no_current_block,
+            &no_cursor,
+            10
+        ),);
 
         // No cursor, subgraph current block ptr <, ==, > than manifest start block num
 
-        assert_eq!(
-            must_check_subgraph_continuity(&logger, &some_current_block(9), &no_cursor, 10),
-            false,
-        );
+        assert!(!must_check_subgraph_continuity(
+            &logger,
+            &some_current_block(9),
+            &no_cursor,
+            10
+        ),);
 
-        assert_eq!(
-            must_check_subgraph_continuity(&logger, &some_current_block(10), &no_cursor, 10),
-            true,
-        );
+        assert!(must_check_subgraph_continuity(
+            &logger,
+            &some_current_block(10),
+            &no_cursor,
+            10
+        ),);
 
-        assert_eq!(
-            must_check_subgraph_continuity(&logger, &some_current_block(11), &no_cursor, 10),
-            true,
-        );
+        assert!(must_check_subgraph_continuity(
+            &logger,
+            &some_current_block(11),
+            &no_cursor,
+            10
+        ),);
 
         // Some cursor, subgraph current block ptr <, ==, > than manifest start block num
 
-        assert_eq!(
-            must_check_subgraph_continuity(&logger, &no_current_block, &some_cursor, 10),
-            false,
-        );
+        assert!(!must_check_subgraph_continuity(
+            &logger,
+            &no_current_block,
+            &some_cursor,
+            10
+        ),);
 
-        assert_eq!(
-            must_check_subgraph_continuity(&logger, &some_current_block(9), &some_cursor, 10),
-            false,
-        );
+        assert!(!must_check_subgraph_continuity(
+            &logger,
+            &some_current_block(9),
+            &some_cursor,
+            10
+        ),);
 
-        assert_eq!(
-            must_check_subgraph_continuity(&logger, &some_current_block(10), &some_cursor, 10),
-            false,
-        );
+        assert!(!must_check_subgraph_continuity(
+            &logger,
+            &some_current_block(10),
+            &some_cursor,
+            10
+        ),);
 
-        assert_eq!(
-            must_check_subgraph_continuity(&logger, &some_current_block(11), &some_cursor, 10),
-            false,
-        );
+        assert!(!must_check_subgraph_continuity(
+            &logger,
+            &some_current_block(11),
+            &some_cursor,
+            10
+        ),);
     }
 }

@@ -114,8 +114,8 @@ where
     /// Never log failed attempts.
     /// May still log at `trace` logging level.
     pub fn no_logging(mut self) -> Self {
-        self.log_after = u64::max_value();
-        self.warn_after = u64::max_value();
+        self.log_after = u64::MAX;
+        self.warn_after = u64::MAX;
         self
     }
 
@@ -485,7 +485,7 @@ mod tests {
     use slog::o;
     use std::sync::Mutex;
 
-    #[tokio::test]
+    #[crate::test]
     async fn test() {
         let logger = Logger::root(::slog::Discard, o!());
 
@@ -510,7 +510,7 @@ mod tests {
         assert_eq!(result, Ok(10));
     }
 
-    #[tokio::test]
+    #[crate::test]
     async fn limit_reached() {
         let logger = Logger::root(::slog::Discard, o!());
 
@@ -535,7 +535,7 @@ mod tests {
         assert_eq!(result, Err(5));
     }
 
-    #[tokio::test]
+    #[crate::test]
     async fn limit_not_reached() {
         let logger = Logger::root(::slog::Discard, o!());
 
@@ -560,7 +560,7 @@ mod tests {
         assert_eq!(result, Ok(10));
     }
 
-    #[tokio::test]
+    #[crate::test]
     async fn custom_when() {
         let logger = Logger::root(::slog::Discard, o!());
         let c = Mutex::new(0);

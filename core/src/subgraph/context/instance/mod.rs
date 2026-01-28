@@ -182,6 +182,7 @@ where
                     Ok(Some(host))
                 }
             }
+            DataSource::Amp(_) => unreachable!(),
         }
     }
 
@@ -240,7 +241,7 @@ where
                 .matches_by_address(trigger.address_match()),
             TriggerData::Offchain(trigger) => self
                 .offchain_hosts
-                .matches_by_address(trigger.source.address().as_ref().map(|a| a.as_slice())),
+                .matches_by_address(trigger.source.address().as_deref()),
             TriggerData::Subgraph(trigger) => self
                 .subgraph_hosts
                 .matches_by_address(Some(trigger.source.to_bytes().as_slice())),
@@ -253,9 +254,5 @@ where
 
     pub fn hosts_len(&self) -> usize {
         self.onchain_hosts.len() + self.offchain_hosts.len()
-    }
-
-    pub fn first_host(&self) -> Option<&Arc<T::Host>> {
-        self.onchain_hosts.hosts().first()
     }
 }

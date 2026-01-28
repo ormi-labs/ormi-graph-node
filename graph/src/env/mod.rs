@@ -1,11 +1,13 @@
+mod amp;
 mod graphql;
 mod mappings;
 mod store;
 
+use std::{collections::HashSet, env::VarError, fmt, str::FromStr, sync::Arc, time::Duration};
+
 use envconfig::Envconfig;
 use lazy_static::lazy_static;
 use semver::Version;
-use std::{collections::HashSet, env::VarError, fmt, str::FromStr, time::Duration};
 
 use self::graphql::*;
 use self::mappings::*;
@@ -14,6 +16,8 @@ use crate::{
     components::{store::BlockNumber, subgraph::SubgraphVersionSwitchingMode},
     runtime::gas::CONST_MAX_GAS_PER_HANDLER,
 };
+
+pub use self::amp::AmpEnv;
 
 #[cfg(debug_assertions)]
 use std::sync::Mutex;
@@ -24,6 +28,8 @@ lazy_static! {
 #[cfg(debug_assertions)]
 lazy_static! {
     pub static ref TEST_WITH_NO_REORG: Mutex<bool> = Mutex::new(false);
+    pub static ref TEST_SQL_QUERIES_ENABLED: Mutex<bool> = Mutex::new(false);
+    pub static ref TEST_STORE_CALL_CACHE_DISABLED: Mutex<bool> = Mutex::new(false);
 }
 
 /// Panics if:
@@ -49,6 +55,7 @@ pub struct EnvVars {
     pub graphql: EnvVarsGraphQl,
     pub mappings: EnvVarsMapping,
     pub store: EnvVarsStore,
+    pub amp: Arc<AmpEnv>,
 
     /// Enables query throttling when getting database connections goes over this value.
     /// Load management can be disabled by setting this to 0.
@@ -189,6 +196,10 @@ pub struct EnvVars {
     /// Set by the environment variable `ETHEREUM_REORG_THRESHOLD`. The default
     /// value is 250 blocks.
     reorg_threshold: BlockNumber,
+    /// Enable SQL query interface. SQL queries are disabled by default
+    /// because they are still experimental. Set by the environment variable
+    /// `GRAPH_ENABLE_SQL_QUERIES`. Off by default.
+    enable_sql_queries: bool,
     /// The time to wait between polls when using polling block ingestor.
     /// The value is set by `ETHERUM_POLLING_INTERVAL` in millis and the
     /// default is 1000.
@@ -196,8 +207,6 @@ pub struct EnvVars {
     /// Set by the env var `GRAPH_EXPERIMENTAL_SUBGRAPH_SETTINGS` which should point
     /// to a file with subgraph-specific settings
     pub subgraph_settings: Option<String>,
-    /// Whether to prefer substreams blocks streams over firehose when available.
-    pub prefer_substreams_block_streams: bool,
     /// Set by the flag `GRAPH_ENABLE_DIPS_METRICS`. Whether to enable
     /// gas metrics. Off by default.
     pub enable_dips_metrics: bool,
@@ -291,6 +300,7 @@ impl EnvVars {
             graphql,
             mappings: mapping_handlers,
             store,
+            amp: Arc::new(AmpEnv::new(&inner)),
 
             load_threshold: Duration::from_millis(inner.load_threshold_in_ms),
             load_jail_threshold: inner.load_jail_threshold,
@@ -341,9 +351,9 @@ impl EnvVars {
             external_ws_base_url: inner.external_ws_base_url,
             static_filters_threshold: inner.static_filters_threshold,
             reorg_threshold: inner.reorg_threshold,
+            enable_sql_queries: inner.enable_sql_queries.0,
             ingestor_polling_interval: Duration::from_millis(inner.ingestor_polling_interval),
             subgraph_settings: inner.subgraph_settings,
-            prefer_substreams_block_streams: inner.prefer_substreams_block_streams,
             enable_dips_metrics: inner.enable_dips_metrics.0,
             history_blocks_override: inner.history_blocks_override,
             min_history_blocks: inner
@@ -414,6 +424,46 @@ impl EnvVars {
     pub fn reorg_threshold(&self) -> i32 {
         self.reorg_threshold
     }
+
+    #[cfg(debug_assertions)]
+    pub fn sql_queries_enabled(&self) -> bool {
+        // SQL queries are disabled by default for security.
+        // For testing purposes, we allow tests to enable SQL queries via TEST_SQL_QUERIES_ENABLED.
+        if *TEST_SQL_QUERIES_ENABLED.lock().unwrap() {
+            true
+        } else {
+            self.enable_sql_queries
+        }
+    }
+    #[cfg(not(debug_assertions))]
+    pub fn sql_queries_enabled(&self) -> bool {
+        self.enable_sql_queries
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn enable_sql_queries_for_tests(&self, enable: bool) {
+        let mut lock = TEST_SQL_QUERIES_ENABLED.lock().unwrap();
+        *lock = enable;
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn store_call_cache_disabled(&self) -> bool {
+        if *TEST_STORE_CALL_CACHE_DISABLED.lock().unwrap() {
+            true
+        } else {
+            self.store.disable_call_cache
+        }
+    }
+
+    #[cfg(not(debug_assertions))]
+    pub fn store_call_cache_disabled(&self) -> bool {
+        self.store.disable_call_cache
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn set_store_call_cache_disabled_for_tests(&self, value: bool) {
+        *TEST_STORE_CALL_CACHE_DISABLED.lock().unwrap() = value;
+    }
 }
 
 impl Default for EnvVars {
@@ -442,7 +492,7 @@ struct Inner {
         default = "false"
     )]
     allow_non_deterministic_fulltext_search: EnvVarBoolean,
-    #[envconfig(from = "GRAPH_MAX_SPEC_VERSION", default = "1.4.0")]
+    #[envconfig(from = "GRAPH_MAX_SPEC_VERSION", default = "1.5.0")]
     max_spec_version: Version,
     #[envconfig(from = "GRAPH_LOAD_WINDOW_SIZE", default = "300")]
     load_window_size_in_secs: u64,
@@ -514,15 +564,12 @@ struct Inner {
     // JSON-RPC specific.
     #[envconfig(from = "ETHEREUM_REORG_THRESHOLD", default = "250")]
     reorg_threshold: BlockNumber,
+    #[envconfig(from = "GRAPH_ENABLE_SQL_QUERIES", default = "false")]
+    enable_sql_queries: EnvVarBoolean,
     #[envconfig(from = "ETHEREUM_POLLING_INTERVAL", default = "1000")]
     ingestor_polling_interval: u64,
     #[envconfig(from = "GRAPH_EXPERIMENTAL_SUBGRAPH_SETTINGS")]
     subgraph_settings: Option<String>,
-    #[envconfig(
-        from = "GRAPH_EXPERIMENTAL_PREFER_SUBSTREAMS_BLOCK_STREAMS",
-        default = "false"
-    )]
-    prefer_substreams_block_streams: bool,
     #[envconfig(from = "GRAPH_ENABLE_DIPS_METRICS", default = "false")]
     enable_dips_metrics: EnvVarBoolean,
     #[envconfig(from = "GRAPH_HISTORY_BLOCKS_OVERRIDE")]
@@ -558,6 +605,17 @@ struct Inner {
         default = "false"
     )]
     disable_deployment_hash_validation: EnvVarBoolean,
+
+    #[envconfig(from = "GRAPH_AMP_MAX_BUFFER_SIZE")]
+    amp_max_buffer_size: Option<usize>,
+    #[envconfig(from = "GRAPH_AMP_MAX_BLOCK_RANGE")]
+    amp_max_block_range: Option<usize>,
+    #[envconfig(from = "GRAPH_AMP_QUERY_RETRY_MIN_DELAY_SECONDS")]
+    amp_query_retry_min_delay_seconds: Option<u64>,
+    #[envconfig(from = "GRAPH_AMP_QUERY_RETRY_MAX_DELAY_SECONDS")]
+    amp_query_retry_max_delay_seconds: Option<u64>,
+    #[envconfig(from = "GRAPH_AMP_FLIGHT_SERVICE_TOKEN")]
+    amp_flight_service_token: Option<String>,
 }
 
 #[derive(Clone, Debug)]

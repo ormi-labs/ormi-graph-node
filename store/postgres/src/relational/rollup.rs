@@ -58,9 +58,10 @@ use std::fmt;
 use std::ops::Range;
 use std::sync::Arc;
 
-use diesel::{sql_query, PgConnection, RunQueryDsl as _};
-
+use diesel::sql_query;
 use diesel::sql_types::{Integer, Nullable, Timestamptz};
+use diesel_async::RunQueryDsl;
+
 use graph::blockchain::BlockTime;
 use graph::components::store::{BlockNumber, StoreError};
 use graph::data::store::IdType;
@@ -73,6 +74,7 @@ use graph::sqlparser::parser::ParserError;
 use itertools::Itertools;
 
 use crate::relational::Table;
+use crate::AsyncPgConnection;
 
 use super::{Column, SqlName};
 
@@ -105,7 +107,7 @@ fn rewrite<'a>(table: &'a Table, expr: &str) -> Result<(String, Vec<&'a str>), S
             }
         }
 
-        fn visit_func_name(&mut self, _func: &mut p::Ident) -> Result<(), ()> {
+        fn visit_func_name(&mut self, _func: &mut p::ObjectNamePart) -> Result<(), ()> {
             Ok(())
         }
 
@@ -270,9 +272,9 @@ impl Rollup {
         })
     }
 
-    pub(crate) fn insert(
+    pub(crate) async fn insert(
         &self,
-        conn: &mut PgConnection,
+        conn: &mut AsyncPgConnection,
         bucket: &Range<BlockTime>,
         block: BlockNumber,
     ) -> Result<usize, diesel::result::Error> {
@@ -280,12 +282,12 @@ impl Rollup {
             .bind::<Timestamptz, _>(bucket.start)
             .bind::<Timestamptz, _>(bucket.end)
             .bind::<Integer, _>(block);
-        query.execute(conn)
+        query.execute(conn).await
     }
 
-    pub(crate) fn last_rollup(
+    pub(crate) async fn last_rollup(
         rollups: &[Rollup],
-        conn: &mut PgConnection,
+        conn: &mut AsyncPgConnection,
     ) -> Result<Option<BlockTime>, StoreError> {
         #[derive(QueryableByName)]
         #[diesel(check_for_backend(diesel::pg::Pg))]
@@ -305,6 +307,7 @@ impl Rollup {
         let query = format!("select max(last_rollup) as last_rollup from ({union_all}) as a");
         let last_rollup = sql_query(&query)
             .get_result::<BlockTimeRes>(conn)
+            .await
             .map(|res| res.last_rollup)?;
         Ok(last_rollup)
     }
@@ -382,7 +385,7 @@ impl<'a> RollupSql<'a> {
                 .aggregates
                 .iter()
                 .flat_map(|agg| &agg.src_columns)
-                .map(|col| *col)
+                .copied()
                 .filter(|&col| col != "id" && col != "timestamp")
                 .collect();
             agg_srcs.sort();
@@ -400,7 +403,7 @@ impl<'a> RollupSql<'a> {
             " order by {src_table}.timestamp) data group by timestamp",
             src_table = self.src_table
         )?;
-        Ok(write_dims(self.dimensions, w)?)
+        write_dims(self.dimensions, w)
     }
 
     fn select(&self, w: &mut dyn fmt::Write) -> fmt::Result {

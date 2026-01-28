@@ -30,8 +30,8 @@ use graph_store_postgres::{BlockStore, ChainHeadUpdateListener};
 use std::{any::Any, cmp::Ordering, sync::Arc, time::Duration};
 
 use crate::chain::{
-    create_ethereum_networks, create_firehose_networks, create_substreams_networks,
-    networks_as_chains, AnyChainFilter, ChainFilter, OneChainFilter,
+    create_ethereum_networks, create_firehose_networks, networks_as_chains, AnyChainFilter,
+    ChainFilter, OneChainFilter,
 };
 
 #[derive(Debug, Clone)]
@@ -55,21 +55,19 @@ pub struct FirehoseAdapterConfig {
 pub enum AdapterConfiguration {
     Rpc(EthAdapterConfig),
     Firehose(FirehoseAdapterConfig),
-    Substreams(FirehoseAdapterConfig),
 }
 
 impl AdapterConfiguration {
     pub fn blockchain_kind(&self) -> &BlockchainKind {
         match self {
             AdapterConfiguration::Rpc(_) => &BlockchainKind::Ethereum,
-            AdapterConfiguration::Firehose(fh) | AdapterConfiguration::Substreams(fh) => &fh.kind,
+            AdapterConfiguration::Firehose(fh) => &fh.kind,
         }
     }
     pub fn chain_id(&self) -> &ChainName {
         match self {
             AdapterConfiguration::Rpc(EthAdapterConfig { chain_id, .. })
-            | AdapterConfiguration::Firehose(FirehoseAdapterConfig { chain_id, .. })
-            | AdapterConfiguration::Substreams(FirehoseAdapterConfig { chain_id, .. }) => chain_id,
+            | AdapterConfiguration::Firehose(FirehoseAdapterConfig { chain_id, .. }) => chain_id,
         }
     }
 
@@ -90,24 +88,12 @@ impl AdapterConfiguration {
     pub fn is_firehose(&self) -> bool {
         self.as_firehose().is_none()
     }
-
-    pub fn as_substreams(&self) -> Option<&FirehoseAdapterConfig> {
-        match self {
-            AdapterConfiguration::Substreams(fh) => Some(fh),
-            _ => None,
-        }
-    }
-
-    pub fn is_substreams(&self) -> bool {
-        self.as_substreams().is_none()
-    }
 }
 
 pub struct Networks {
     pub adapters: Vec<AdapterConfiguration>,
     pub rpc_provider_manager: ProviderManager<EthereumNetworkAdapter>,
     pub firehose_provider_manager: ProviderManager<Arc<FirehoseEndpoint>>,
-    pub substreams_provider_manager: ProviderManager<Arc<FirehoseEndpoint>>,
 }
 
 impl Networks {
@@ -117,17 +103,12 @@ impl Networks {
             adapters: vec![],
             rpc_provider_manager: ProviderManager::new(
                 Logger::root(Discard, o!()),
-                vec![].into_iter(),
+                vec![],
                 ProviderCheckStrategy::MarkAsValid,
             ),
             firehose_provider_manager: ProviderManager::new(
                 Logger::root(Discard, o!()),
-                vec![].into_iter(),
-                ProviderCheckStrategy::MarkAsValid,
-            ),
-            substreams_provider_manager: ProviderManager::new(
-                Logger::root(Discard, o!()),
-                vec![].into_iter(),
+                vec![],
                 ProviderCheckStrategy::MarkAsValid,
             ),
         }
@@ -172,14 +153,6 @@ impl Networks {
                     "firehose",
                 )
             })
-            .or_else(|_| {
-                get_identifier(
-                    self.substreams_provider_manager.clone(),
-                    logger,
-                    chain_id,
-                    "substreams",
-                )
-            })
             .await
     }
 
@@ -198,28 +171,18 @@ impl Networks {
         let eth = create_ethereum_networks(
             logger.cheap_clone(),
             registry,
-            &config,
+            config,
             endpoint_metrics.cheap_clone(),
             chain_filter,
         )
         .await?;
         let firehose = create_firehose_networks(
             logger.cheap_clone(),
-            &config,
+            config,
             endpoint_metrics.cheap_clone(),
             chain_filter,
         );
-        let substreams = create_substreams_networks(
-            logger.cheap_clone(),
-            &config,
-            endpoint_metrics,
-            chain_filter,
-        );
-        let adapters: Vec<_> = eth
-            .into_iter()
-            .chain(firehose.into_iter())
-            .chain(substreams.into_iter())
-            .collect();
+        let adapters: Vec<_> = eth.into_iter().chain(firehose.into_iter()).collect();
 
         Ok(Networks::new(&logger, adapters, provider_checks))
     }
@@ -298,19 +261,6 @@ impl Networks {
             )
             .collect_vec();
 
-        let substreams_adapters = adapters
-            .iter()
-            .flat_map(|a| a.as_substreams())
-            .cloned()
-            .map(
-                |FirehoseAdapterConfig {
-                     chain_id,
-                     kind: _,
-                     adapters,
-                 }| { (chain_id, adapters) },
-            )
-            .collect_vec();
-
         let s = Self {
             adapters: adapters2,
             rpc_provider_manager: ProviderManager::new(
@@ -320,16 +270,7 @@ impl Networks {
             ),
             firehose_provider_manager: ProviderManager::new(
                 logger.clone(),
-                firehose_adapters
-                    .into_iter()
-                    .map(|(chain_id, endpoints)| (chain_id, endpoints)),
-                ProviderCheckStrategy::RequireAll(provider_checks),
-            ),
-            substreams_provider_manager: ProviderManager::new(
-                logger.clone(),
-                substreams_adapters
-                    .into_iter()
-                    .map(|(chain_id, endpoints)| (chain_id, endpoints)),
+                firehose_adapters,
                 ProviderCheckStrategy::RequireAll(provider_checks),
             ),
         };
@@ -379,19 +320,7 @@ impl Networks {
                 BlockchainKind::Near => {
                     block_ingestor::<graph_chain_near::Chain>(logger, id, chain, &mut res).await?
                 }
-                BlockchainKind::Substreams => {}
             }
-        }
-
-        // substreams networks that also have other types of chain(rpc or firehose), will have
-        // block ingestors already running.
-        let visited: Vec<_> = res.iter().map(|b| b.network_name()).collect();
-
-        for ((_, id), chain) in blockchain_map
-            .iter()
-            .filter(|((kind, id), _)| BlockchainKind::Substreams.eq(&kind) && !visited.contains(id))
-        {
-            block_ingestor::<graph_chain_substreams::Chain>(logger, id, chain, &mut res).await?
         }
 
         Ok(res)
@@ -401,7 +330,7 @@ impl Networks {
         &self,
         config: &Arc<EnvVars>,
         logger: &Logger,
-        store: Arc<BlockStore>,
+        store: BlockStore,
         logger_factory: &LoggerFactory,
         metrics_registry: Arc<MetricsRegistry>,
         chain_head_update_listener: Arc<ChainHeadUpdateListener>,
@@ -425,10 +354,6 @@ impl Networks {
 
     pub fn firehose_endpoints(&self, chain_id: ChainName) -> FirehoseEndpoints {
         FirehoseEndpoints::new(chain_id, self.firehose_provider_manager.clone())
-    }
-
-    pub fn substreams_endpoints(&self, chain_id: ChainName) -> FirehoseEndpoints {
-        FirehoseEndpoints::new(chain_id, self.substreams_provider_manager.clone())
     }
 
     pub fn ethereum_rpcs(&self, chain_id: ChainName) -> EthereumNetworkAdapters {

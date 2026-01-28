@@ -1,5 +1,4 @@
 use anyhow::{anyhow, Error};
-use graph::tokio;
 use std::cmp;
 use std::collections::VecDeque;
 use std::pin::Pin;
@@ -14,7 +13,7 @@ use graph::blockchain::block_stream::{
 use graph::blockchain::{Block, BlockPtr, TriggerFilterWrapper};
 use graph::futures03::{stream::Stream, Future, FutureExt};
 use graph::prelude::{DeploymentHash, BLOCK_NUMBER_MAX};
-use graph::slog::{debug, info, trace, warn, Logger};
+use graph::slog::{info, trace, warn, Logger};
 
 use graph::components::store::BlockNumber;
 use graph::data::subgraph::UnifiedMappingApiVersion;
@@ -39,7 +38,7 @@ enum BlockStreamState {
     /// store up to date with the chain store.
     ///
     /// Valid next states: BeginReconciliation
-    YieldingBlocks(Box<VecDeque<BlockWithTriggers<Chain>>>),
+    YieldingBlocks(VecDeque<BlockWithTriggers<Chain>>),
 
     /// The BlockStream experienced an error and is pausing before attempting to produce
     /// blocks again.
@@ -407,6 +406,7 @@ impl PollingBlockStreamContext {
             // block number, and checking to see if the block we found matches the
             // subgraph_ptr.
 
+            #[allow(clippy::unnecessary_unwrap)]
             let subgraph_ptr =
                 subgraph_ptr.expect("subgraph block pointer should not be `None` here");
 
@@ -516,15 +516,17 @@ impl Stream for PollingBlockStream {
                                     total_triggers as f64 / block_range_size as f64;
                                 self.ctx.previous_block_range_size = block_range_size;
                                 if total_triggers > 0 {
-                                    debug!(
+                                    info!(
                                         self.ctx.logger,
-                                        "Processing {} triggers", total_triggers
+                                        "Found {} triggers in {} blocks with a block range of {}",
+                                        total_triggers,
+                                        next_blocks.len(),
+                                        block_range_size
                                     );
                                 }
 
                                 // Switch to yielding state until next_blocks is depleted
-                                self.state =
-                                    BlockStreamState::YieldingBlocks(Box::new(next_blocks));
+                                self.state = BlockStreamState::YieldingBlocks(next_blocks);
 
                                 // Yield the first block in next_blocks
                                 continue;

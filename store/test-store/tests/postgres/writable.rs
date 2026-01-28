@@ -2,9 +2,11 @@ use graph::blockchain::block_stream::{EntitySourceOperation, FirehoseCursor};
 use graph::data::subgraph::schema::DeploymentCreate;
 use graph::data::value::Word;
 use graph::data_source::CausalityRegion;
+use graph::prelude::alloy::primitives::B256;
 use graph::schema::{EntityKey, EntityType, InputSchema};
 use lazy_static::lazy_static;
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::marker::PhantomData;
 use std::ops::Range;
 use test_store::*;
@@ -17,7 +19,6 @@ use graph::semver::Version;
 use graph::{entity, prelude::*};
 use graph_store_postgres::layout_for_tests::writable;
 use graph_store_postgres::{Store as DieselStore, SubgraphStore as DieselSubgraphStore};
-use web3::types::H256;
 
 const SCHEMA_GQL: &str = "
     type Counter @entity {
@@ -102,14 +103,8 @@ async fn insert_test_data(store: Arc<DieselSubgraphStore>) -> DeploymentLocator 
             NETWORK_NAME.to_string(),
             SubgraphVersionSwitchingMode::Instant,
         )
+        .await
         .unwrap()
-}
-
-/// Removes test data from the database behind the store.
-fn remove_test_data(store: Arc<DieselSubgraphStore>) {
-    store
-        .delete_all_entities_for_test_use_only()
-        .expect("deleting test entities succeeds");
 }
 
 /// Test harness for running database integration tests.
@@ -123,12 +118,12 @@ where
         ) -> R
         + Send
         + 'static,
-    R: std::future::Future<Output = ()> + Send + 'static,
+    R: Future<Output = ()> + Send + 'static,
 {
     run_test_sequentially(|store| async move {
         let subgraph_store = store.subgraph_store();
         // Reset state before starting
-        remove_test_data(subgraph_store.clone());
+        remove_subgraphs().await;
 
         // Seed database with test data
         let deployment = insert_test_data(subgraph_store.clone()).await;
@@ -150,7 +145,7 @@ where
 }
 
 fn block_pointer(number: u8) -> BlockPtr {
-    let hash = H256::from([number; 32]);
+    let hash = B256::from([number; 32]);
     BlockPtr::from((hash, number as BlockNumber))
 }
 
@@ -214,17 +209,18 @@ async fn pause_writer(deployment: &DeploymentLocator) {
 ///
 /// `read_count` lets us look up entities in different ways to exercise
 /// different methods in `WritableStore`
-fn get_with_pending<F>(batch: bool, read_count: F)
+fn get_with_pending<R, F>(batch: bool, read_count: F)
 where
-    F: Send + Fn(&dyn WritableStore) -> i32 + Sync + 'static,
+    F: Send + Fn(Arc<dyn WritableStore>) -> R + Sync + 'static,
+    R: Future<Output = i32> + Send + 'static,
 {
     run_test(move |store, writable, _, deployment| async move {
         let subgraph_store = store.subgraph_store();
 
-        let read_count = || read_count(writable.as_ref());
+        let read_count = || read_count(writable.cheap_clone());
 
         if !batch {
-            writable.deployment_synced(block_pointer(0)).unwrap();
+            writable.deployment_synced(block_pointer(0)).await.unwrap();
         }
 
         for count in 1..4 {
@@ -236,10 +232,10 @@ where
         for count in 4..7 {
             insert_count(&subgraph_store, &deployment, count, count, false).await;
         }
-        assert_eq!(6, read_count());
+        assert_eq!(6, read_count().await);
 
         writable.flush().await.unwrap();
-        assert_eq!(6, read_count());
+        assert_eq!(6, read_count().await);
 
         // Test reading back with pending writes and a pending revert
         for count in 7..10 {
@@ -250,28 +246,34 @@ where
             .await
             .unwrap();
 
-        assert_eq!(2, read_count());
+        assert_eq!(2, read_count().await);
 
         writable.flush().await.unwrap();
-        assert_eq!(2, read_count());
+        assert_eq!(2, read_count().await);
     })
 }
 
 /// Get the count using `WritableStore::get_many`
-fn count_get_many(writable: &dyn WritableStore) -> i32 {
+async fn count_get_many(writable: Arc<dyn WritableStore>) -> i32 {
     let key = count_key("1");
     let keys = BTreeSet::from_iter(vec![key.clone()]);
-    let counter = writable.get_many(keys).unwrap().get(&key).unwrap().clone();
+    let counter = writable
+        .get_many(keys)
+        .await
+        .unwrap()
+        .get(&key)
+        .unwrap()
+        .clone();
     counter.get("count").unwrap().as_int().unwrap()
 }
 
 /// Get the count using `WritableStore::get`
-fn count_get(writable: &dyn WritableStore) -> i32 {
-    let counter = writable.get(&count_key("1")).unwrap().unwrap();
+async fn count_get(writable: Arc<dyn WritableStore>) -> i32 {
+    let counter = writable.get(&count_key("1")).await.unwrap().unwrap();
     counter.get("count").unwrap().as_int().unwrap()
 }
 
-fn count_get_derived(writable: &dyn WritableStore) -> i32 {
+async fn count_get_derived(writable: Arc<dyn WritableStore>) -> i32 {
     let key = count_key("1");
     let query = DerivedEntityQuery {
         entity_type: key.entity_type.clone(),
@@ -279,7 +281,7 @@ fn count_get_derived(writable: &dyn WritableStore) -> i32 {
         value: key.entity_id.clone(),
         causality_region: CausalityRegion::ONCHAIN,
     };
-    let map = writable.get_derived(&query).unwrap();
+    let map = writable.get_derived(&query).await.unwrap();
     let counter = map.get(&key).unwrap();
     counter.get("count").unwrap().as_int().unwrap()
 }
@@ -318,7 +320,7 @@ fn get_derived_nobatch() {
 fn restart() {
     run_test(|store, writable, _, deployment| async move {
         let subgraph_store = store.subgraph_store();
-        let schema = subgraph_store.input_schema(&deployment.hash).unwrap();
+        let schema = subgraph_store.input_schema(&deployment.hash).await.unwrap();
 
         // Cause an error by leaving out the non-nullable `count` attribute
         let entity_ops = vec![EntityOperation::Set {
@@ -368,7 +370,7 @@ fn restart() {
 #[test]
 fn read_range_test() {
     run_test(|store, writable, sourceable, deployment| async move {
-        let result_entities = vec![
+        let result_entities = [
             r#"(1, [EntitySourceOperation { entity_op: Create, entity_type: EntityType(Counter), entity: Entity { count: Int(2), id: String("1"), vid: Int8(1) }, vid: 1 }, EntitySourceOperation { entity_op: Create, entity_type: EntityType(Counter2), entity: Entity { count: Int(2), id: String("1"), vid: Int8(1) }, vid: 1 }])"#,
             r#"(2, [EntitySourceOperation { entity_op: Modify, entity_type: EntityType(Counter), entity: Entity { count: Int(4), id: String("1"), vid: Int8(2) }, vid: 2 }, EntitySourceOperation { entity_op: Create, entity_type: EntityType(Counter2), entity: Entity { count: Int(4), id: String("2"), vid: Int8(2) }, vid: 2 }])"#,
             r#"(3, [EntitySourceOperation { entity_op: Delete, entity_type: EntityType(Counter), entity: Entity { count: Int(4), id: String("1"), vid: Int8(2) }, vid: 2 }, EntitySourceOperation { entity_op: Create, entity_type: EntityType(Counter2), entity: Entity { count: Int(6), id: String("3"), vid: Int8(3) }, vid: 3 }])"#,
@@ -378,18 +380,19 @@ fn read_range_test() {
             r#"(7, [EntitySourceOperation { entity_op: Delete, entity_type: EntityType(Counter), entity: Entity { count: Int(12), id: String("1"), vid: Int8(6) }, vid: 6 }])"#,
         ];
         let subgraph_store = store.subgraph_store();
-        writable.deployment_synced(block_pointer(0)).unwrap();
+        writable.deployment_synced(block_pointer(0)).await.unwrap();
 
         for count in 1..=5 {
             insert_count(&subgraph_store, &deployment, count, 2 * count, false).await;
         }
         writable.flush().await.unwrap();
-        writable.deployment_synced(block_pointer(0)).unwrap();
+        writable.deployment_synced(block_pointer(0)).await.unwrap();
 
         let br: Range<BlockNumber> = 0..18;
         let entity_types = vec![COUNTER_TYPE.clone(), COUNTER2_TYPE.clone()];
         let e: BTreeMap<i32, Vec<EntitySourceOperation>> = sourceable
             .get_range(entity_types.clone(), CausalityRegion::ONCHAIN, br.clone())
+            .await
             .unwrap();
         assert_eq!(e.len(), 5);
         for en in &e {
@@ -401,9 +404,10 @@ fn read_range_test() {
             insert_count(&subgraph_store, &deployment, count, 2 * count, false).await;
         }
         writable.flush().await.unwrap();
-        writable.deployment_synced(block_pointer(0)).unwrap();
+        writable.deployment_synced(block_pointer(0)).await.unwrap();
         let e: BTreeMap<i32, Vec<EntitySourceOperation>> = sourceable
             .get_range(entity_types, CausalityRegion::ONCHAIN, br)
+            .await
             .unwrap();
         assert_eq!(e.len(), 7);
         for en in &e {
@@ -418,17 +422,18 @@ fn read_range_test() {
 fn read_immutable_only_range_test() {
     run_test(|store, writable, sourceable, deployment| async move {
         let subgraph_store = store.subgraph_store();
-        writable.deployment_synced(block_pointer(0)).unwrap();
+        writable.deployment_synced(block_pointer(0)).await.unwrap();
 
         for count in 1..=4 {
             insert_count(&subgraph_store, &deployment, count, 2 * count, true).await;
         }
         writable.flush().await.unwrap();
-        writable.deployment_synced(block_pointer(0)).unwrap();
+        writable.deployment_synced(block_pointer(0)).await.unwrap();
         let br: Range<BlockNumber> = 0..18;
         let entity_types = vec![COUNTER2_TYPE.clone()];
         let e: BTreeMap<i32, Vec<EntitySourceOperation>> = sourceable
             .get_range(entity_types.clone(), CausalityRegion::ONCHAIN, br.clone())
+            .await
             .unwrap();
         assert_eq!(e.len(), 4);
     })
@@ -437,14 +442,12 @@ fn read_immutable_only_range_test() {
 #[test]
 fn read_range_pool_created_test() {
     run_test(|store, writable, sourceable, deployment| async move {
-        let result_entities = vec![
-            format!("(1, [EntitySourceOperation {{ entity_op: Create, entity_type: EntityType(PoolCreated), entity: Entity {{ blockNumber: BigInt(12369621), blockTimestamp: BigInt(1620243254), fee: Int(500), id: Bytes(0xff80818283848586), logIndex: BigInt(0), pool: Bytes(0x8ad599c3a0ff1de082011efddc58f1908eb6e6d8), tickSpacing: Int(10), token0: Bytes(0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48), token1: Bytes(0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2), transactionFrom: Bytes(0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48), transactionGasPrice: BigInt(100000000000), transactionHash: Bytes(0x12340000000000000000000000000000000000000000000000000000000000000000000000000000), vid: Int8(1) }}, vid: 1 }}])"),
-            format!("(2, [EntitySourceOperation {{ entity_op: Create, entity_type: EntityType(PoolCreated), entity: Entity {{ blockNumber: BigInt(12369622), blockTimestamp: BigInt(1620243255), fee: Int(3000), id: Bytes(0xff90919293949596), logIndex: BigInt(1), pool: Bytes(0x4585fe77225b41b697c938b018e2ac67ac5a20c0), tickSpacing: Int(60), token0: Bytes(0x2260fac5e5542a773aa44fbcfedf7c193bc2c599), token1: Bytes(0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2), transactionFrom: Bytes(0x2260fac5e5542a773aa44fbcfedf7c193bc2c599), transactionGasPrice: BigInt(100000000000), transactionHash: Bytes(0x12340000000000000000000000000000000000000000000000000000000000000000000000000001), vid: Int8(2) }}, vid: 2 }}])"),
-        ];
+        let result_entities = ["(1, [EntitySourceOperation { entity_op: Create, entity_type: EntityType(PoolCreated), entity: Entity { blockNumber: BigInt(12369621), blockTimestamp: BigInt(1620243254), fee: Int(500), id: Bytes(0xff80818283848586), logIndex: BigInt(0), pool: Bytes(0x8ad599c3a0ff1de082011efddc58f1908eb6e6d8), tickSpacing: Int(10), token0: Bytes(0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48), token1: Bytes(0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2), transactionFrom: Bytes(0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48), transactionGasPrice: BigInt(100000000000), transactionHash: Bytes(0x12340000000000000000000000000000000000000000000000000000000000000000000000000000), vid: Int8(1) }, vid: 1 }])",
+            "(2, [EntitySourceOperation { entity_op: Create, entity_type: EntityType(PoolCreated), entity: Entity { blockNumber: BigInt(12369622), blockTimestamp: BigInt(1620243255), fee: Int(3000), id: Bytes(0xff90919293949596), logIndex: BigInt(1), pool: Bytes(0x4585fe77225b41b697c938b018e2ac67ac5a20c0), tickSpacing: Int(60), token0: Bytes(0x2260fac5e5542a773aa44fbcfedf7c193bc2c599), token1: Bytes(0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2), transactionFrom: Bytes(0x2260fac5e5542a773aa44fbcfedf7c193bc2c599), transactionGasPrice: BigInt(100000000000), transactionHash: Bytes(0x12340000000000000000000000000000000000000000000000000000000000000000000000000001), vid: Int8(2) }, vid: 2 }])"];
 
         // Rest of the test remains the same
         let subgraph_store = store.subgraph_store();
-        writable.deployment_synced(block_pointer(0)).unwrap();
+        writable.deployment_synced(block_pointer(0)).await.unwrap();
 
         let pool_created_type = TEST_SUBGRAPH_SCHEMA.entity_type("PoolCreated").unwrap();
         let entity_types = vec![pool_created_type.clone()];
@@ -490,16 +493,17 @@ fn read_range_pool_created_test() {
             .unwrap();
         }
         writable.flush().await.unwrap();
-        writable.deployment_synced(block_pointer(0)).unwrap();
+        writable.deployment_synced(block_pointer(0)).await.unwrap();
 
         let br: Range<BlockNumber> = 0..18;
         let e: BTreeMap<i32, Vec<EntitySourceOperation>> = sourceable
             .get_range(entity_types.clone(), CausalityRegion::ONCHAIN, br.clone())
+            .await
             .unwrap();
         assert_eq!(e.len(), 2);
         for en in &e {
             let index = *en.0 - 1;
-            let a = result_entities[index as usize].clone();
+            let a = result_entities[index as usize];
             assert_eq!(a, format!("{:?}", en));
         }
 

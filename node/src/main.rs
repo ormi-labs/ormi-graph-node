@@ -1,23 +1,23 @@
 use clap::Parser as _;
 use git_testament::git_testament;
-
-use graph::prelude::*;
-use graph::{env::EnvVars, log::logger};
-
+use graph::{env::EnvVars, log::logger, prelude::*};
 use graph_core::polling_monitor::ipfs_service;
 use graph_node::{launcher, opt};
+use tokio_util::sync::CancellationToken;
 
 git_testament!(TESTAMENT);
 
-fn main() {
-    let max_blocking: usize = std::env::var("GRAPH_MAX_BLOCKING_THREADS")
+lazy_static! {
+    pub static ref MAX_BLOCKING_THREADS: usize = std::env::var("GRAPH_MAX_BLOCKING_THREADS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(512);
+}
 
+fn main() {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .max_blocking_threads(max_blocking)
+        .max_blocking_threads(*MAX_BLOCKING_THREADS)
         .build()
         .unwrap()
         .block_on(async { main_inner().await })
@@ -25,13 +25,21 @@ fn main() {
 
 async fn main_inner() {
     env_logger::init();
+
+    let cancel_token = CancellationToken::new();
     let env_vars = Arc::new(EnvVars::from_env().unwrap());
     let opt = opt::Opt::parse();
 
     // Set up logger
     let logger = logger(opt.debug);
+    debug!(
+        logger,
+        "Runtime configured with {} max blocking threads", *MAX_BLOCKING_THREADS
+    );
 
-    let ipfs_client = graph::ipfs::new_ipfs_client(&opt.ipfs, &logger)
+    let (prometheus_registry, metrics_registry) = launcher::setup_metrics(&logger);
+
+    let ipfs_client = graph::ipfs::new_ipfs_client(&opt.ipfs, &metrics_registry, &logger)
         .await
         .unwrap_or_else(|err| panic!("Failed to create IPFS client: {err:#}"));
 
@@ -44,5 +52,16 @@ async fn main_inner() {
 
     let link_resolver = Arc::new(IpfsResolver::new(ipfs_client, env_vars.cheap_clone()));
 
-    launcher::run(logger, opt, env_vars, ipfs_service, link_resolver, None).await;
+    launcher::run(
+        logger,
+        opt,
+        env_vars,
+        ipfs_service,
+        link_resolver,
+        None,
+        prometheus_registry,
+        metrics_registry,
+        cancel_token,
+    )
+    .await;
 }

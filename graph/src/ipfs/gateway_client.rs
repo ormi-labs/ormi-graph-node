@@ -5,17 +5,14 @@ use async_trait::async_trait;
 use derivative::Derivative;
 use http::header::ACCEPT;
 use http::header::CACHE_CONTROL;
-use reqwest::StatusCode;
+use reqwest::{redirect::Policy as RedirectPolicy, StatusCode};
 use slog::Logger;
 
 use crate::env::ENV_VARS;
-use crate::ipfs::IpfsClient;
-use crate::ipfs::IpfsError;
-use crate::ipfs::IpfsRequest;
-use crate::ipfs::IpfsResponse;
-use crate::ipfs::IpfsResult;
-use crate::ipfs::RetryPolicy;
-use crate::ipfs::ServerAddress;
+use crate::ipfs::{
+    IpfsClient, IpfsError, IpfsMetrics, IpfsRequest, IpfsResponse, IpfsResult, RetryPolicy,
+    ServerAddress,
+};
 
 /// A client that connects to an IPFS gateway.
 ///
@@ -28,14 +25,19 @@ pub struct IpfsGatewayClient {
     #[derivative(Debug = "ignore")]
     http_client: reqwest::Client,
 
+    metrics: IpfsMetrics,
     logger: Logger,
 }
 
 impl IpfsGatewayClient {
     /// Creates a new [IpfsGatewayClient] with the specified server address.
     /// Verifies that the server is responding to IPFS gateway requests.
-    pub(crate) async fn new(server_address: impl AsRef<str>, logger: &Logger) -> IpfsResult<Self> {
-        let client = Self::new_unchecked(server_address, logger)?;
+    pub(crate) async fn new(
+        server_address: impl AsRef<str>,
+        metrics: IpfsMetrics,
+        logger: &Logger,
+    ) -> IpfsResult<Self> {
+        let client = Self::new_unchecked(server_address, metrics, logger)?;
 
         client
             .send_test_request()
@@ -50,10 +52,20 @@ impl IpfsGatewayClient {
 
     /// Creates a new [IpfsGatewayClient] with the specified server address.
     /// Does not verify that the server is responding to IPFS gateway requests.
-    pub fn new_unchecked(server_address: impl AsRef<str>, logger: &Logger) -> IpfsResult<Self> {
+    pub fn new_unchecked(
+        server_address: impl AsRef<str>,
+        metrics: IpfsMetrics,
+        logger: &Logger,
+    ) -> IpfsResult<Self> {
         Ok(Self {
             server_address: ServerAddress::new(server_address)?,
-            http_client: reqwest::Client::new(),
+            http_client: reqwest::Client::builder()
+                // IPFS gateways allow requests to directory CIDs.
+                // However, they sometimes redirect before displaying the directory listing.
+                // This policy permits that behavior.
+                .redirect(RedirectPolicy::limited(1))
+                .build()?,
+            metrics,
             logger: logger.to_owned(),
         })
     }
@@ -113,8 +125,8 @@ impl IpfsGatewayClient {
 
 #[async_trait]
 impl IpfsClient for IpfsGatewayClient {
-    fn logger(&self) -> &Logger {
-        &self.logger
+    fn metrics(&self) -> &IpfsMetrics {
+        &self.metrics
     }
 
     async fn call(self: Arc<Self>, req: IpfsRequest) -> IpfsResult<IpfsResponse> {
@@ -158,7 +170,8 @@ mod tests {
     use wiremock::ResponseTemplate;
 
     use super::*;
-    use crate::ipfs::ContentPath;
+    use crate::data::subgraph::DeploymentHash;
+    use crate::ipfs::{ContentPath, IpfsContext, IpfsMetrics};
     use crate::log::discard;
 
     const PATH: &str = "/ipfs/QmUNLLsPACCz1vLxQVkXqqLX5R1X345qqfHbsf67hvA3Nn";
@@ -189,7 +202,9 @@ mod tests {
 
     async fn make_client() -> (MockServer, Arc<IpfsGatewayClient>) {
         let server = mock_server().await;
-        let client = IpfsGatewayClient::new_unchecked(server.uri(), &discard()).unwrap();
+        let client =
+            IpfsGatewayClient::new_unchecked(server.uri(), IpfsMetrics::test(), &discard())
+                .unwrap();
 
         (server, Arc::new(client))
     }
@@ -202,16 +217,16 @@ mod tests {
         Duration::from_millis(millis)
     }
 
-    #[tokio::test]
+    #[crate::test]
     async fn new_fails_to_create_the_client_if_gateway_is_not_accessible() {
         let server = mock_server().await;
 
-        IpfsGatewayClient::new(server.uri(), &discard())
+        IpfsGatewayClient::new(server.uri(), IpfsMetrics::test(), &discard())
             .await
             .unwrap_err();
     }
 
-    #[tokio::test]
+    #[crate::test]
     async fn new_creates_the_client_if_it_can_check_the_gateway() {
         let server = mock_server().await;
 
@@ -222,7 +237,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        IpfsGatewayClient::new(server.uri(), &discard())
+        IpfsGatewayClient::new(server.uri(), IpfsMetrics::test(), &discard())
             .await
             .unwrap();
 
@@ -232,12 +247,12 @@ mod tests {
             .mount(&server)
             .await;
 
-        IpfsGatewayClient::new(server.uri(), &discard())
+        IpfsGatewayClient::new(server.uri(), IpfsMetrics::test(), &discard())
             .await
             .unwrap();
     }
 
-    #[tokio::test]
+    #[crate::test]
     async fn new_retries_gateway_check_on_non_deterministic_errors() {
         let server = mock_server().await;
 
@@ -252,19 +267,19 @@ mod tests {
             .mount(&server)
             .await;
 
-        IpfsGatewayClient::new(server.uri(), &discard())
+        IpfsGatewayClient::new(server.uri(), IpfsMetrics::test(), &discard())
             .await
             .unwrap();
     }
 
-    #[tokio::test]
+    #[crate::test]
     async fn new_unchecked_creates_the_client_without_checking_the_gateway() {
         let server = mock_server().await;
 
-        IpfsGatewayClient::new_unchecked(server.uri(), &discard()).unwrap();
+        IpfsGatewayClient::new_unchecked(server.uri(), IpfsMetrics::test(), &discard()).unwrap();
     }
 
-    #[tokio::test]
+    #[crate::test]
     async fn cat_stream_returns_the_content() {
         let (server, client) = make_client().await;
 
@@ -275,7 +290,7 @@ mod tests {
             .await;
 
         let bytes = client
-            .cat_stream(&make_path(), None, RetryPolicy::None)
+            .cat_stream(&IpfsContext::test(), &make_path(), None, RetryPolicy::None)
             .await
             .unwrap()
             .try_fold(BytesMut::new(), |mut acc, chunk| async {
@@ -289,7 +304,7 @@ mod tests {
         assert_eq!(bytes.as_ref(), b"some data")
     }
 
-    #[tokio::test]
+    #[crate::test]
     async fn cat_stream_fails_on_timeout() {
         let (server, client) = make_client().await;
 
@@ -300,13 +315,18 @@ mod tests {
             .await;
 
         let result = client
-            .cat_stream(&make_path(), Some(ms(300)), RetryPolicy::None)
+            .cat_stream(
+                &IpfsContext::test(),
+                &make_path(),
+                Some(ms(300)),
+                RetryPolicy::None,
+            )
             .await;
 
-        assert!(matches!(result, Err(_)));
+        assert!(result.is_err());
     }
 
-    #[tokio::test]
+    #[crate::test]
     async fn cat_stream_retries_the_request_on_non_deterministic_errors() {
         let (server, client) = make_client().await;
 
@@ -324,12 +344,17 @@ mod tests {
             .await;
 
         let _stream = client
-            .cat_stream(&make_path(), None, RetryPolicy::NonDeterministic)
+            .cat_stream(
+                &IpfsContext::test(),
+                &make_path(),
+                None,
+                RetryPolicy::NonDeterministic,
+            )
             .await
             .unwrap();
     }
 
-    #[tokio::test]
+    #[crate::test]
     async fn cat_returns_the_content() {
         let (server, client) = make_client().await;
 
@@ -340,14 +365,20 @@ mod tests {
             .await;
 
         let bytes = client
-            .cat(&make_path(), usize::MAX, None, RetryPolicy::None)
+            .cat(
+                &IpfsContext::test(),
+                &make_path(),
+                usize::MAX,
+                None,
+                RetryPolicy::None,
+            )
             .await
             .unwrap();
 
         assert_eq!(bytes.as_ref(), b"some data");
     }
 
-    #[tokio::test]
+    #[crate::test]
     async fn cat_returns_the_content_if_max_size_is_equal_to_the_content_size() {
         let (server, client) = make_client().await;
 
@@ -360,14 +391,20 @@ mod tests {
             .await;
 
         let bytes = client
-            .cat(&make_path(), data.len(), None, RetryPolicy::None)
+            .cat(
+                &IpfsContext::test(),
+                &make_path(),
+                data.len(),
+                None,
+                RetryPolicy::None,
+            )
             .await
             .unwrap();
 
         assert_eq!(bytes.as_ref(), data);
     }
 
-    #[tokio::test]
+    #[crate::test]
     async fn cat_fails_if_content_is_too_large() {
         let (server, client) = make_client().await;
 
@@ -380,12 +417,18 @@ mod tests {
             .await;
 
         client
-            .cat(&make_path(), data.len() - 1, None, RetryPolicy::None)
+            .cat(
+                &IpfsContext::test(),
+                &make_path(),
+                data.len() - 1,
+                None,
+                RetryPolicy::None,
+            )
             .await
             .unwrap_err();
     }
 
-    #[tokio::test]
+    #[crate::test]
     async fn cat_fails_on_timeout() {
         let (server, client) = make_client().await;
 
@@ -396,12 +439,18 @@ mod tests {
             .await;
 
         client
-            .cat(&make_path(), usize::MAX, Some(ms(300)), RetryPolicy::None)
+            .cat(
+                &IpfsContext::test(),
+                &make_path(),
+                usize::MAX,
+                Some(ms(300)),
+                RetryPolicy::None,
+            )
             .await
             .unwrap_err();
     }
 
-    #[tokio::test]
+    #[crate::test]
     async fn cat_retries_the_request_on_non_deterministic_errors() {
         let (server, client) = make_client().await;
 
@@ -420,6 +469,7 @@ mod tests {
 
         let bytes = client
             .cat(
+                &IpfsContext::test(),
                 &make_path(),
                 usize::MAX,
                 None,
@@ -431,7 +481,7 @@ mod tests {
         assert_eq!(bytes.as_ref(), b"some data");
     }
 
-    #[tokio::test]
+    #[crate::test]
     async fn get_block_returns_the_block_content() {
         let (server, client) = make_client().await;
 
@@ -442,14 +492,14 @@ mod tests {
             .await;
 
         let bytes = client
-            .get_block(&make_path(), None, RetryPolicy::None)
+            .get_block(&IpfsContext::test(), &make_path(), None, RetryPolicy::None)
             .await
             .unwrap();
 
         assert_eq!(bytes.as_ref(), b"some data");
     }
 
-    #[tokio::test]
+    #[crate::test]
     async fn get_block_fails_on_timeout() {
         let (server, client) = make_client().await;
 
@@ -460,12 +510,17 @@ mod tests {
             .await;
 
         client
-            .get_block(&make_path(), Some(ms(300)), RetryPolicy::None)
+            .get_block(
+                &IpfsContext::test(),
+                &make_path(),
+                Some(ms(300)),
+                RetryPolicy::None,
+            )
             .await
             .unwrap_err();
     }
 
-    #[tokio::test]
+    #[crate::test]
     async fn get_block_retries_the_request_on_non_deterministic_errors() {
         let (server, client) = make_client().await;
 
@@ -483,14 +538,19 @@ mod tests {
             .await;
 
         let bytes = client
-            .get_block(&make_path(), None, RetryPolicy::NonDeterministic)
+            .get_block(
+                &IpfsContext::test(),
+                &make_path(),
+                None,
+                RetryPolicy::NonDeterministic,
+            )
             .await
             .unwrap();
 
         assert_eq!(bytes.as_ref(), b"some data");
     }
 
-    #[tokio::test]
+    #[crate::test]
     async fn operation_names_include_cid_for_debugging() {
         use slog::{o, Drain, Logger, Record};
         use std::sync::{Arc, Mutex};
@@ -507,10 +567,31 @@ mod tests {
             fn log(
                 &self,
                 record: &Record,
-                _: &slog::OwnedKVList,
+                values: &slog::OwnedKVList,
             ) -> std::result::Result<Self::Ok, Self::Err> {
-                let message = format!("{}", record.msg());
+                use slog::KV;
+
+                let mut serialized_values = String::new();
+                let mut serializer = StringSerializer(&mut serialized_values);
+                values.serialize(record, &mut serializer).unwrap();
+
+                let message = format!("{}; {serialized_values}", record.msg());
                 self.messages.lock().unwrap().push(message);
+
+                Ok(())
+            }
+        }
+
+        struct StringSerializer<'a>(&'a mut String);
+
+        impl<'a> slog::Serializer for StringSerializer<'a> {
+            fn emit_arguments(
+                &mut self,
+                key: slog::Key,
+                val: &std::fmt::Arguments,
+            ) -> slog::Result {
+                use std::fmt::Write;
+                write!(self.0, "{}: {}, ", key, val).unwrap();
                 Ok(())
             }
         }
@@ -522,7 +603,9 @@ mod tests {
         let logger = Logger::root(drain.fuse(), o!());
 
         let server = mock_server().await;
-        let client = Arc::new(IpfsGatewayClient::new_unchecked(server.uri(), &logger).unwrap());
+        let client = Arc::new(
+            IpfsGatewayClient::new_unchecked(server.uri(), IpfsMetrics::test(), &logger).unwrap(),
+        );
 
         // Set up mock to fail twice then succeed to trigger retry with warning logs
         mock_get()
@@ -542,7 +625,13 @@ mod tests {
 
         // This should trigger retry logs because we set up failures first
         let _result = client
-            .cat(&path, usize::MAX, None, RetryPolicy::NonDeterministic)
+            .cat(
+                &IpfsContext::new(&DeploymentHash::default(), &logger),
+                &path,
+                usize::MAX,
+                None,
+                RetryPolicy::NonDeterministic,
+            )
             .await
             .unwrap();
 
@@ -563,7 +652,7 @@ mod tests {
         let expected_cid = "QmUNLLsPACCz1vLxQVkXqqLX5R1X345qqfHbsf67hvA3Nn";
         let has_cid_in_operation = retry_messages
             .iter()
-            .any(|msg| msg.contains(&format!("IPFS.cat[{}]", expected_cid)));
+            .any(|msg| msg.contains(&format!("path: {expected_cid}")));
 
         assert!(
             has_cid_in_operation,

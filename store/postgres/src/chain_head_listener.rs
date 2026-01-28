@@ -168,8 +168,7 @@ impl ChainHeadUpdateListener {
                 if let Some(watcher) = watchers
                     .try_read()
                     .as_ref()
-                    .map(|w| w.get(&update.network_name))
-                    .flatten()
+                    .and_then(|w| w.get(&update.network_name))
                 {
                     watcher.send();
                 }
@@ -254,19 +253,21 @@ impl ChainHeadUpdateSender {
         }
     }
 
-    pub fn send(&self, hash: &str, number: i64) -> Result<(), StoreError> {
+    pub async fn send(&self, hash: &str, number: i64) -> Result<(), StoreError> {
         let msg = json! ({
             "network_name": &self.chain_name,
             "head_block_hash": hash,
             "head_block_number": number
         });
 
-        let mut conn = self.pool.get()?;
-        self.sender.notify(
-            &mut conn,
-            CHANNEL_NAME.as_str(),
-            Some(&self.chain_name),
-            &msg,
-        )
+        let mut conn = self.pool.get_permitted().await?;
+        self.sender
+            .notify(
+                &mut conn,
+                CHANNEL_NAME.as_str(),
+                Some(&self.chain_name),
+                &msg,
+            )
+            .await
     }
 }

@@ -1,7 +1,12 @@
-use ethabi;
-
+//! Rust types that have with a direct correspondence to an Asc class,
+//! with their `AscType` implementations.
+use async_trait::async_trait;
+use graph::abi;
 use graph::{
-    data::store::{self, scalar::Timestamp},
+    data::{
+        store::{self, scalar::Timestamp},
+        subgraph::API_VERSION_0_0_4,
+    },
     runtime::{
         gas::GasCounter, AscHeap, AscIndexId, AscType, AscValue, HostExportError,
         IndexForAscTypeId, ToAscObj,
@@ -14,9 +19,6 @@ use graph_runtime_derive::AscType;
 use crate::asc_abi::{v0_0_4, v0_0_5};
 use semver::Version;
 
-///! Rust types that have with a direct correspondence to an Asc class,
-///! with their `AscType` implementations.
-
 /// Wrapper of ArrayBuffer for multiple AssemblyScript versions.
 /// It just delegates its method calls to the correct mappings apiVersion.
 pub enum ArrayBuffer {
@@ -27,10 +29,10 @@ pub enum ArrayBuffer {
 impl ArrayBuffer {
     pub(crate) fn new<T: AscType>(
         values: &[T],
-        api_version: Version,
+        api_version: &Version,
     ) -> Result<Self, DeterministicHostError> {
         match api_version {
-            version if version <= Version::new(0, 0, 4) => {
+            version if version <= &API_VERSION_0_0_4 => {
                 Ok(Self::ApiVersion0_0_4(v0_0_4::ArrayBuffer::new(values)?))
             }
             _ => Ok(Self::ApiVersion0_0_5(v0_0_5::ArrayBuffer::new(values)?)),
@@ -89,18 +91,18 @@ pub enum TypedArray<T> {
 }
 
 impl<T: AscValue> TypedArray<T> {
-    pub fn new<H: AscHeap + ?Sized>(
+    pub async fn new<H: AscHeap + ?Sized>(
         content: &[T],
         heap: &mut H,
         gas: &GasCounter,
     ) -> Result<Self, HostExportError> {
         match heap.api_version() {
-            version if version <= Version::new(0, 0, 4) => Ok(Self::ApiVersion0_0_4(
-                v0_0_4::TypedArray::new(content, heap, gas)?,
+            version if version <= &API_VERSION_0_0_4 => Ok(Self::ApiVersion0_0_4(
+                v0_0_4::TypedArray::new(content, heap, gas).await?,
             )),
-            _ => Ok(Self::ApiVersion0_0_5(v0_0_5::TypedArray::new(
-                content, heap, gas,
-            )?)),
+            _ => Ok(Self::ApiVersion0_0_5(
+                v0_0_5::TypedArray::new(content, heap, gas).await?,
+            )),
         }
     }
 
@@ -143,13 +145,14 @@ impl<T> AscType for TypedArray<T> {
 pub struct Bytes<'a>(pub &'a Vec<u8>);
 
 pub type Uint8Array = TypedArray<u8>;
+#[async_trait]
 impl ToAscObj<Uint8Array> for Bytes<'_> {
-    fn to_asc_obj<H: AscHeap + ?Sized>(
+    async fn to_asc_obj<H: AscHeap + Send + ?Sized>(
         &self,
         heap: &mut H,
         gas: &GasCounter,
     ) -> Result<Uint8Array, HostExportError> {
-        self.0.to_asc_obj(heap, gas)
+        self.0.to_asc_obj(heap, gas).await
     }
 }
 
@@ -201,9 +204,9 @@ pub enum AscString {
 }
 
 impl AscString {
-    pub fn new(content: &[u16], api_version: Version) -> Result<Self, DeterministicHostError> {
+    pub fn new(content: &[u16], api_version: &Version) -> Result<Self, DeterministicHostError> {
         match api_version {
-            version if version <= Version::new(0, 0, 4) => {
+            version if version <= &API_VERSION_0_0_4 => {
                 Ok(Self::ApiVersion0_0_4(v0_0_4::AscString::new(content)?))
             }
             _ => Ok(Self::ApiVersion0_0_5(v0_0_5::AscString::new(content)?)),
@@ -269,18 +272,18 @@ pub enum Array<T> {
 }
 
 impl<T: AscValue> Array<T> {
-    pub fn new<H: AscHeap + ?Sized>(
+    pub async fn new<H: AscHeap + ?Sized>(
         content: &[T],
         heap: &mut H,
         gas: &GasCounter,
     ) -> Result<Self, HostExportError> {
         match heap.api_version() {
-            version if version <= Version::new(0, 0, 4) => Ok(Self::ApiVersion0_0_4(
-                v0_0_4::Array::new(content, heap, gas)?,
+            version if version <= &API_VERSION_0_0_4 => Ok(Self::ApiVersion0_0_4(
+                v0_0_4::Array::new(content, heap, gas).await?,
             )),
-            _ => Ok(Self::ApiVersion0_0_5(v0_0_5::Array::new(
-                content, heap, gas,
-            )?)),
+            _ => Ok(Self::ApiVersion0_0_5(
+                v0_0_5::Array::new(content, heap, gas).await?,
+            )),
         }
     }
 
@@ -523,8 +526,9 @@ impl AscIndexId for AscEnum<YamlValueKind> {
 pub type AscEnumArray<D> = AscPtr<Array<AscPtr<AscEnum<D>>>>;
 
 #[repr(u32)]
-#[derive(AscType, Copy, Clone)]
+#[derive(AscType, Copy, Clone, Default)]
 pub enum EthereumValueKind {
+    #[default]
     Address,
     FixedBytes,
     Bytes,
@@ -535,41 +539,40 @@ pub enum EthereumValueKind {
     FixedArray,
     Array,
     Tuple,
+    Function,
 }
 
 impl EthereumValueKind {
-    pub(crate) fn get_kind(token: &ethabi::Token) -> Self {
-        match token {
-            ethabi::Token::Address(_) => EthereumValueKind::Address,
-            ethabi::Token::FixedBytes(_) => EthereumValueKind::FixedBytes,
-            ethabi::Token::Bytes(_) => EthereumValueKind::Bytes,
-            ethabi::Token::Int(_) => EthereumValueKind::Int,
-            ethabi::Token::Uint(_) => EthereumValueKind::Uint,
-            ethabi::Token::Bool(_) => EthereumValueKind::Bool,
-            ethabi::Token::String(_) => EthereumValueKind::String,
-            ethabi::Token::FixedArray(_) => EthereumValueKind::FixedArray,
-            ethabi::Token::Array(_) => EthereumValueKind::Array,
-            ethabi::Token::Tuple(_) => EthereumValueKind::Tuple,
-        }
-    }
-}
+    pub(crate) fn get_kind(value: &abi::DynSolValue) -> Self {
+        use graph::abi::DynSolValue;
 
-impl Default for EthereumValueKind {
-    fn default() -> Self {
-        EthereumValueKind::Address
+        match value {
+            DynSolValue::Bool(_) => Self::Bool,
+            DynSolValue::Int(_, _) => Self::Int,
+            DynSolValue::Uint(_, _) => Self::Uint,
+            DynSolValue::FixedBytes(_, _) => Self::FixedBytes,
+            DynSolValue::Address(_) => Self::Address,
+            DynSolValue::Function(_) => Self::Function,
+            DynSolValue::Bytes(_) => Self::Bytes,
+            DynSolValue::String(_) => Self::String,
+            DynSolValue::Array(_) => Self::Array,
+            DynSolValue::FixedArray(_) => Self::FixedArray,
+            DynSolValue::Tuple(_) => Self::Tuple,
+        }
     }
 }
 
 impl AscValue for EthereumValueKind {}
 
 #[repr(u32)]
-#[derive(AscType, Copy, Clone)]
+#[derive(AscType, Copy, Clone, Default)]
 pub enum StoreValueKind {
     String,
     Int,
     BigDecimal,
     Bool,
     Array,
+    #[default]
     Null,
     Bytes,
     BigInt,
@@ -593,12 +596,6 @@ impl StoreValueKind {
             Value::Bytes(_) => StoreValueKind::Bytes,
             Value::BigInt(_) => StoreValueKind::BigInt,
         }
-    }
-}
-
-impl Default for StoreValueKind {
-    fn default() -> Self {
-        StoreValueKind::Null
     }
 }
 
@@ -665,20 +662,15 @@ pub type AscEntity = AscTypedMap<AscString, AscEnum<StoreValueKind>>;
 pub(crate) type AscJson = AscTypedMap<AscString, AscEnum<JsonValueKind>>;
 
 #[repr(u32)]
-#[derive(AscType, Copy, Clone)]
+#[derive(AscType, Copy, Clone, Default)]
 pub enum JsonValueKind {
+    #[default]
     Null,
     Bool,
     Number,
     String,
     Array,
     Object,
-}
-
-impl Default for JsonValueKind {
-    fn default() -> Self {
-        JsonValueKind::Null
-    }
 }
 
 impl AscValue for JsonValueKind {}
@@ -775,8 +767,9 @@ impl AscIndexId for AscWrapped<AscPtr<AscEnum<YamlValueKind>>> {
 }
 
 #[repr(u32)]
-#[derive(AscType, Clone, Copy)]
+#[derive(AscType, Clone, Copy, Default)]
 pub enum YamlValueKind {
+    #[default]
     Null,
     Bool,
     Number,
@@ -784,12 +777,6 @@ pub enum YamlValueKind {
     Array,
     Object,
     Tagged,
-}
-
-impl Default for YamlValueKind {
-    fn default() -> Self {
-        YamlValueKind::Null
-    }
 }
 
 impl AscValue for YamlValueKind {}

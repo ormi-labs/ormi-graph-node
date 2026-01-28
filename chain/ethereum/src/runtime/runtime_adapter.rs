@@ -7,26 +7,24 @@ use crate::{
 };
 use anyhow::{anyhow, Context, Error};
 use blockchain::HostFn;
+use graph::abi;
+use graph::abi::DynSolValueExt;
 use graph::blockchain::ChainIdentifier;
 use graph::components::subgraph::HostMetrics;
 use graph::data::store::ethereum::call;
 use graph::data::store::scalar::BigInt;
-use graph::data::subgraph::API_VERSION_0_0_9;
+use graph::data::subgraph::{API_VERSION_0_0_4, API_VERSION_0_0_9};
 use graph::data_source;
 use graph::data_source::common::{ContractCall, MappingABI};
-use graph::prelude::web3::types::H160;
 use graph::runtime::gas::Gas;
 use graph::runtime::{AscIndexId, IndexForAscTypeId};
 use graph::slog::debug;
 use graph::{
     blockchain::{self, BlockPtr, HostFnCtx},
     cheap_clone::CheapClone,
-    prelude::{
-        ethabi::{self, Address, Token},
-        EthereumCallCache,
-    },
+    futures03::FutureExt,
+    prelude::{alloy::primitives::Address, EthereumCallCache},
     runtime::{asc_get, asc_new, AscPtr, HostExportError},
-    semver::Version,
     slog::Logger,
 };
 use graph_runtime_wasm::asc_abi::class::{AscBigInt, AscEnumArray, AscWrapped, EthereumValueKind};
@@ -96,20 +94,27 @@ impl blockchain::RuntimeAdapter<Chain> for RuntimeAdapter {
                         let call_cache = call_cache.clone();
                         let abis = abis.clone();
                         move |ctx, wasm_ptr| {
-                            let eth_adapter =
-                                eth_adapters.call_or_cheapest(Some(&NodeCapabilities {
-                                    archive,
-                                    traces: false,
-                                }))?;
-                            ethereum_call(
-                                &eth_adapter,
-                                call_cache.clone(),
-                                ctx,
-                                wasm_ptr,
-                                &abis,
-                                eth_call_gas,
-                            )
-                            .map(|ptr| ptr.wasm_ptr())
+                            let eth_adapters = eth_adapters.cheap_clone();
+                            let call_cache = call_cache.cheap_clone();
+                            let abis = abis.cheap_clone();
+                            async move {
+                                let eth_adapter =
+                                    eth_adapters.call_or_cheapest(Some(&NodeCapabilities {
+                                        archive,
+                                        traces: false,
+                                    }))?;
+                                ethereum_call(
+                                    &eth_adapter,
+                                    call_cache.clone(),
+                                    ctx,
+                                    wasm_ptr,
+                                    &abis,
+                                    eth_call_gas,
+                                )
+                                .await
+                                .map(|ptr| ptr.wasm_ptr())
+                            }
+                            .boxed()
                         }
                     }),
                 },
@@ -118,26 +123,37 @@ impl blockchain::RuntimeAdapter<Chain> for RuntimeAdapter {
                     func: Arc::new({
                         let eth_adapters = eth_adapters.clone();
                         move |ctx, wasm_ptr| {
-                            let eth_adapter =
-                                eth_adapters.unverified_cheapest_with(&NodeCapabilities {
-                                    archive,
-                                    traces: false,
-                                })?;
-                            eth_get_balance(&eth_adapter, ctx, wasm_ptr).map(|ptr| ptr.wasm_ptr())
+                            let eth_adapters = eth_adapters.cheap_clone();
+                            async move {
+                                let eth_adapter =
+                                    eth_adapters.unverified_cheapest_with(&NodeCapabilities {
+                                        archive,
+                                        traces: false,
+                                    })?;
+                                eth_get_balance(&eth_adapter, ctx, wasm_ptr)
+                                    .await
+                                    .map(|ptr| ptr.wasm_ptr())
+                            }
+                            .boxed()
                         }
                     }),
                 },
                 HostFn {
                     name: "ethereum.hasCode",
                     func: Arc::new({
-                        let eth_adapters = eth_adapters.clone();
                         move |ctx, wasm_ptr| {
-                            let eth_adapter =
-                                eth_adapters.unverified_cheapest_with(&NodeCapabilities {
-                                    archive,
-                                    traces: false,
-                                })?;
-                            eth_has_code(&eth_adapter, ctx, wasm_ptr).map(|ptr| ptr.wasm_ptr())
+                            let eth_adapters = eth_adapters.cheap_clone();
+                            async move {
+                                let eth_adapter =
+                                    eth_adapters.unverified_cheapest_with(&NodeCapabilities {
+                                        archive,
+                                        traces: false,
+                                    })?;
+                                eth_has_code(&eth_adapter, ctx, wasm_ptr)
+                                    .await
+                                    .map(|ptr| ptr.wasm_ptr())
+                            }
+                            .boxed()
                         }
                     }),
                 },
@@ -164,6 +180,7 @@ impl blockchain::RuntimeAdapter<Chain> for RuntimeAdapter {
                 create_host_fns(abis, archive, call_cache, eth_adapters, eth_call_gas)
             }
             data_source::DataSource::Offchain(_) => vec![],
+            data_source::DataSource::Amp(_) => vec![],
         };
 
         Ok(host_fns)
@@ -171,10 +188,10 @@ impl blockchain::RuntimeAdapter<Chain> for RuntimeAdapter {
 }
 
 /// function ethereum.call(call: SmartContractCall): Array<Token> | null
-fn ethereum_call(
+async fn ethereum_call(
     eth_adapter: &EthereumAdapter,
     call_cache: Arc<dyn EthereumCallCache>,
-    ctx: HostFnCtx,
+    ctx: HostFnCtx<'_>,
     wasm_ptr: u32,
     abis: &[Arc<MappingABI>],
     eth_call_gas: Option<u32>,
@@ -185,7 +202,7 @@ fn ethereum_call(
     // For apiVersion >= 0.0.4 the call passed from the mapping includes the
     // function signature; subgraphs using an apiVersion < 0.0.4 don't pass
     // the signature along with the call.
-    let call: UnresolvedContractCall = if ctx.heap.api_version() >= Version::new(0, 0, 4) {
+    let call: UnresolvedContractCall = if ctx.heap.api_version() >= &API_VERSION_0_0_4 {
         asc_get::<_, AscUnresolvedContractCall_0_0_4, _>(ctx.heap, wasm_ptr.into(), &ctx.gas, 0)?
     } else {
         asc_get::<_, AscUnresolvedContractCall, _>(ctx.heap, wasm_ptr.into(), &ctx.gas, 0)?
@@ -200,14 +217,15 @@ fn ethereum_call(
         abis,
         eth_call_gas,
         ctx.metrics.cheap_clone(),
-    )?;
+    )
+    .await?;
     match result {
-        Some(tokens) => Ok(asc_new(ctx.heap, tokens.as_slice(), &ctx.gas)?),
+        Some(tokens) => Ok(asc_new(ctx.heap, tokens.as_slice(), &ctx.gas).await?),
         None => Ok(AscPtr::null()),
     }
 }
 
-fn eth_get_balance(
+async fn eth_get_balance(
     eth_adapter: &EthereumAdapter,
     ctx: HostFnCtx<'_>,
     wasm_ptr: u32,
@@ -215,7 +233,7 @@ fn eth_get_balance(
     ctx.gas
         .consume_host_fn_with_metrics(ETH_GET_BALANCE, "eth_get_balance")?;
 
-    if ctx.heap.api_version() < API_VERSION_0_0_9 {
+    if ctx.heap.api_version() < &API_VERSION_0_0_9 {
         return Err(HostExportError::Deterministic(anyhow!(
             "ethereum.getBalance call is not supported before API version 0.0.9"
         )));
@@ -224,24 +242,26 @@ fn eth_get_balance(
     let logger = &ctx.logger;
     let block_ptr = &ctx.block_ptr;
 
-    let address: H160 = asc_get(ctx.heap, wasm_ptr.into(), &ctx.gas, 0)?;
+    let address: Address = asc_get(ctx.heap, wasm_ptr.into(), &ctx.gas, 0)?;
 
-    let result = graph::block_on(eth_adapter.get_balance(logger, address, block_ptr.clone()));
+    let result = eth_adapter
+        .get_balance(logger, address, block_ptr.clone())
+        .await;
 
     match result {
         Ok(v) => {
             let bigint = BigInt::from_unsigned_u256(&v);
-            Ok(asc_new(ctx.heap, &bigint, &ctx.gas)?)
+            Ok(asc_new(ctx.heap, &bigint, &ctx.gas).await?)
         }
         // Retry on any kind of error
-        Err(EthereumRpcError::Web3Error(e)) => Err(HostExportError::PossibleReorg(e.into())),
+        Err(EthereumRpcError::AlloyError(e)) => Err(HostExportError::PossibleReorg(e.into())),
         Err(EthereumRpcError::Timeout) => Err(HostExportError::PossibleReorg(
             EthereumRpcError::Timeout.into(),
         )),
     }
 }
 
-fn eth_has_code(
+async fn eth_has_code(
     eth_adapter: &EthereumAdapter,
     ctx: HostFnCtx<'_>,
     wasm_ptr: u32,
@@ -249,7 +269,7 @@ fn eth_has_code(
     ctx.gas
         .consume_host_fn_with_metrics(ETH_HAS_CODE, "eth_has_code")?;
 
-    if ctx.heap.api_version() < API_VERSION_0_0_9 {
+    if ctx.heap.api_version() < &API_VERSION_0_0_9 {
         return Err(HostExportError::Deterministic(anyhow!(
             "ethereum.hasCode call is not supported before API version 0.0.9"
         )));
@@ -258,15 +278,17 @@ fn eth_has_code(
     let logger = &ctx.logger;
     let block_ptr = &ctx.block_ptr;
 
-    let address: H160 = asc_get(ctx.heap, wasm_ptr.into(), &ctx.gas, 0)?;
+    let address: Address = asc_get(ctx.heap, wasm_ptr.into(), &ctx.gas, 0)?;
 
-    let result = graph::block_on(eth_adapter.get_code(logger, address, block_ptr.clone()))
+    let result = eth_adapter
+        .get_code(logger, address, block_ptr.clone())
+        .await
         .map(|v| !v.0.is_empty());
 
     match result {
-        Ok(v) => Ok(asc_new(ctx.heap, &AscWrapped { inner: v }, &ctx.gas)?),
+        Ok(v) => Ok(asc_new(ctx.heap, &AscWrapped { inner: v }, &ctx.gas).await?),
         // Retry on any kind of error
-        Err(EthereumRpcError::Web3Error(e)) => Err(HostExportError::PossibleReorg(e.into())),
+        Err(EthereumRpcError::AlloyError(e)) => Err(HostExportError::PossibleReorg(e.into())),
         Err(EthereumRpcError::Timeout) => Err(HostExportError::PossibleReorg(
             EthereumRpcError::Timeout.into(),
         )),
@@ -274,7 +296,7 @@ fn eth_has_code(
 }
 
 /// Returns `Ok(None)` if the call was reverted.
-fn eth_call(
+async fn eth_call(
     eth_adapter: &EthereumAdapter,
     call_cache: Arc<dyn EthereumCallCache>,
     logger: &Logger,
@@ -283,20 +305,7 @@ fn eth_call(
     abis: &[Arc<MappingABI>],
     eth_call_gas: Option<u32>,
     metrics: Arc<HostMetrics>,
-) -> Result<Option<Vec<Token>>, HostExportError> {
-    // Helpers to log the result of the call at the end
-    fn tokens_as_string(tokens: &[Token]) -> String {
-        tokens.iter().map(|arg| arg.to_string()).join(", ")
-    }
-
-    fn result_as_string(result: &Result<Option<Vec<Token>>, HostExportError>) -> String {
-        match result {
-            Ok(Some(tokens)) => format!("({})", tokens_as_string(&tokens)),
-            Ok(None) => "none".to_string(),
-            Err(_) => "error".to_string(),
-        }
-    }
-
+) -> Result<Option<Vec<abi::DynSolValue>>, HostExportError> {
     let start_time = Instant::now();
 
     // Obtain the path to the contract ABI
@@ -332,18 +341,17 @@ fn eth_call(
     // Run Ethereum call in tokio runtime
     let logger1 = logger.clone();
     let call_cache = call_cache.clone();
-    let (result, source) =
-        match graph::block_on(eth_adapter.contract_call(&logger1, &call, call_cache)) {
-            Ok((result, source)) => (Ok(result), source),
-            Err(e) => (Err(e), call::Source::Rpc),
-        };
+    let (result, source) = match eth_adapter.contract_call(&logger1, &call, call_cache).await {
+        Ok((result, source)) => (Ok(result), source),
+        Err(e) => (Err(e), call::Source::Rpc),
+    };
     let result = match result {
             Ok(res) => Ok(res),
 
             // Any error reported by the Ethereum node could be due to the block no longer being on
             // the main chain. This is very unespecific but we don't want to risk failing a
             // subgraph due to a transient error such as a reorg.
-            Err(ContractCallError::Web3Error(e)) => Err(HostExportError::PossibleReorg(anyhow::anyhow!(
+            Err(ContractCallError::AlloyError(e)) => Err(HostExportError::PossibleReorg(anyhow::anyhow!(
                 "Ethereum node returned an error when calling function \"{}\" of contract \"{}\": {}",
                 unresolved_call.function_name,
                 unresolved_call.contract_name,
@@ -375,16 +383,26 @@ fn eth_call(
         );
     }
 
-    debug!(logger, "Contract call finished";
-              "address" => format!("0x{:x}", &unresolved_call.contract_address),
-              "contract" => &unresolved_call.contract_name,
-              "signature" => &unresolved_call.function_signature,
-              "args" => format!("[{}]", tokens_as_string(&unresolved_call.function_args)),
-              "time_ms" => format!("{}ms", elapsed.as_millis()),
-              "result" => result_as_string(&result),
-              "block_hash" => block_ptr.hash_hex(),
-              "block_number" => block_ptr.block_number(),
-              "source" => source.to_string());
+    let args_as_string = format!("[{}]", values_to_string(&unresolved_call.function_args));
+
+    let result_as_string = match &result {
+        Ok(Some(values)) => format!("({})", values_to_string(values)),
+        Ok(None) => "none".to_owned(),
+        Err(_err) => "error".to_owned(),
+    };
+
+    debug!(
+        logger, "Contract call finished";
+        "address" => format!("0x{:x}", &unresolved_call.contract_address),
+        "contract" => &unresolved_call.contract_name,
+        "signature" => &unresolved_call.function_signature,
+        "args" => args_as_string,
+        "time_ms" => format!("{}ms", elapsed.as_millis()),
+        "result" => result_as_string,
+        "block_hash" => block_ptr.hash_hex(),
+        "block_number" => block_ptr.block_number(),
+        "source" => source.to_string(),
+    );
 
     result
 }
@@ -395,9 +413,18 @@ pub struct UnresolvedContractCall {
     pub contract_address: Address,
     pub function_name: String,
     pub function_signature: Option<String>,
-    pub function_args: Vec<ethabi::Token>,
+    pub function_args: Vec<abi::DynSolValue>,
 }
 
 impl AscIndexId for AscUnresolvedContractCall {
     const INDEX_ASC_TYPE_ID: IndexForAscTypeId = IndexForAscTypeId::SmartContractCall;
+}
+
+#[inline]
+fn values_to_string(values: &[abi::DynSolValue]) -> String {
+    values
+        .iter()
+        .map(|x| x.to_string())
+        .collect_vec()
+        .join(", ")
 }

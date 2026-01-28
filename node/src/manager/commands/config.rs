@@ -72,7 +72,7 @@ pub fn pools(config: &Config, nodes: Vec<String>, shard: bool) -> Result<(), Err
         .into_iter()
         .map(|name| {
             NodeId::new(name.replace('-', "_"))
-                .map_err(|()| anyhow!("illegal node name `{}`", name))
+                .map_err(|name| anyhow!("illegal node name `{}`", name))
         })
         .collect::<Result<_, _>>()?;
     // node -> shard_name -> size
@@ -139,7 +139,7 @@ pub async fn provider(
 
     let metrics = Arc::new(EndpointMetrics::mock());
     let caps = caps_from_features(features)?;
-    let networks = Networks::from_config(logger, &config, registry, metrics, &[]).await?;
+    let networks = Networks::from_config(logger, config, registry, metrics, &[]).await?;
     let network: ChainName = network.into();
     let adapters = networks.ethereum_rpcs(network.clone());
 
@@ -157,7 +157,7 @@ pub async fn provider(
 }
 
 pub fn setting(name: &str) -> Result<(), Error> {
-    let name = SubgraphName::new(name).map_err(|()| anyhow!("illegal subgraph name `{}`", name))?;
+    let name = SubgraphName::new(name).map_err(|name| anyhow!("illegal subgraph name `{name}`"))?;
     let env_vars = EnvVars::from_env().unwrap();
     if let Some(path) = &env_vars.subgraph_settings {
         let settings = Settings::from_file(path)

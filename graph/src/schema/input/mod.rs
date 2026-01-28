@@ -201,7 +201,7 @@ impl TypeInfo {
     }
 
     fn for_aggregation(schema: &Schema, pool: &AtomPool, agg_type: &s::ObjectType) -> Self {
-        let agg_type = Aggregation::new(&schema, &pool, agg_type);
+        let agg_type = Aggregation::new(schema, pool, agg_type);
         TypeInfo::Aggregation(agg_type)
     }
 
@@ -230,7 +230,7 @@ impl Field {
         field_type: &s::Type,
         derived_from: Option<Word>,
     ) -> Self {
-        let value_type = Self::scalar_value_type(&schema, field_type);
+        let value_type = Self::scalar_value_type(schema, field_type);
         Self {
             name: Word::from(name),
             field_type: field_type.clone(),
@@ -245,7 +245,7 @@ impl Field {
             s::Type::NamedType(name) => name.parse::<ValueType>().unwrap_or_else(|_| {
                 match schema.document.get_named_type(name) {
                     Some(t::Object(obj_type)) => {
-                        let id = obj_type.field(&*ID).expect("all object types have an id");
+                        let id = obj_type.field(&ID).expect("all object types have an id");
                         Self::scalar_value_type(schema, &id.field_type)
                     }
                     Some(t::Interface(intf)) => {
@@ -265,7 +265,7 @@ impl Field {
                                 ValueType::String
                             }
                             Some(obj_type) => {
-                                let id = obj_type.field(&*ID).expect("all object types have an id");
+                                let id = obj_type.field(&ID).expect("all object types have an id");
                                 Self::scalar_value_type(schema, &id.field_type)
                             }
                         }
@@ -290,7 +290,7 @@ impl Field {
         let derived_from = self.derived_from.as_ref()?;
         let name = schema
             .pool()
-            .lookup(&self.field_type.get_base_type())
+            .lookup(self.field_type.get_base_type())
             .unwrap();
         schema.field(name, derived_from)
     }
@@ -309,11 +309,9 @@ pub enum ObjectOrInterface<'a> {
 impl<'a> CheapClone for ObjectOrInterface<'a> {
     fn cheap_clone(&self) -> Self {
         match self {
-            ObjectOrInterface::Object(schema, object) => {
-                ObjectOrInterface::Object(*schema, *object)
-            }
+            ObjectOrInterface::Object(schema, object) => ObjectOrInterface::Object(schema, object),
             ObjectOrInterface::Interface(schema, interface) => {
-                ObjectOrInterface::Interface(*schema, *interface)
+                ObjectOrInterface::Interface(schema, interface)
             }
         }
     }
@@ -357,7 +355,7 @@ impl<'a> ObjectOrInterface<'a> {
         let object_type = match self {
             ObjectOrInterface::Object(_, object_type) => Some(*object_type),
             ObjectOrInterface::Interface(schema, interface) => {
-                schema.implementers(&interface).next()
+                schema.implementers(interface).next()
             }
         };
         object_type.and_then(|object_type| object_type.field(name))
@@ -431,7 +429,7 @@ impl ObjectType {
             .fields
             .iter()
             .map(|field| {
-                let derived_from = field.derived_from().map(|name| Word::from(name));
+                let derived_from = field.derived_from().map(Word::from);
                 Field::new(schema, &field.name, &field.field_type, derived_from)
             })
             .collect();
@@ -535,7 +533,7 @@ impl InterfaceType {
                 // since the API schema does not contain certain filters for
                 // derived fields on interfaces that it would for
                 // non-derived fields
-                let derived_from = field.derived_from().map(|name| Word::from(name));
+                let derived_from = field.derived_from().map(Word::from);
                 Field::new(schema, &field.name, &field.field_type, derived_from)
             })
             .collect();
@@ -788,7 +786,7 @@ pub struct Aggregate {
 }
 
 impl Aggregate {
-    fn new(_schema: &Schema, name: &str, field_type: &s::Type, dir: &s::Directive) -> Self {
+    fn new(schema: &Schema, name: &str, field_type: &s::Type, dir: &s::Directive) -> Self {
         let func = dir
             .argument("fn")
             .unwrap()
@@ -818,7 +816,7 @@ impl Aggregate {
             arg,
             cumulative,
             field_type: field_type.clone(),
-            value_type: field_type.get_base_type().parse().unwrap(),
+            value_type: Field::scalar_value_type(schema, field_type),
         }
     }
 
@@ -932,7 +930,7 @@ impl Aggregation {
     pub fn dimensions(&self) -> impl Iterator<Item = &Field> {
         self.fields
             .iter()
-            .filter(|field| &field.name != &*ID && field.name != kw::TIMESTAMP)
+            .filter(|field| field.name != *ID && field.name != kw::TIMESTAMP)
     }
 
     fn object_type(&self, interval: AggregationInterval) -> Option<&ObjectType> {
@@ -969,7 +967,7 @@ impl InputSchema {
                 .iter()
                 .enumerate()
                 .filter_map(|(idx, ti)| ti.aggregation().map(|agg_type| (idx, agg_type)))
-                .map(|(aggregation, agg_type)| {
+                .flat_map(|(aggregation, agg_type)| {
                     agg_type
                         .intervals
                         .iter()
@@ -980,7 +978,6 @@ impl InputSchema {
                             agg_type,
                         })
                 })
-                .flatten()
                 .collect();
             mappings.sort();
             mappings.into_boxed_slice()
@@ -1383,6 +1380,14 @@ impl InputSchema {
             .any(|ti| matches!(ti, TypeInfo::Aggregation(_)))
     }
 
+    pub fn aggregation_names(&self) -> impl Iterator<Item = &str> {
+        self.inner
+            .type_infos
+            .iter()
+            .filter_map(TypeInfo::aggregation)
+            .map(|agg_type| self.inner.pool.get(agg_type.name).unwrap())
+    }
+
     pub fn entity_fulltext_definitions(
         &self,
         entity: &str,
@@ -1400,12 +1405,7 @@ impl InputSchema {
             .filter(|directive| match directive.argument("include") {
                 Some(Value::List(includes)) if !includes.is_empty() => {
                     includes.iter().any(|include| match include {
-                        Value::Object(include) => match include.get("entity") {
-                            Some(Value::String(fulltext_entity)) if fulltext_entity == entity => {
-                                true
-                            }
-                            _ => false,
-                        },
+                        Value::Object(include) => matches!(include.get("entity"), Some(Value::String(fulltext_entity)) if fulltext_entity == entity),
                         _ => false,
                     })
                 }
@@ -1603,7 +1603,7 @@ impl InputSchema {
 fn atom_pool(document: &s::Document) -> AtomPool {
     let mut pool = AtomPool::new();
 
-    pool.intern(&*ID);
+    pool.intern(&ID);
     // Name and attributes of PoI entity type
     pool.intern(POI_OBJECT);
     pool.intern(POI_DIGEST);
@@ -1668,7 +1668,7 @@ fn atom_pool(document: &s::Document) -> AtomPool {
     }
 
     for object_type in document.get_object_type_definitions() {
-        for defn in InputSchema::fulltext_definitions(&document, &object_type.name).unwrap() {
+        for defn in InputSchema::fulltext_definitions(document, &object_type.name).unwrap() {
             pool.intern(defn.name.as_str());
         }
     }
@@ -1777,9 +1777,7 @@ mod validations {
                 if subgraph_schema_type
                     .directives
                     .iter()
-                    .filter(|directive| !directive.name.eq("fulltext"))
-                    .next()
-                    .is_some()
+                    .any(|directive| !directive.name.eq("fulltext"))
                 {
                     Some(SchemaValidationError::InvalidSchemaTypeDirectives)
                 } else {
@@ -1994,7 +1992,7 @@ mod validations {
         /// type `Int8` and that the `id` field has type `Int8`
         fn validate_entity_directives(&self) -> Vec<SchemaValidationError> {
             fn id_type_is_int8(object_type: &s::ObjectType) -> Option<SchemaValidationError> {
-                let field = match object_type.field(&*ID) {
+                let field = match object_type.field(&ID) {
                     Some(field) => field,
                     None => {
                         return Some(Err::IdFieldMissing(object_type.name.to_owned()));
@@ -2058,7 +2056,7 @@ mod validations {
             self.entity_types
                 .iter()
                 .fold(vec![], |mut errors, object_type| {
-                    match object_type.field(&*ID) {
+                    match object_type.field(&ID) {
                         None => errors.push(SchemaValidationError::IdFieldMissing(
                             object_type.name.clone(),
                         )),
@@ -2273,7 +2271,7 @@ mod validations {
                 // when we query, and just assume that that's ok.
                 let target_field_type = target_field.field_type.get_base_type();
                 if target_field_type != object_type.name
-                    && &target_field.name != ID.as_str()
+                    && target_field.name != ID.as_str()
                     && !interface_types
                         .iter()
                         .any(|iface| target_field_type.eq(iface.as_str()))
@@ -2312,7 +2310,7 @@ mod validations {
                 let id_types: HashSet<&str> = HashSet::from_iter(
                     obj_types
                         .iter()
-                        .filter_map(|obj_type| obj_type.field(&*ID))
+                        .filter_map(|obj_type| obj_type.field(&ID))
                         .map(|f| f.field_type.get_base_type())
                         .map(|name| if name == "ID" { "String" } else { name }),
                 );
@@ -2358,27 +2356,59 @@ mod validations {
                 }
             }
 
-            fn aggregate_fields_are_numbers(agg_type: &s::ObjectType, errors: &mut Vec<Err>) {
+            fn aggregate_field_types(
+                schema: &Schema,
+                agg_type: &s::ObjectType,
+                errors: &mut Vec<Err>,
+            ) {
+                fn is_first_last(agg_directive: &s::Directive) -> bool {
+                    match agg_directive.argument(kw::FUNC) {
+                        Some(s::Value::Enum(func) | s::Value::String(func)) => {
+                            func == AggregateFn::First.as_str()
+                                || func == AggregateFn::Last.as_str()
+                        }
+                        _ => false,
+                    }
+                }
+
                 let errs = agg_type
                     .fields
                     .iter()
-                    .filter(|field| field.find_directive(kw::AGGREGATE).is_some())
-                    .map(|field| match field.field_type.value_type() {
-                        Ok(vt) => {
-                            if vt.is_numeric() {
-                                Ok(())
-                            } else {
-                                Err(Err::NonNumericAggregate(
+                    .filter_map(|field| {
+                        field
+                            .find_directive(kw::AGGREGATE)
+                            .map(|agg_directive| (field, agg_directive))
+                    })
+                    .map(|(field, agg_directive)| {
+                        let is_first_last = is_first_last(agg_directive);
+
+                        match field.field_type.value_type() {
+                            Ok(value_type) if value_type.is_numeric() => Ok(()),
+                            Ok(ValueType::Bytes | ValueType::String) if is_first_last => Ok(()),
+                            Ok(_) if is_first_last => Err(Err::InvalidFirstLastAggregate(
+                                agg_type.name.clone(),
+                                field.name.clone(),
+                            )),
+                            Ok(_) => Err(Err::NonNumericAggregate(
+                                agg_type.name.to_owned(),
+                                field.name.to_owned(),
+                            )),
+                            Err(_) => {
+                                if is_first_last
+                                    && schema.entity_types.iter().any(|entity_type| {
+                                        entity_type.name.eq(field.field_type.get_base_type())
+                                    })
+                                {
+                                    return Ok(());
+                                }
+
+                                Err(Err::FieldTypeUnknown(
                                     agg_type.name.to_owned(),
                                     field.name.to_owned(),
+                                    field.field_type.get_base_type().to_owned(),
                                 ))
                             }
                         }
-                        Err(_) => Err(Err::FieldTypeUnknown(
-                            agg_type.name.to_owned(),
-                            field.name.to_owned(),
-                            field.field_type.get_base_type().to_owned(),
-                        )),
                     })
                     .filter_map(|err| err.err());
                 errors.extend(errs);
@@ -2386,10 +2416,10 @@ mod validations {
 
             /// * `source` is an existing timeseries type
             /// * all non-aggregate fields are also fields on the `source`
-            /// type and have the same type
+            ///   type and have the same type
             /// * `arg` for each `@aggregate` is a numeric type in the
-            /// timeseries, coercible to the type of the field (e.g. `Int ->
-            /// BigDecimal`, but not `BigInt -> Int8`)
+            ///   timeseries, coercible to the type of the field (e.g. `Int
+            ///   -> BigDecimal`, but not `BigInt -> Int8`)
             fn aggregate_directive(
                 schema: &Schema,
                 agg_type: &s::ObjectType,
@@ -2511,16 +2541,10 @@ mod validations {
                                     continue;
                                 }
                             };
-                            let field_type = match field.field_type.value_type() {
-                                Ok(field_type) => field_type,
-                                Err(_) => {
-                                    errors.push(Err::NonNumericAggregate(
-                                        agg_type.name.to_owned(),
-                                        field.name.to_owned(),
-                                    ));
-                                    continue;
-                                }
-                            };
+
+                            let is_first_last =
+                                matches!(func, AggregateFn::First | AggregateFn::Last);
+
                             // It would be nicer to use a proper struct here
                             // and have that implement
                             // `sqlexpr::ExprVisitor` but we need access to
@@ -2531,6 +2555,18 @@ mod validations {
                                 let arg_type = match source.field(ident) {
                                     Some(arg_field) => match arg_field.field_type.value_type() {
                                         Ok(arg_type) if arg_type.is_numeric() => arg_type,
+                                        Ok(ValueType::Bytes | ValueType::String)
+                                            if is_first_last =>
+                                        {
+                                            return Ok(());
+                                        }
+                                        Err(_)
+                                            if is_first_last
+                                                && arg_field.field_type.get_base_type()
+                                                    == field.field_type.get_base_type() =>
+                                        {
+                                            return Ok(());
+                                        }
                                         Ok(_) | Err(_) => {
                                             return Err(Err::AggregationNonNumericArg(
                                                 agg_type.name.to_owned(),
@@ -2548,15 +2584,27 @@ mod validations {
                                         ));
                                     }
                                 };
-                                if arg_type > field_type {
-                                    return Err(Err::AggregationNonMatchingArg(
-                                        agg_type.name.to_owned(),
-                                        field.name.to_owned(),
-                                        arg.to_owned(),
-                                        arg_type.to_str().to_owned(),
-                                        field_type.to_str().to_owned(),
-                                    ));
+
+                                match field.field_type.value_type() {
+                                    Ok(field_type) if field_type.is_numeric() => {
+                                        if arg_type > field_type {
+                                            return Err(Err::AggregationNonMatchingArg(
+                                                agg_type.name.to_owned(),
+                                                field.name.to_owned(),
+                                                arg.to_owned(),
+                                                arg_type.to_str().to_owned(),
+                                                field_type.to_str().to_owned(),
+                                            ));
+                                        }
+                                    }
+                                    Ok(_) | Err(_) => {
+                                        return Err(Err::NonNumericAggregate(
+                                            agg_type.name.to_owned(),
+                                            field.name.to_owned(),
+                                        ));
+                                    }
                                 }
+
                                 Ok(())
                             };
                             if let Err(mut errs) = sqlexpr::parse(arg, check_ident) {
@@ -2629,7 +2677,7 @@ mod validations {
                     return;
                 }
                 for interval in intervals {
-                    if let Err(_) = interval.parse::<AggregationInterval>() {
+                    if interval.parse::<AggregationInterval>().is_err() {
                         errors.push(Err::AggregationInvalidInterval(
                             agg_type.name.to_owned(),
                             interval.to_owned(),
@@ -2653,7 +2701,7 @@ mod validations {
                     errors.push(err);
                 }
                 no_derived_fields(agg_type, &mut errors);
-                aggregate_fields_are_numbers(agg_type, &mut errors);
+                aggregate_field_types(self, agg_type, &mut errors);
                 aggregate_directive(self, agg_type, &mut errors);
                 // check timeseries directive has intervals and args
                 aggregation_intervals(agg_type, &mut errors);
@@ -2745,9 +2793,9 @@ mod validations {
                     BaseSchema::parse(&schema, DeploymentHash::new("dummy").unwrap()).unwrap();
                 let res = validate(&schema);
                 if ok {
-                    assert!(matches!(res, Ok(_)));
+                    assert!(res.is_ok());
                 } else {
-                    assert!(matches!(res, Err(_)));
+                    assert!(res.is_err());
                     assert!(matches!(
                         res.unwrap_err()[0],
                         SchemaValidationError::InterfaceImplementorsMixId(_, _)
@@ -2779,7 +2827,7 @@ type Account implements Address @entity { id: ID!, txn: Transaction! @derivedFro
             fn validate(field: &str, errmsg: &str) {
                 let raw = format!("type A @entity {{ id: ID!\n {} }}\n{}", field, OTHER_TYPES);
 
-                let document = graphql_parser::parse_schema(&raw)
+                let document = s::parse_schema(&raw)
                     .expect("Failed to parse raw schema")
                     .into_static();
                 let schema = BaseSchema::new(DeploymentHash::new("id").unwrap(), document).unwrap();
@@ -2836,8 +2884,7 @@ type Account implements Address @entity { id: ID!, txn: Transaction! @derivedFro
             const ROOT_SCHEMA: &str = "
 type _Schema_ { id: ID! }";
 
-            let document =
-                graphql_parser::parse_schema(ROOT_SCHEMA).expect("Failed to parse root schema");
+            let document = s::parse_schema(ROOT_SCHEMA).expect("Failed to parse root schema");
             let schema = BaseSchema::new(DeploymentHash::new("id").unwrap(), document).unwrap();
             let schema = Schema::new(LATEST_VERSION, &schema);
             assert_eq!(
@@ -2853,8 +2900,7 @@ type _Schema_ { id: ID! }";
             const ROOT_SCHEMA: &str = "
 type _Schema_ @illegal";
 
-            let document =
-                graphql_parser::parse_schema(ROOT_SCHEMA).expect("Failed to parse root schema");
+            let document = s::parse_schema(ROOT_SCHEMA).expect("Failed to parse root schema");
             let schema = BaseSchema::new(DeploymentHash::new("id").unwrap(), document).unwrap();
             let schema = Schema::new(LATEST_VERSION, &schema);
             assert_eq!(
@@ -2878,8 +2924,7 @@ type A @entity {
   color: Color
 }"#;
 
-            let document =
-                graphql_parser::parse_schema(ROOT_SCHEMA).expect("Failed to parse root schema");
+            let document = s::parse_schema(ROOT_SCHEMA).expect("Failed to parse root schema");
             let schema = BaseSchema::new(DeploymentHash::new("id").unwrap(), document).unwrap();
             let schema = Schema::new(LATEST_VERSION, &schema);
             assert_eq!(schema.validate_fields().len(), 0);
@@ -2987,7 +3032,7 @@ type Gravatar @entity {
   imageUrl: String!
 }"#;
 
-            let document = graphql_parser::parse_schema(SCHEMA).expect("Failed to parse schema");
+            let document = s::parse_schema(SCHEMA).expect("Failed to parse schema");
             let schema = BaseSchema::new(DeploymentHash::new("id1").unwrap(), document).unwrap();
             let schema = Schema::new(LATEST_VERSION, &schema);
             assert_eq!(schema.validate_fulltext_directives(), vec![]);
@@ -3046,7 +3091,6 @@ type Gravatar @entity {
             let files = {
                 let mut files = std::fs::read_dir(dir)
                     .unwrap()
-                    .into_iter()
                     .filter_map(|entry| entry.ok())
                     .map(|entry| entry.path())
                     .filter(|path| path.extension() == Some(OsString::from("graphql").as_os_str()))
@@ -3082,8 +3126,10 @@ type Gravatar @entity {
                         } else {
                             let msgs: Vec<_> = errs.iter().map(|err| err.to_string()).collect();
                             panic!(
-                                    "{file_name} failed but not with the expected error `{msg}`: {errs:?} {msgs:?}",
-                                )
+                                "{file_name} failed but not with the expected error `{msg}`: \n\
+                                    actual: {errs:?}\n\
+                                    or {msgs:?}",
+                            )
                         }
                     }
                     (true, Ok(_)) => {

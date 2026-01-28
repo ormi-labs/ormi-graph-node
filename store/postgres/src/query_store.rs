@@ -2,9 +2,11 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use crate::deployment_store::{DeploymentStore, ReplicaId};
+use crate::sql::Parser;
+use async_trait::async_trait;
 use graph::components::store::{DeploymentId, QueryPermit, QueryStore as QueryStoreTrait};
 use graph::data::query::Trace;
-use graph::data::store::QueryObject;
+use graph::data::store::{QueryObject, SqlQueryObject};
 use graph::prelude::*;
 use graph::schema::{ApiSchema, InputSchema};
 
@@ -16,29 +18,35 @@ pub(crate) struct QueryStore {
     store: Arc<DeploymentStore>,
     chain_store: Arc<crate::ChainStore>,
     api_version: Arc<ApiVersion>,
+    sql_parser: Result<Parser, StoreError>,
 }
 
 impl QueryStore {
-    pub(crate) fn new(
+    pub(crate) async fn new(
         store: Arc<DeploymentStore>,
         chain_store: Arc<crate::ChainStore>,
         site: Arc<Site>,
         replica_id: ReplicaId,
         api_version: Arc<ApiVersion>,
     ) -> Self {
+        let sql_parser = store
+            .find_layout(site.clone())
+            .await
+            .map(|layout| Parser::new(layout, BLOCK_NUMBER_MAX));
         QueryStore {
             site,
             replica_id,
             store,
             chain_store,
             api_version,
+            sql_parser,
         }
     }
 }
 
 #[async_trait]
 impl QueryStoreTrait for QueryStore {
-    fn find_query_values(
+    async fn find_query_values(
         &self,
         query: EntityQuery,
     ) -> Result<(Vec<QueryObject>, Trace), graph::prelude::QueryExecutionError> {
@@ -47,14 +55,44 @@ impl QueryStoreTrait for QueryStore {
         let mut conn = self
             .store
             .get_replica_conn(self.replica_id)
+            .await
             .map_err(|e| QueryExecutionError::StoreError(e.into()))?;
         let wait = start.elapsed();
         self.store
             .execute_query(&mut conn, self.site.clone(), query)
+            .await
             .map(|(entities, mut trace)| {
                 trace.conn_wait(wait);
                 (entities, trace)
             })
+    }
+
+    async fn execute_sql(
+        &self,
+        sql: &str,
+    ) -> Result<Vec<SqlQueryObject>, graph::prelude::QueryExecutionError> {
+        // Check if SQL queries are enabled
+        if !ENV_VARS.sql_queries_enabled() {
+            return Err(QueryExecutionError::SqlError(
+                "SQL queries are disabled. Set GRAPH_ENABLE_SQL_QUERIES=true to enable."
+                    .to_string(),
+            ));
+        }
+
+        let mut conn = self
+            .store
+            .get_replica_conn(self.replica_id)
+            .await
+            .map_err(|e| QueryExecutionError::SqlError(format!("SQL error: {}", e)))?;
+
+        let parser = self
+            .sql_parser
+            .as_ref()
+            .map_err(|e| QueryExecutionError::SqlError(format!("SQL error: {}", e)))?;
+
+        let sql = parser.parse_and_validate(sql)?;
+
+        self.store.execute_sql(&mut conn, &sql).await
     }
 
     /// Return true if the deployment with the given id is fully synced,
@@ -120,13 +158,13 @@ impl QueryStoreTrait for QueryStore {
         Ok(self.store.deployment_state(self.site.cheap_clone()).await?)
     }
 
-    fn api_schema(&self) -> Result<Arc<ApiSchema>, QueryExecutionError> {
-        let info = self.store.subgraph_info(self.site.cheap_clone())?;
+    async fn api_schema(&self) -> Result<Arc<ApiSchema>, QueryExecutionError> {
+        let info = self.store.subgraph_info(self.site.cheap_clone()).await?;
         Ok(info.api.get(&self.api_version).unwrap().clone())
     }
 
-    fn input_schema(&self) -> Result<InputSchema, QueryExecutionError> {
-        let layout = self.store.find_layout(self.site.cheap_clone())?;
+    async fn input_schema(&self) -> Result<InputSchema, QueryExecutionError> {
+        let layout = self.store.find_layout(self.site.cheap_clone()).await?;
         Ok(layout.input_schema.cheap_clone())
     }
 

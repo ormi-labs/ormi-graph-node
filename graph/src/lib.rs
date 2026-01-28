@@ -24,10 +24,6 @@ pub mod runtime;
 
 pub mod firehose;
 
-pub mod substreams;
-
-pub mod substreams_rpc;
-
 pub mod endpoint;
 
 pub mod schema;
@@ -37,9 +33,15 @@ pub mod env;
 
 pub mod ipfs;
 
+pub mod abi;
+
+pub mod amp;
+
 /// Wrapper for spawning tasks that abort on panic, which is our default.
-mod task_spawn;
-pub use task_spawn::{
+mod tokio;
+#[cfg(debug_assertions)]
+pub use tokio::TEST_RUNTIME;
+pub use tokio::{
     block_on, spawn, spawn_allow_panic, spawn_blocking, spawn_blocking_allow_panic, spawn_thread,
 };
 
@@ -48,6 +50,7 @@ pub use bytes;
 pub use futures01;
 pub use futures03;
 pub use graph_derive as derive;
+pub use graph_derive::test;
 pub use http;
 pub use http0;
 pub use http_body_util;
@@ -62,9 +65,6 @@ pub use slog;
 pub use sqlparser;
 pub use stable_hash;
 pub use stable_hash_legacy;
-pub use tokio;
-pub use tokio_retry;
-pub use tokio_stream;
 pub use url;
 
 /// A prelude that makes all system component traits and data types available.
@@ -76,13 +76,12 @@ pub use url;
 /// ```
 pub mod prelude {
     pub use ::anyhow;
+    pub use alloy;
     pub use anyhow::{anyhow, Context as _, Error};
-    pub use async_trait::async_trait;
     pub use atty;
     pub use chrono;
     pub use diesel;
     pub use envconfig;
-    pub use ethabi;
     pub use hex;
     pub use lazy_static::lazy_static;
     pub use prost;
@@ -106,7 +105,6 @@ pub mod prelude {
     pub use tokio;
     pub use toml;
     pub use tonic;
-    pub use web3;
 
     pub type DynTryFuture<'a, Ok = (), Err = Error> =
         Pin<Box<dyn futures03::Future<Output = Result<Ok, Err>> + Send + 'a>>;
@@ -131,13 +129,12 @@ pub mod prelude {
         EntityCollection, EntityFilter, EntityLink, EntityOperation, EntityOrder,
         EntityOrderByChild, EntityOrderByChildInfo, EntityQuery, EntityRange, EntityWindow,
         EthereumCallCache, ParentLink, PartialBlockPtr, PoolWaitStats, QueryStore,
-        QueryStoreManager, StoreError, StoreEvent, StoreEventStream, StoreEventStreamBox,
-        SubgraphStore, UnfailOutcome, WindowAttribute, BLOCK_NUMBER_MAX,
+        QueryStoreManager, StoreError, StoreEvent, StoreEventStreamBox, SubgraphStore,
+        UnfailOutcome, WindowAttribute, BLOCK_NUMBER_MAX,
     };
     pub use crate::components::subgraph::{
         BlockState, HostMetrics, InstanceDSTemplateInfo, RuntimeHost, RuntimeHostBuilder,
-        SubgraphAssignmentProvider, SubgraphInstanceManager, SubgraphRegistrar,
-        SubgraphVersionSwitchingMode,
+        SubgraphInstanceManager, SubgraphRegistrar, SubgraphVersionSwitchingMode,
     };
     pub use crate::components::trigger_processor::TriggerProcessor;
     pub use crate::components::versions::{ApiVersion, FeatureFlag};
@@ -152,7 +149,7 @@ pub mod prelude {
         Query, QueryError, QueryExecutionError, QueryResult, QueryTarget, QueryVariables,
     };
     pub use crate::data::store::scalar::{BigDecimal, BigInt, BigIntSign};
-    pub use crate::data::store::{AssignmentEvent, Attribute, Entity, NodeId, Value, ValueType};
+    pub use crate::data::store::{Attribute, Entity, NodeId, Value, ValueType};
     pub use crate::data::subgraph::schema::SubgraphDeploymentEntity;
     pub use crate::data::subgraph::{
         CreateSubgraphResult, DataSourceContext, DeploymentHash, DeploymentState, Link,
@@ -174,35 +171,39 @@ pub mod prelude {
     pub use crate::log::split::split_logger;
     pub use crate::util::cache_weight::CacheWeight;
     pub use crate::util::futures::{retry, TimeoutError};
-    pub use crate::util::stats::MovingStats;
+    pub use crate::util::stats::{AtomicMovingStats, MovingStats};
+    pub use crate::util::test_utils::*;
 
     macro_rules! static_graphql {
         ($m:ident, $m2:ident, {$($n:ident,)*}) => {
-            pub mod $m {
-                use graphql_parser::$m2 as $m;
-                pub use graphql_parser::Pos;
+                use graphql_tools::parser::$m2 as $m;
+                pub use graphql_tools::parser::Pos;
                 pub use $m::*;
                 $(
                     pub type $n = $m::$n<'static, String>;
                 )*
-            }
         };
     }
 
     // Static graphql mods. These are to be phased out, with a preference
     // toward making graphql generic over text. This helps to ease the
     // transition by providing the old graphql-parse 0.2.x API
-    static_graphql!(q, query, {
-        Document, Value, OperationDefinition, InlineFragment, TypeCondition,
-        FragmentSpread, Field, Selection, SelectionSet, FragmentDefinition,
-        Directive, VariableDefinition, Type, Query,
-    });
-    static_graphql!(s, schema, {
-        Field, Directive, InterfaceType, ObjectType, Value, TypeDefinition,
-        EnumType, Type, Definition, Document, ScalarType, InputValue, DirectiveDefinition,
-        UnionType, InputObjectType, EnumValue,
-    });
-
+    pub mod q {
+        static_graphql!(q, query, {
+            Document, Value, OperationDefinition, InlineFragment, TypeCondition,
+            FragmentSpread, Field, Selection, SelectionSet, FragmentDefinition,
+            Directive, VariableDefinition, Type, Query,
+        });
+        pub use q::parse_query;
+    }
+    pub mod s {
+        static_graphql!(s, schema, {
+            Field, Directive, InterfaceType, ObjectType, Value, TypeDefinition,
+            EnumType, Type, Definition, Document, ScalarType, InputValue, DirectiveDefinition,
+            UnionType, InputObjectType, EnumValue,
+        });
+        pub use s::parse_schema;
+    }
     pub mod r {
         pub use crate::data::value::{Object, Value};
     }

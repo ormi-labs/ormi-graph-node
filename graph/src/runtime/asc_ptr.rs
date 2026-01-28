@@ -1,3 +1,5 @@
+use crate::data::subgraph::API_VERSION_0_0_4;
+
 use super::gas::GasCounter;
 use super::{padding_to_16, DeterministicHostError, HostExportError};
 
@@ -17,7 +19,7 @@ impl<T> Copy for AscPtr<T> {}
 
 impl<T> Clone for AscPtr<T> {
     fn clone(&self) -> Self {
-        AscPtr(self.0, PhantomData)
+        *self
     }
 }
 
@@ -61,13 +63,13 @@ impl<C: AscType> AscPtr<C> {
         let len = match heap.api_version() {
             // TODO: The version check here conflicts with the comment on C::asc_size,
             // which states "Only used for version <= 0.0.3."
-            version if version <= Version::new(0, 0, 4) => C::asc_size(self, heap, gas),
+            version if version <= &API_VERSION_0_0_4 => C::asc_size(self, heap, gas),
             _ => self.read_len(heap, gas),
         }?;
 
         let using_buffer = |buffer: &mut [MaybeUninit<u8>]| {
             let buffer = heap.read(self.0, buffer, gas)?;
-            C::from_asc_bytes(buffer, &heap.api_version())
+            C::from_asc_bytes(buffer, heap.api_version())
         };
 
         let len = len as usize;
@@ -82,7 +84,7 @@ impl<C: AscType> AscPtr<C> {
     }
 
     /// Allocate `asc_obj` as an Asc object of class `C`.
-    pub fn alloc_obj<H: AscHeap + ?Sized>(
+    pub async fn alloc_obj<H: AscHeap + ?Sized>(
         asc_obj: C,
         heap: &mut H,
         gas: &GasCounter,
@@ -91,8 +93,8 @@ impl<C: AscType> AscPtr<C> {
         C: AscIndexId,
     {
         match heap.api_version() {
-            version if version <= Version::new(0, 0, 4) => {
-                let heap_ptr = heap.raw_new(&asc_obj.to_asc_bytes()?, gas)?;
+            version if version <= &API_VERSION_0_0_4 => {
+                let heap_ptr = heap.raw_new(&asc_obj.to_asc_bytes()?, gas).await?;
                 Ok(AscPtr::new(heap_ptr))
             }
             _ => {
@@ -101,17 +103,18 @@ impl<C: AscType> AscPtr<C> {
                 let aligned_len = padding_to_16(bytes.len());
                 // Since AssemblyScript keeps all allocated objects with a 16 byte alignment,
                 // we need to do the same when we allocate ourselves.
-                bytes.extend(std::iter::repeat(0).take(aligned_len));
+                bytes.extend(std::iter::repeat_n(0, aligned_len));
 
                 let header = Self::generate_header(
                     heap,
                     C::INDEX_ASC_TYPE_ID,
                     asc_obj.content_len(&bytes),
                     bytes.len(),
-                )?;
+                )
+                .await?;
                 let header_len = header.len() as u32;
 
-                let heap_ptr = heap.raw_new(&[header, bytes].concat(), gas)?;
+                let heap_ptr = heap.raw_new(&[header, bytes].concat(), gas).await?;
 
                 // Use header length as offset. so the AscPtr points directly at the content.
                 Ok(AscPtr::new(heap_ptr + header_len))
@@ -137,8 +140,9 @@ impl<C: AscType> AscPtr<C> {
     /// - gc_info2: usize -> second GC info (we don't free memory so it's irrelevant)
     /// - rt_id: u32 -> identifier for the class being allocated
     /// - rt_size: u32 -> content size
+    ///
     /// Only used for version >= 0.0.5.
-    fn generate_header<H: AscHeap + ?Sized>(
+    async fn generate_header<H: AscHeap + ?Sized>(
         heap: &mut H,
         type_id_index: IndexForAscTypeId,
         content_length: usize,
@@ -148,7 +152,7 @@ impl<C: AscType> AscPtr<C> {
 
         let gc_info: [u8; 4] = (0u32).to_le_bytes();
         let gc_info2: [u8; 4] = (0u32).to_le_bytes();
-        let asc_type_id = heap.asc_type_id(type_id_index)?;
+        let asc_type_id = heap.asc_type_id(type_id_index).await?;
         let rt_id: [u8; 4] = asc_type_id.to_le_bytes();
         let rt_size: [u8; 4] = (content_length as u32).to_le_bytes();
 
@@ -166,12 +170,14 @@ impl<C: AscType> AscPtr<C> {
     }
 
     /// Helper to read the length from the header.
+    ///
     /// An AssemblyScript header has 20 bytes, and it's right before the content, and composed by:
     /// - mm_info: usize
     /// - gc_info: usize
     /// - gc_info2: usize
     /// - rt_id: u32
     /// - rt_size: u32
+    ///
     /// This function returns the `rt_size`.
     /// Only used for version >= 0.0.5.
     pub fn read_len<H: AscHeap + ?Sized>(

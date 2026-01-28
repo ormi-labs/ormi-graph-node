@@ -4,21 +4,36 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-async-trait = "0.1.50"
-atomic_refcell = "0.1.13"
+async-trait = { workspace = true}
 bytes = "1.0"
 graph = { path = "../graph" }
 graph-chain-ethereum = { path = "../chain/ethereum" }
 graph-chain-near = { path = "../chain/near" }
-graph-chain-substreams = { path = "../chain/substreams" }
 graph-runtime-wasm = { path = "../runtime/wasm" }
 serde_yaml = { workspace = true }
+tokio = { workspace = true }
+tokio-retry = { workspace = true }
 # Switch to crates.io once tower 0.5 is released
 tower = { git = "https://github.com/tower-rs/tower.git", features = ["full"] }
 thiserror = { workspace = true }
-cid = "0.11.1"
 anyhow = "1.0"
+
+# Dependencies related to Amp subgraphs
+alloy.workspace = true
+arrow.workspace = true
+chrono.workspace = true
+futures.workspace = true
+indoc.workspace = true
+itertools.workspace = true
+parking_lot.workspace = true
+prometheus.workspace = true
+slog.workspace = true
+strum.workspace = true
+tokio-util.workspace = true
 
 [dev-dependencies]
 tower-test = { git = "https://github.com/tower-rs/tower.git" }
 wiremock = "0.6.5"
+
+[lints]
+workspace = true

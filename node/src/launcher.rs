@@ -1,29 +1,25 @@
+use std::{
+    io::{BufRead, BufReader},
+    path::Path,
+    time::Duration,
+};
+
 use anyhow::Result;
-
 use git_testament::{git_testament, render_testament};
-use graph::futures01::Future as _;
-use graph::futures03::compat::Future01CompatExt;
-use graph::futures03::future::TryFutureExt;
-
-use crate::config::Config;
-use crate::dev::helpers::watch_subgraph_updates;
-use crate::network_setup::Networks;
-use crate::opt::Opt;
-use crate::store_builder::StoreBuilder;
-use graph::blockchain::{Blockchain, BlockchainKind, BlockchainMap};
 use graph::components::link_resolver::{ArweaveClient, FileSizeLimit};
 use graph::components::subgraph::Settings;
 use graph::data::graphql::load_manager::LoadManager;
 use graph::endpoint::EndpointMetrics;
 use graph::env::EnvVars;
+use graph::futures03::future::TryFutureExt;
 use graph::prelude::*;
 use graph::prometheus::Registry;
 use graph::url::Url;
-use graph_core::polling_monitor::{arweave_service, ArweaveService, IpfsService};
-use graph_core::{
-    SubgraphAssignmentProvider as IpfsSubgraphAssignmentProvider, SubgraphInstanceManager,
-    SubgraphRegistrar as IpfsSubgraphRegistrar,
+use graph::{
+    amp,
+    blockchain::{Blockchain, BlockchainKind, BlockchainMap},
 };
+use graph_core::polling_monitor::{arweave_service, ArweaveService, IpfsService};
 use graph_graphql::prelude::GraphQlRunner;
 use graph_server_http::GraphQLServer as GraphQLQueryServer;
 use graph_server_index_node::IndexNodeServer;
@@ -35,15 +31,19 @@ use graph_store_postgres::{
 };
 use graphman_server::GraphmanServer;
 use graphman_server::GraphmanServerConfig;
-use std::io::{BufRead, BufReader};
-use std::path::Path;
-use std::time::Duration;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
+
+use crate::config::Config;
+use crate::helpers::watch_subgraph_updates;
+use crate::network_setup::Networks;
+use crate::opt::Opt;
+use crate::store_builder::StoreBuilder;
 
 git_testament!(TESTAMENT);
 
 /// Sets up metrics and monitoring
-fn setup_metrics(logger: &Logger) -> (Arc<Registry>, Arc<MetricsRegistry>) {
+pub fn setup_metrics(logger: &Logger) -> (Arc<Registry>, Arc<MetricsRegistry>) {
     // Set up Prometheus registry
     let prometheus_registry = Arc::new(Registry::new());
     let metrics_registry = Arc::new(MetricsRegistry::new(
@@ -79,7 +79,7 @@ async fn setup_store(
     let primary_pool = store_builder.primary_pool();
     let subscription_manager = store_builder.subscription_manager();
     let chain_head_update_listener = store_builder.chain_head_update_listener();
-    let network_store = store_builder.network_store(config.chain_ids());
+    let network_store = store_builder.network_store(config.chain_ids()).await;
 
     (
         primary_pool,
@@ -106,7 +106,7 @@ async fn build_blockchain_map(
 
     if env_vars.genesis_validation_enabled {
         provider_checks.push(Arc::new(network_provider::GenesisHashCheck::from_id_store(
-            block_store.clone(),
+            Box::new(block_store.cheap_clone()),
         )));
     }
 
@@ -119,7 +119,7 @@ async fn build_blockchain_map(
 
     let network_adapters = Networks::from_config(
         logger.cheap_clone(),
-        &config,
+        config,
         metrics_registry.cheap_clone(),
         endpoint_metrics,
         &provider_checks,
@@ -129,10 +129,10 @@ async fn build_blockchain_map(
 
     let blockchain_map = network_adapters
         .blockchain_map(
-            &env_vars,
-            &logger,
+            env_vars,
+            logger,
             block_store,
-            &logger_factory,
+            logger_factory,
             metrics_registry.cheap_clone(),
             chain_head_update_listener,
         )
@@ -141,7 +141,10 @@ async fn build_blockchain_map(
     Arc::new(blockchain_map)
 }
 
-fn cleanup_ethereum_shallow_blocks(blockchain_map: &BlockchainMap, network_store: &Arc<Store>) {
+async fn cleanup_ethereum_shallow_blocks(
+    blockchain_map: &BlockchainMap,
+    network_store: &Arc<Store>,
+) {
     match blockchain_map
         .get_all_by_kind::<graph_chain_ethereum::Chain>(BlockchainKind::Ethereum)
         .ok()
@@ -161,6 +164,7 @@ fn cleanup_ethereum_shallow_blocks(blockchain_map: &BlockchainMap, network_store
             network_store
                 .block_store()
                 .cleanup_ethereum_shallow_blocks(eth_network_names)
+                .await
                 .unwrap();
         }
         // This code path only happens if the downcast on the blockchain map fails, that
@@ -180,7 +184,7 @@ async fn spawn_block_ingestor(
     metrics_registry: &Arc<MetricsRegistry>,
 ) {
     let logger = logger.clone();
-    let ingestors = Networks::block_ingestors(&logger, &blockchain_map)
+    let ingestors = Networks::block_ingestors(&logger, blockchain_map)
         .await
         .expect("unable to start block ingestors");
 
@@ -258,7 +262,7 @@ fn deploy_subgraph_from_flag(
     );
 }
 
-fn build_subgraph_registrar(
+fn build_subgraph_registrar<AC>(
     metrics_registry: Arc<MetricsRegistry>,
     network_store: &Arc<Store>,
     logger_factory: &LoggerFactory,
@@ -270,18 +274,44 @@ fn build_subgraph_registrar(
     subscription_manager: Arc<SubscriptionManager>,
     arweave_service: ArweaveService,
     ipfs_service: IpfsService,
+    amp_client: Option<Arc<AC>>,
+    cancel_token: CancellationToken,
 ) -> Arc<
-    IpfsSubgraphRegistrar<
-        IpfsSubgraphAssignmentProvider<SubgraphInstanceManager<SubgraphStore>>,
+    graph_core::subgraph::SubgraphRegistrar<
+        graph_core::subgraph_provider::SubgraphProvider,
         SubgraphStore,
         SubscriptionManager,
+        AC,
     >,
-> {
+>
+where
+    AC: amp::Client + Send + Sync + 'static,
+{
     let static_filters = ENV_VARS.experimental_static_filters;
     let sg_count = Arc::new(SubgraphCountMetric::new(metrics_registry.cheap_clone()));
 
-    let subgraph_instance_manager = SubgraphInstanceManager::new(
-        &logger_factory,
+    let mut subgraph_instance_managers =
+        graph_core::subgraph_provider::SubgraphInstanceManagers::new();
+
+    if let Some(amp_client) = amp_client.cheap_clone() {
+        let amp_instance_manager = graph_core::amp_subgraph::Manager::new(
+            logger_factory,
+            metrics_registry.cheap_clone(),
+            env_vars.cheap_clone(),
+            &cancel_token,
+            network_store.subgraph_store(),
+            link_resolver.cheap_clone(),
+            amp_client,
+        );
+
+        subgraph_instance_managers.add(
+            graph_core::subgraph_provider::SubgraphProcessingKind::Amp,
+            Arc::new(amp_instance_manager),
+        );
+    }
+
+    let subgraph_instance_manager = graph_core::subgraph::SubgraphInstanceManager::new(
+        logger_factory,
         env_vars.cheap_clone(),
         network_store.subgraph_store(),
         blockchain_map.cheap_clone(),
@@ -290,34 +320,41 @@ fn build_subgraph_registrar(
         link_resolver.clone(),
         ipfs_service,
         arweave_service,
+        amp_client.cheap_clone(),
         static_filters,
     );
 
-    // Create IPFS-based subgraph provider
-    let subgraph_provider = IpfsSubgraphAssignmentProvider::new(
-        &logger_factory,
-        link_resolver.clone(),
-        subgraph_instance_manager,
-        sg_count,
+    subgraph_instance_managers.add(
+        graph_core::subgraph_provider::SubgraphProcessingKind::Trigger,
+        Arc::new(subgraph_instance_manager),
+    );
+
+    let subgraph_provider = graph_core::subgraph_provider::SubgraphProvider::new(
+        logger_factory,
+        sg_count.cheap_clone(),
+        network_store.subgraph_store(),
+        link_resolver.cheap_clone(),
+        tokio_util::sync::CancellationToken::new(),
+        subgraph_instance_managers,
     );
 
     // Check version switching mode environment variable
     let version_switching_mode = ENV_VARS.subgraph_version_switching_mode;
 
     // Create named subgraph provider for resolving subgraph name->ID mappings
-    let subgraph_registrar = Arc::new(IpfsSubgraphRegistrar::new(
-        &logger_factory,
+
+    Arc::new(graph_core::subgraph::SubgraphRegistrar::new(
+        logger_factory,
         link_resolver,
         Arc::new(subgraph_provider),
         network_store.subgraph_store(),
         subscription_manager,
+        amp_client,
         blockchain_map,
         node_id.clone(),
         version_switching_mode,
         Arc::new(subgraph_settings),
-    ));
-
-    subgraph_registrar
+    ))
 }
 
 fn build_graphql_server(
@@ -330,20 +367,19 @@ fn build_graphql_server(
 ) -> GraphQLQueryServer<GraphQlRunner<Store>> {
     let shards: Vec<_> = config.stores.keys().cloned().collect();
     let load_manager = Arc::new(LoadManager::new(
-        &logger,
+        logger,
         shards,
         expensive_queries,
         metrics_registry.clone(),
     ));
     let graphql_runner = Arc::new(GraphQlRunner::new(
-        &logger,
+        logger,
         network_store.clone(),
         load_manager,
         metrics_registry,
     ));
-    let graphql_server = GraphQLQueryServer::new(&logger_factory, graphql_runner.clone());
 
-    graphql_server
+    GraphQLQueryServer::new(logger_factory, graphql_runner.clone())
 }
 
 /// Runs the Graph Node by initializing all components and starting all required services
@@ -363,6 +399,9 @@ pub async fn run(
     ipfs_service: IpfsService,
     link_resolver: Arc<dyn LinkResolver>,
     dev_updates: Option<mpsc::Receiver<(DeploymentHash, SubgraphName)>>,
+    prometheus_registry: Arc<Registry>,
+    metrics_registry: Arc<MetricsRegistry>,
+    cancel_token: CancellationToken,
 ) {
     // Log version information
     info!(
@@ -399,10 +438,7 @@ pub async fn run(
     // Obtain metrics server port
     let metrics_port = opt.metrics_port;
 
-    info!(logger, "Starting up");
-
-    // Set up metrics
-    let (prometheus_registry, metrics_registry) = setup_metrics(&logger);
+    info!(logger, "Starting up"; "node_id" => &node_id);
 
     // Optionally, identify the Elasticsearch logging configuration
     let elastic_config = opt
@@ -466,6 +502,37 @@ pub async fn run(
         &logger_factory,
     );
 
+    let amp_client = match opt.amp_flight_service_address.as_deref() {
+        Some(amp_flight_service_address) => {
+            let addr: graph::http::Uri = amp_flight_service_address
+                .parse()
+                .expect("Invalid Amp Flight service address");
+
+            debug!(logger, "Connecting to Amp Flight service";
+                "host" => ?addr.host(),
+                "port" => ?addr.port()
+            );
+
+            let mut amp_client = amp::FlightClient::new(addr.clone())
+                .await
+                .expect("Failed to connect to Amp Flight service");
+
+            if let Some(auth_token) = &env_vars.amp.flight_service_token {
+                amp_client.set_auth_token(auth_token);
+            }
+
+            info!(logger, "Amp-powered subgraphs enabled";
+                "amp_flight_service_host" => ?addr.host()
+            );
+
+            Some(Arc::new(amp_client))
+        }
+        None => {
+            warn!(logger, "Amp-powered subgraphs disabled");
+            None
+        }
+    };
+
     start_graphman_server(opt.graphman_port, graphman_server_config).await;
 
     let launch_services = |logger: Logger, env_vars: Arc<EnvVars>| async move {
@@ -483,7 +550,7 @@ pub async fn run(
 
         // see comment on cleanup_ethereum_shallow_blocks
         if !opt.disable_block_ingestor {
-            cleanup_ethereum_shallow_blocks(&blockchain_map, &network_store);
+            cleanup_ethereum_shallow_blocks(&blockchain_map, &network_store).await;
         }
 
         let graphql_server = build_graphql_server(
@@ -500,6 +567,7 @@ pub async fn run(
             blockchain_map.clone(),
             network_store.clone(),
             link_resolver.clone(),
+            amp_client.cheap_clone(),
         );
 
         if !opt.disable_block_ingestor {
@@ -525,13 +593,15 @@ pub async fn run(
             subscription_manager,
             arweave_service,
             ipfs_service,
+            amp_client,
+            cancel_token,
         );
 
         graph::spawn(
             subgraph_registrar
+                .cheap_clone()
                 .start()
-                .map_err(|e| panic!("failed to initialize subgraph provider {}", e))
-                .compat(),
+                .map_err(|e| panic!("failed to initialize subgraph provider {}", e)),
         );
 
         // Start admin JSON-RPC server.

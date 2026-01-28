@@ -1,9 +1,10 @@
+use async_trait::async_trait;
 use graph::blockchain::Block;
 use graph::blockchain::MappingTriggerTrait;
 use graph::blockchain::TriggerData;
 use graph::derive::CheapClone;
+use graph::prelude::alloy::primitives::B256;
 use graph::prelude::hex;
-use graph::prelude::web3::types::H256;
 use graph::prelude::BlockNumber;
 use graph::runtime::HostExportError;
 use graph::runtime::{asc_new, gas::GasCounter, AscHeap, AscPtr};
@@ -38,15 +39,16 @@ impl std::fmt::Debug for NearTrigger {
     }
 }
 
+#[async_trait]
 impl ToAscPtr for NearTrigger {
-    fn to_asc_ptr<H: AscHeap>(
+    async fn to_asc_ptr<H: AscHeap>(
         self,
         heap: &mut H,
         gas: &GasCounter,
     ) -> Result<AscPtr<()>, HostExportError> {
         Ok(match self {
-            NearTrigger::Block(block) => asc_new(heap, block.as_ref(), gas)?.erase(),
-            NearTrigger::Receipt(receipt) => asc_new(heap, receipt.as_ref(), gas)?.erase(),
+            NearTrigger::Block(block) => asc_new(heap, block.as_ref(), gas).await?.erase(),
+            NearTrigger::Receipt(receipt) => asc_new(heap, receipt.as_ref(), gas).await?.erase(),
         })
     }
 }
@@ -78,10 +80,10 @@ impl NearTrigger {
         }
     }
 
-    pub fn block_hash(&self) -> H256 {
+    pub fn block_hash(&self) -> B256 {
         match self {
-            NearTrigger::Block(block) => block.ptr().hash_as_h256(),
-            NearTrigger::Receipt(receipt) => receipt.block.ptr().hash_as_h256(),
+            NearTrigger::Block(block) => block.ptr().hash.as_b256(),
+            NearTrigger::Receipt(receipt) => receipt.block.ptr().hash.as_b256(),
         }
     }
 
@@ -150,8 +152,6 @@ pub struct ReceiptWithOutcome {
 
 #[cfg(test)]
 mod tests {
-    use std::convert::TryFrom;
-
     use super::*;
 
     use graph::{
@@ -163,17 +163,19 @@ mod tests {
         util::mem::init_slice,
     };
 
-    #[test]
-    fn block_trigger_to_asc_ptr() {
+    #[graph::test]
+    async fn block_trigger_to_asc_ptr() {
         let mut heap = BytesHeap::new(API_VERSION_0_0_5);
         let trigger = NearTrigger::Block(Arc::new(block()));
 
-        let result = trigger.to_asc_ptr(&mut heap, &GasCounter::new(GasMetrics::mock()));
+        let result = trigger
+            .to_asc_ptr(&mut heap, &GasCounter::new(GasMetrics::mock()))
+            .await;
         assert!(result.is_ok());
     }
 
-    #[test]
-    fn receipt_trigger_to_asc_ptr() {
+    #[graph::test]
+    async fn receipt_trigger_to_asc_ptr() {
         let mut heap = BytesHeap::new(API_VERSION_0_0_5);
         let trigger = NearTrigger::Receipt(Arc::new(ReceiptWithOutcome {
             block: Arc::new(block()),
@@ -181,7 +183,9 @@ mod tests {
             receipt: receipt().unwrap(),
         }));
 
-        let result = trigger.to_asc_ptr(&mut heap, &GasCounter::new(GasMetrics::mock()));
+        let result = trigger
+            .to_asc_ptr(&mut heap, &GasCounter::new(GasMetrics::mock()))
+            .await;
         assert!(result.is_ok());
     }
 
@@ -401,8 +405,7 @@ mod tests {
     }
 
     fn big_int(input: u64) -> Option<codec::BigInt> {
-        let value =
-            BigInt::try_from(input).unwrap_or_else(|_| panic!("Invalid BigInt value {}", input));
+        let value = BigInt::from(input);
         let bytes = value.to_signed_bytes_le();
 
         Some(codec::BigInt { bytes })
@@ -444,8 +447,9 @@ mod tests {
         }
     }
 
+    #[async_trait]
     impl AscHeap for BytesHeap {
-        fn raw_new(
+        async fn raw_new(
             &mut self,
             bytes: &[u8],
             _gas: &GasCounter,
@@ -497,11 +501,11 @@ mod tests {
             Ok(init_slice(src, buffer))
         }
 
-        fn api_version(&self) -> graph::semver::Version {
-            self.api_version.clone()
+        fn api_version(&self) -> &graph::semver::Version {
+            &self.api_version
         }
 
-        fn asc_type_id(
+        async fn asc_type_id(
             &mut self,
             type_id_index: graph::runtime::IndexForAscTypeId,
         ) -> Result<u32, HostExportError> {

@@ -123,7 +123,7 @@ mod tests {
         }
     }
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[crate::test]
     async fn jobs_run() {
         let count = Arc::new(Mutex::new(0));
         let job = CounterJob {
@@ -142,7 +142,7 @@ mod tests {
                 break;
             }
             if start.elapsed() > Duration::from_secs(2) {
-                assert!(false, "Counting to 10 took longer than 2 seconds");
+                panic!("Counting to 10 took longer than 2 seconds");
             }
         }
 

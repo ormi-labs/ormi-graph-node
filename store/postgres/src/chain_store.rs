@@ -1,14 +1,15 @@
 use anyhow::anyhow;
-use diesel::pg::PgConnection;
-use diesel::prelude::*;
-use diesel::r2d2::{ConnectionManager, PooledConnection};
+use async_trait::async_trait;
 use diesel::sql_types::Text;
-use diesel::{insert_into, update};
+use diesel::{insert_into, update, ExpressionMethods, OptionalExtension, QueryDsl};
+use diesel_async::AsyncConnection;
+use diesel_async::{scoped_futures::ScopedFutureExt, RunQueryDsl};
+
 use graph::components::store::ChainHeadStore;
 use graph::data::store::ethereum::call;
-use graph::derive::CheapClone;
 use graph::env::ENV_VARS;
 use graph::parking_lot::RwLock;
+use graph::prelude::alloy::primitives::B256;
 use graph::prelude::MetricsRegistry;
 use graph::prometheus::{CounterVec, GaugeVec};
 use graph::slog::Logger;
@@ -16,6 +17,9 @@ use graph::stable_hash::crypto_stable_hash;
 use graph::util::herd_cache::HerdCache;
 
 use std::collections::BTreeMap;
+use std::future::Future;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 use std::{
     collections::HashMap,
     convert::{TryFrom, TryInto},
@@ -25,15 +29,14 @@ use std::{
 
 use graph::blockchain::{Block, BlockHash, ChainIdentifier, ExtendedBlockPtr};
 use graph::cheap_clone::CheapClone;
-use graph::prelude::web3::types::{H256, U256};
 use graph::prelude::{
-    async_trait, serde_json as json, transaction_receipt::LightTransactionReceipt, BlockNumber,
-    BlockPtr, CachedEthereumCall, CancelableError, ChainStore as ChainStoreTrait, Error,
-    EthereumCallCache, StoreError,
+    serde_json as json, transaction_receipt::LightTransactionReceipt, BlockNumber, BlockPtr,
+    CachedEthereumCall, ChainStore as ChainStoreTrait, Error, EthereumCallCache, StoreError,
 };
 use graph::{ensure, internal_error};
 
 use self::recent_blocks_cache::RecentBlocksCache;
+use crate::AsyncPgConnection;
 use crate::{
     block_store::ChainStatus, chain_head_listener::ChainHeadUpdateSender, pool::ConnectionPool,
 };
@@ -55,12 +58,12 @@ impl JsonBlock {
         }
     }
 
-    fn timestamp(&self) -> Option<U256> {
+    fn timestamp(&self) -> Option<u64> {
         self.data
             .as_ref()
             .and_then(|data| data.get("timestamp"))
             .and_then(|ts| ts.as_str())
-            .and_then(|ts| U256::from_dec_str(ts).ok())
+            .and_then(|ts| ts.parse::<u64>().ok())
     }
 }
 
@@ -83,29 +86,32 @@ pub use data::Storage;
 
 /// Encapuslate access to the blocks table for a chain.
 mod data {
-    use diesel::sql_types::{Array, Binary, Bool, Nullable};
-    use diesel::{connection::SimpleConnection, insert_into};
-    use diesel::{delete, prelude::*, sql_query};
+    use crate::diesel::dsl::IntervalDsl;
+    use crate::AsyncPgConnection;
+    use diesel::dsl::sql;
+    use diesel::insert_into;
+    use diesel::sql_types::{Array, Binary, Bool, Nullable, Text};
+    use diesel::{delete, sql_query, ExpressionMethods, JoinOnDsl, OptionalExtension, QueryDsl};
     use diesel::{
         deserialize::FromSql,
         pg::Pg,
         serialize::{Output, ToSql},
-        sql_types::Text,
     };
-    use diesel::{dsl::sql, pg::PgConnection};
     use diesel::{
         sql_types::{BigInt, Bytea, Integer, Jsonb},
         update,
     };
+    use diesel_async::{RunQueryDsl, SimpleAsyncConnection};
     use graph::blockchain::{Block, BlockHash};
     use graph::data::store::scalar::Bytes;
     use graph::internal_error;
-    use graph::prelude::ethabi::ethereum_types::H160;
+    use graph::prelude::alloy::primitives::{Address, B256};
     use graph::prelude::transaction_receipt::LightTransactionReceipt;
-    use graph::prelude::web3::types::H256;
     use graph::prelude::{
-        serde_json as json, BlockNumber, BlockPtr, CachedEthereumCall, Error, StoreError,
+        info, serde_json as json, BlockNumber, BlockPtr, CachedEthereumCall, Error, Logger,
+        StoreError,
     };
+
     use std::collections::HashMap;
     use std::convert::TryFrom;
     use std::fmt;
@@ -170,17 +176,17 @@ mod data {
         hash: Vec<u8>,
     }
 
-    // Like H256::from_slice, but returns an error instead of panicking
+    // Like B256::from_slice, but returns an error instead of panicking
     // when `bytes` does not have the right length
-    fn h256_from_bytes(bytes: &[u8]) -> Result<H256, StoreError> {
-        if bytes.len() == H256::len_bytes() {
-            Ok(H256::from_slice(bytes))
+    fn b256_from_bytes(bytes: &[u8]) -> Result<B256, StoreError> {
+        if bytes.len() == B256::len_bytes() {
+            Ok(B256::from_slice(bytes))
         } else {
             Err(internal_error!(
                 "invalid H256 value `{}` has {} bytes instead of {}",
                 graph::prelude::hex::encode(bytes),
                 bytes.len(),
-                H256::len_bytes()
+                B256::len_bytes()
             ))
         }
     }
@@ -319,6 +325,7 @@ mod data {
 
     #[derive(Clone, Debug, AsExpression, FromSqlRow)]
     #[diesel(sql_type = Text)]
+    #[allow(clippy::large_enum_variant)]
     /// Storage for a chain. The underlying namespace (database schema) is either
     /// `public` or of the form `chain[0-9]+`.
     pub enum Storage {
@@ -377,7 +384,7 @@ mod data {
         /// `Storage::Private`. If it uses `Storage::Shared`, do nothing since
         /// a regular migration will already have created the `ethereum_blocks`
         /// table
-        pub(super) fn create(&self, conn: &mut PgConnection) -> Result<(), Error> {
+        pub(super) async fn create(&self, conn: &mut AsyncPgConnection) -> Result<(), Error> {
             fn make_ddl(nsp: &str) -> String {
                 format!(
                     "
@@ -410,7 +417,7 @@ mod data {
             match self {
                 Storage::Shared => Ok(()),
                 Storage::Private(Schema { name, .. }) => {
-                    conn.batch_execute(&make_ddl(name))?;
+                    conn.batch_execute(&make_ddl(name)).await?;
                     Ok(())
                 }
             }
@@ -425,48 +432,56 @@ mod data {
             }
         }
 
-        pub(super) fn drop_storage(
+        pub(super) async fn drop_storage(
             &self,
-            conn: &mut PgConnection,
+            conn: &mut AsyncPgConnection,
             name: &str,
         ) -> Result<(), StoreError> {
             match &self {
                 Storage::Shared => {
                     use public::ethereum_blocks as b;
-                    delete(b::table.filter(b::network_name.eq(name))).execute(conn)?;
+                    delete(b::table.filter(b::network_name.eq(name)))
+                        .execute(conn)
+                        .await?;
                     Ok(())
                 }
                 Storage::Private(Schema { name, .. }) => {
-                    conn.batch_execute(&format!("drop schema {} cascade", name))?;
+                    conn.batch_execute(&format!("drop schema {} cascade", name))
+                        .await?;
                     Ok(())
                 }
             }
         }
 
-        pub(super) fn truncate_block_cache(
+        pub(super) async fn truncate_block_cache(
             &self,
-            conn: &mut PgConnection,
+            conn: &mut AsyncPgConnection,
         ) -> Result<(), StoreError> {
             let table_name = match &self {
                 Storage::Shared => ETHEREUM_BLOCKS_TABLE_NAME,
                 Storage::Private(Schema { blocks, .. }) => &blocks.qname,
             };
-            conn.batch_execute(&format!("truncate table {} restart identity", table_name))?;
+            conn.batch_execute(&format!("truncate table {} restart identity", table_name))
+                .await?;
             Ok(())
         }
 
-        fn truncate_call_cache(&self, conn: &mut PgConnection) -> Result<(), StoreError> {
+        async fn truncate_call_cache(
+            &self,
+            conn: &mut AsyncPgConnection,
+        ) -> Result<(), StoreError> {
             let table_name = match &self {
                 Storage::Shared => ETHEREUM_CALL_CACHE_TABLE_NAME,
                 Storage::Private(Schema { call_cache, .. }) => &call_cache.qname,
             };
-            conn.batch_execute(&format!("truncate table {} restart identity", table_name))?;
+            conn.batch_execute(&format!("truncate table {} restart identity", table_name))
+                .await?;
             Ok(())
         }
 
-        pub(super) fn cleanup_shallow_blocks(
+        pub(super) async fn cleanup_shallow_blocks(
             &self,
-            conn: &mut PgConnection,
+            conn: &mut AsyncPgConnection,
             lowest_block: i32,
         ) -> Result<(), StoreError> {
             let table_name = match &self {
@@ -476,47 +491,42 @@ mod data {
             conn.batch_execute(&format!(
                 "delete from {} WHERE number >= {} AND data->'block'->'data' = 'null'::jsonb;",
                 table_name, lowest_block,
-            ))?;
+            ))
+            .await?;
             Ok(())
         }
 
-        pub(super) fn remove_cursor(
+        pub(super) async fn remove_cursor(
             &self,
-            conn: &mut PgConnection,
+            conn: &mut AsyncPgConnection,
             chain: &str,
         ) -> Result<Option<BlockNumber>, StoreError> {
             use diesel::dsl::not;
-            use public::ethereum_networks::dsl::*;
+            use public::ethereum_networks as n;
 
-            match update(
-                ethereum_networks
-                    .filter(name.eq(chain))
-                    .filter(not(head_block_cursor.is_null())),
+            let head_block_number = update(
+                n::table
+                    .filter(n::name.eq(chain))
+                    .filter(not(n::head_block_cursor.is_null())),
             )
-            .set(head_block_cursor.eq(None as Option<String>))
-            .returning(head_block_number)
+            .set(n::head_block_cursor.eq(None as Option<String>))
+            .returning(n::head_block_number)
             .get_result::<Option<i64>>(conn)
-            .optional()
-            {
-                Ok(res) => match res {
-                    Some(opt_num) => match opt_num {
-                        Some(num) => Ok(Some(num as i32)),
-                        None => Ok(None),
-                    },
-                    None => Ok(None),
-                },
-                Err(e) => Err(e),
-            }
-            .map_err(Into::into)
+            .await
+            .optional()?
+            .flatten()
+            .map(|num| num as i32);
+
+            Ok(head_block_number)
         }
 
         /// Insert a block. If the table already contains a block with the
         /// same hash, then overwrite that block since it may be adding
         /// transaction receipts. If `overwrite` is `true`, overwrite a
         /// possibly existing entry. If it is `false`, keep the old entry.
-        pub(super) fn upsert_block(
+        pub(super) async fn upsert_block(
             &self,
-            conn: &mut PgConnection,
+            conn: &mut AsyncPgConnection,
             chain: &str,
             block: &dyn Block,
             overwrite: bool,
@@ -552,13 +562,15 @@ mod data {
                             .on_conflict(b::hash)
                             .do_update()
                             .set(values)
-                            .execute(conn)?;
+                            .execute(conn)
+                            .await?;
                     } else {
                         insert_into(b::table)
                             .values(values.clone())
                             .on_conflict(b::hash)
                             .do_nothing()
-                            .execute(conn)?;
+                            .execute(conn)
+                            .await?;
                     }
                 }
                 Storage::Private(Schema { blocks, .. }) => {
@@ -583,15 +595,16 @@ mod data {
                         .bind::<BigInt, _>(number)
                         .bind::<Bytea, _>(parent_hash.as_slice())
                         .bind::<Jsonb, _>(data)
-                        .execute(conn)?;
+                        .execute(conn)
+                        .await?;
                 }
             };
             Ok(())
         }
 
-        pub(super) fn block_ptrs_by_numbers(
+        pub(super) async fn block_ptrs_by_numbers(
             &self,
-            conn: &mut PgConnection,
+            conn: &mut AsyncPgConnection,
             chain: &str,
             numbers: &[BlockNumber],
         ) -> Result<Vec<JsonBlock>, StoreError> {
@@ -609,21 +622,25 @@ mod data {
                         .filter(b::network_name.eq(chain))
                         .filter(b::number.eq_any(Vec::from_iter(numbers.iter().map(|&n| n as i64))))
                         .load::<(BlockHash, i64, BlockHash, json::Value)>(conn)
+                        .await
                 }
-                Storage::Private(Schema { blocks, .. }) => blocks
-                    .table()
-                    .select((
-                        blocks.hash(),
-                        blocks.number(),
-                        blocks.parent_hash(),
-                        sql::<Jsonb>("coalesce(data -> 'block', data)"),
-                    ))
-                    .filter(
-                        blocks
-                            .number()
-                            .eq_any(Vec::from_iter(numbers.iter().map(|&n| n as i64))),
-                    )
-                    .load::<(BlockHash, i64, BlockHash, json::Value)>(conn),
+                Storage::Private(Schema { blocks, .. }) => {
+                    blocks
+                        .table()
+                        .select((
+                            blocks.hash(),
+                            blocks.number(),
+                            blocks.parent_hash(),
+                            sql::<Jsonb>("coalesce(data -> 'block', data)"),
+                        ))
+                        .filter(
+                            blocks
+                                .number()
+                                .eq_any(Vec::from_iter(numbers.iter().map(|&n| n as i64))),
+                        )
+                        .load::<(BlockHash, i64, BlockHash, json::Value)>(conn)
+                        .await
+                }
             }?;
 
             Ok(x.into_iter()
@@ -633,9 +650,9 @@ mod data {
                 .collect())
         }
 
-        pub(super) fn blocks(
+        pub(super) async fn blocks(
             &self,
-            conn: &mut PgConnection,
+            conn: &mut AsyncPgConnection,
             chain: &str,
             hashes: &[BlockHash],
         ) -> Result<Vec<JsonBlock>, StoreError> {
@@ -663,21 +680,25 @@ mod data {
                                 .eq_any(Vec::from_iter(hashes.iter().map(|h| format!("{:x}", h)))),
                         )
                         .load::<(BlockHash, i64, BlockHash, json::Value)>(conn)
+                        .await
                 }
-                Storage::Private(Schema { blocks, .. }) => blocks
-                    .table()
-                    .select((
-                        blocks.hash(),
-                        blocks.number(),
-                        blocks.parent_hash(),
-                        sql::<Jsonb>("coalesce(data -> 'block', data)"),
-                    ))
-                    .filter(
-                        blocks
-                            .hash()
-                            .eq_any(Vec::from_iter(hashes.iter().map(|h| h.as_slice()))),
-                    )
-                    .load::<(BlockHash, i64, BlockHash, json::Value)>(conn),
+                Storage::Private(Schema { blocks, .. }) => {
+                    blocks
+                        .table()
+                        .select((
+                            blocks.hash(),
+                            blocks.number(),
+                            blocks.parent_hash(),
+                            sql::<Jsonb>("coalesce(data -> 'block', data)"),
+                        ))
+                        .filter(
+                            blocks
+                                .hash()
+                                .eq_any(Vec::from_iter(hashes.iter().map(|h| h.as_slice()))),
+                        )
+                        .load::<(BlockHash, i64, BlockHash, json::Value)>(conn)
+                        .await
+                }
             }?;
             Ok(x.into_iter()
                 .map(|(hash, nr, parent, data)| {
@@ -686,9 +707,9 @@ mod data {
                 .collect())
         }
 
-        pub(super) fn block_hashes_by_block_number(
+        pub(super) async fn block_hashes_by_block_number(
             &self,
-            conn: &mut PgConnection,
+            conn: &mut AsyncPgConnection,
             chain: &str,
             number: BlockNumber,
         ) -> Result<Vec<BlockHash>, Error> {
@@ -700,26 +721,27 @@ mod data {
                         .select(b::hash)
                         .filter(b::network_name.eq(&chain))
                         .filter(b::number.eq(number as i64))
-                        .get_results::<String>(conn)?
+                        .get_results::<String>(conn)
+                        .await?
                         .into_iter()
                         .map(|h| h.parse())
                         .collect::<Result<Vec<BlockHash>, _>>()
-                        .map_err(Error::from)
                 }
                 Storage::Private(Schema { blocks, .. }) => Ok(blocks
                     .table()
                     .select(blocks.hash())
                     .filter(blocks.number().eq(number as i64))
-                    .get_results::<Vec<u8>>(conn)?
+                    .get_results::<Vec<u8>>(conn)
+                    .await?
                     .into_iter()
                     .map(BlockHash::from)
                     .collect::<Vec<BlockHash>>()),
             }
         }
 
-        pub(super) fn confirm_block_hash(
+        pub(super) async fn confirm_block_hash(
             &self,
-            conn: &mut PgConnection,
+            conn: &mut AsyncPgConnection,
             chain: &str,
             number: BlockNumber,
             hash: &BlockHash,
@@ -736,6 +758,7 @@ mod data {
                         .filter(b::number.eq(number))
                         .filter(b::hash.ne(&hash))
                         .execute(conn)
+                        .await
                         .map_err(Error::from)
                 }
                 Storage::Private(Schema { blocks, .. }) => {
@@ -747,6 +770,7 @@ mod data {
                         .bind::<BigInt, _>(number)
                         .bind::<Bytea, _>(hash.as_slice())
                         .execute(conn)
+                        .await
                         .map_err(Error::from)
                 }
             }
@@ -754,9 +778,9 @@ mod data {
 
         /// timestamp's representation depends the blockchain::Block implementation, on
         /// ethereum this is a U256 but on different chains it will most likely be different.
-        pub(super) fn block_number(
+        pub(super) async fn block_number(
             &self,
-            conn: &mut PgConnection,
+            conn: &mut AsyncPgConnection,
             hash: &BlockHash,
         ) -> Result<Option<(BlockNumber, Option<u64>, Option<BlockHash>)>, StoreError> {
             const TIMESTAMP_QUERY: &str =
@@ -774,6 +798,7 @@ mod data {
                         ))
                         .filter(b::hash.eq(format!("{:x}", hash)))
                         .first::<(i64, Option<String>, Option<String>)>(conn)
+                        .await
                         .optional()?
                         .map(|(number, ts, parent_hash)| {
                             // Convert parent_hash from Hex String to Vec<u8>
@@ -791,6 +816,7 @@ mod data {
                     ))
                     .filter(blocks.hash().eq(hash.as_slice()))
                     .first::<(i64, Option<String>, Vec<u8>)>(conn)
+                    .await
                     .optional()?
                     .map(|(number, ts, parent_hash)| (number, ts, Some(parent_hash))),
             };
@@ -803,15 +829,15 @@ mod data {
                     Ok(Some((
                         number,
                         crate::chain_store::try_parse_timestamp(ts)?,
-                        parent_hash.map(|h| BlockHash::from(h)),
+                        parent_hash.map(BlockHash::from),
                     )))
                 }
             }
         }
 
-        pub(super) fn block_numbers(
+        pub(super) async fn block_numbers(
             &self,
-            conn: &mut PgConnection,
+            conn: &mut AsyncPgConnection,
             hashes: &[BlockHash],
         ) -> Result<HashMap<BlockHash, BlockNumber>, StoreError> {
             let pairs = match self {
@@ -826,7 +852,8 @@ mod data {
                     b::table
                         .select((b::hash, b::number))
                         .filter(b::hash.eq_any(hashes))
-                        .load::<(String, i64)>(conn)?
+                        .load::<(String, i64)>(conn)
+                        .await?
                         .into_iter()
                         .map(|(hash, n)| {
                             let hash = hex::decode(&hash).expect("Invalid hex in parent_hash");
@@ -840,7 +867,8 @@ mod data {
                         .table()
                         .select((blocks.hash(), blocks.number()))
                         .filter(blocks.hash().eq_any(hashes))
-                        .load::<(BlockHash, i64)>(conn)?
+                        .load::<(BlockHash, i64)>(conn)
+                        .await?
                 }
             };
 
@@ -853,14 +881,14 @@ mod data {
         /// Find the first block that is missing from the database needed to
         /// complete the chain from block `hash` to the block with number
         /// `first_block`.
-        pub(super) fn missing_parent(
+        pub(super) async fn missing_parent(
             &self,
-            conn: &mut PgConnection,
+            conn: &mut AsyncPgConnection,
             chain: &str,
             first_block: i64,
-            hash: H256,
-            genesis: H256,
-        ) -> Result<Option<H256>, Error> {
+            hash: B256,
+            genesis: B256,
+        ) -> Result<Option<B256>, Error> {
             match self {
                 Storage::Shared => {
                     // We recursively build a temp table 'chain' containing the hash and
@@ -901,7 +929,8 @@ mod data {
                         .bind::<Text, _>(&hash)
                         .bind::<Text, _>(&genesis)
                         .bind::<BigInt, _>(first_block)
-                        .load::<BlockHashText>(conn)?;
+                        .load::<BlockHashText>(conn)
+                        .await?;
 
                     let missing = match missing.len() {
                         0 => None,
@@ -943,14 +972,15 @@ mod data {
                     );
 
                     let missing = sql_query(query)
-                        .bind::<Bytea, _>(hash.as_bytes())
-                        .bind::<Bytea, _>(genesis.as_bytes())
+                        .bind::<Bytea, _>(hash.as_slice())
+                        .bind::<Bytea, _>(genesis.as_slice())
                         .bind::<BigInt, _>(first_block)
-                        .load::<BlockHashBytea>(conn)?;
+                        .load::<BlockHashBytea>(conn)
+                        .await?;
 
                     let missing = match missing.len() {
                         0 => None,
-                        1 => Some(h256_from_bytes(&missing[0].hash)?),
+                        1 => Some(b256_from_bytes(&missing[0].hash)?),
                         _ => {
                             unreachable!("the query can only return no or one row")
                         }
@@ -964,9 +994,9 @@ mod data {
         /// with a higher block number than the current chain head. The returned
         /// value if the hash and number of the candidate and the genesis block
         /// hash for the chain
-        pub(super) fn chain_head_candidate(
+        pub(super) async fn chain_head_candidate(
             &self,
-            conn: &mut PgConnection,
+            conn: &mut AsyncPgConnection,
             chain: &str,
         ) -> Result<Option<BlockPtr>, Error> {
             use public::ethereum_networks as n;
@@ -974,7 +1004,8 @@ mod data {
             let head = n::table
                 .filter(n::name.eq(chain))
                 .select(n::head_block_number)
-                .first::<Option<i64>>(conn)?
+                .first::<Option<i64>>(conn)
+                .await?
                 .unwrap_or(-1);
 
             match self {
@@ -986,6 +1017,7 @@ mod data {
                         .order_by((b::number.desc(), b::hash))
                         .select((b::hash, b::number))
                         .first::<(String, i64)>(conn)
+                        .await
                         .optional()?
                         .map(|(hash, number)| BlockPtr::try_from((hash.as_str(), number)))
                         .transpose()
@@ -996,6 +1028,7 @@ mod data {
                     .order_by((blocks.number().desc(), blocks.hash()))
                     .select((blocks.hash(), blocks.number()))
                     .first::<(Vec<u8>, i64)>(conn)
+                    .await
                     .optional()?
                     .map(|(hash, number)| BlockPtr::try_from((hash.as_slice(), number)))
                     .transpose(),
@@ -1031,9 +1064,9 @@ mod data {
         /// Returns an ancestor of a specified block at a given offset, with an option to specify a `root` hash
         /// for a targeted search. If a `root` hash is provided, the search stops at the block whose parent hash
         /// matches the `root`.
-        pub(super) fn ancestor_block(
+        pub(super) async fn ancestor_block(
             &self,
-            conn: &mut PgConnection,
+            conn: &mut AsyncPgConnection,
             block_ptr: BlockPtr,
             offset: BlockNumber,
             root: Option<BlockHash>,
@@ -1068,6 +1101,7 @@ mod data {
                             .bind::<BigInt, _>(offset as i64)
                             .get_result::<BlockHashAndNumber>(conn),
                     }
+                    .await
                     .optional()?;
 
                     use public::ethereum_blocks as b;
@@ -1078,7 +1112,8 @@ mod data {
                             b::table
                                 .filter(b::hash.eq(&block.hash))
                                 .select(b::data)
-                                .first::<json::Value>(conn)?,
+                                .first::<json::Value>(conn)
+                                .await?,
                             BlockPtr::new(
                                 BlockHash::from_str(&block.hash)?,
                                 i32::try_from(block.number).unwrap(),
@@ -1098,7 +1133,7 @@ mod data {
                         number: i64,
                     }
 
-                    let block = match root {
+                    let block = match &root {
                         Some(root) => sql_query(query)
                             .bind::<Bytea, _>(block_ptr.hash_slice())
                             .bind::<BigInt, _>(offset as i64)
@@ -1109,6 +1144,7 @@ mod data {
                             .bind::<BigInt, _>(offset as i64)
                             .get_result::<BlockHashAndNumber>(conn),
                     }
+                    .await
                     .optional()?;
 
                     match block {
@@ -1118,7 +1154,8 @@ mod data {
                                 .table()
                                 .filter(blocks.hash().eq(&block.hash))
                                 .select(blocks.data())
-                                .first::<json::Value>(conn)?,
+                                .first::<json::Value>(conn)
+                                .await?,
                             BlockPtr::from((block.hash, block.number)),
                         )),
                     }
@@ -1147,9 +1184,9 @@ mod data {
             Ok(data_and_ptr)
         }
 
-        pub(super) fn delete_blocks_before(
+        pub(super) async fn delete_blocks_before(
             &self,
-            conn: &mut PgConnection,
+            conn: &mut AsyncPgConnection,
             chain: &str,
             block: i64,
         ) -> Result<usize, Error> {
@@ -1162,6 +1199,7 @@ mod data {
                         .filter(b::number.lt(block))
                         .filter(b::number.gt(0))
                         .execute(conn)
+                        .await
                         .map_err(Error::from)
                 }
                 Storage::Private(Schema { blocks, .. }) => {
@@ -1172,16 +1210,17 @@ mod data {
                     sql_query(query)
                         .bind::<BigInt, _>(block)
                         .execute(conn)
+                        .await
                         .map_err(Error::from)
                 }
             }
         }
 
-        pub(super) fn delete_blocks_by_hash(
+        pub(super) async fn delete_blocks_by_hash(
             &self,
-            conn: &mut PgConnection,
+            conn: &mut AsyncPgConnection,
             chain: &str,
-            block_hashes: &[&H256],
+            block_hashes: &[&B256],
         ) -> Result<usize, Error> {
             match self {
                 Storage::Shared => {
@@ -1197,6 +1236,7 @@ mod data {
                         .filter(b::hash.eq_any(hashes))
                         .filter(b::number.gt(0)) // keep genesis
                         .execute(conn)
+                        .await
                         .map_err(Error::from)
                 }
                 Storage::Private(Schema { blocks, .. }) => {
@@ -1206,19 +1246,20 @@ mod data {
                     );
 
                     let hashes: Vec<&[u8]> =
-                        block_hashes.iter().map(|hash| hash.as_bytes()).collect();
+                        block_hashes.iter().map(|hash| hash.as_slice()).collect();
 
                     sql_query(query)
                         .bind::<Array<Bytea>, _>(hashes)
                         .execute(conn)
+                        .await
                         .map_err(Error::from)
                 }
             }
         }
 
-        pub(super) fn get_call_and_access(
+        pub(super) async fn get_call_and_access(
             &self,
-            conn: &mut PgConnection,
+            conn: &mut AsyncPgConnection,
             id: &[u8],
         ) -> Result<Option<(Bytes, bool)>, Error> {
             match self {
@@ -1234,6 +1275,7 @@ mod data {
                             sql::<Bool>("CURRENT_DATE > eth_call_meta.accessed_at"),
                         ))
                         .get_result(conn)
+                        .await
                         .optional()
                         .map_err(Error::from)
                 }
@@ -1258,15 +1300,16 @@ mod data {
                         )),
                     ))
                     .first::<(Vec<u8>, bool)>(conn)
+                    .await
                     .optional()
                     .map_err(Error::from),
             }
             .map(|row| row.map(|(return_value, expired)| (Bytes::from(return_value), expired)))
         }
 
-        pub(super) fn get_calls_and_access(
+        pub(super) async fn get_calls_and_access(
             &self,
-            conn: &mut PgConnection,
+            conn: &mut AsyncPgConnection,
             ids: &[&[u8]],
         ) -> Result<Vec<(Vec<u8>, Bytes, bool)>, Error> {
             let rows = match self {
@@ -1283,6 +1326,7 @@ mod data {
                             sql::<Bool>("CURRENT_DATE > eth_call_meta.accessed_at"),
                         ))
                         .load(conn)
+                        .await
                         .map_err(Error::from)
                 }
                 Storage::Private(Schema {
@@ -1307,6 +1351,7 @@ mod data {
                         )),
                     ))
                     .load::<(Vec<u8>, Vec<u8>, bool)>(conn)
+                    .await
                     .map_err(Error::from),
             }?;
             Ok(rows
@@ -1315,9 +1360,9 @@ mod data {
                 .collect())
         }
 
-        pub(super) fn get_calls_in_block(
+        pub(super) async fn get_calls_in_block(
             &self,
-            conn: &mut PgConnection,
+            conn: &mut AsyncPgConnection,
             block_ptr: BlockPtr,
         ) -> Result<Vec<CachedEthereumCall>, Error> {
             let block_num = block_ptr.block_number();
@@ -1330,18 +1375,22 @@ mod data {
                         .select((cache::id, cache::return_value, cache::contract_address))
                         .filter(cache::block_number.eq(block_num))
                         .order(cache::contract_address)
-                        .get_results::<(Vec<u8>, Vec<u8>, Vec<u8>)>(conn)?
+                        .get_results::<(Vec<u8>, Vec<u8>, Vec<u8>)>(conn)
+                        .await?
                 }
-                Storage::Private(Schema { call_cache, .. }) => call_cache
-                    .table()
-                    .select((
-                        call_cache.id(),
-                        call_cache.return_value(),
-                        call_cache.contract_address(),
-                    ))
-                    .filter(call_cache.block_number().eq(block_num as i64))
-                    .order(call_cache.contract_address())
-                    .get_results::<(Vec<u8>, Vec<u8>, Vec<u8>)>(conn)?,
+                Storage::Private(Schema { call_cache, .. }) => {
+                    call_cache
+                        .table()
+                        .select((
+                            call_cache.id(),
+                            call_cache.return_value(),
+                            call_cache.contract_address(),
+                        ))
+                        .filter(call_cache.block_number().eq(block_num as i64))
+                        .order(call_cache.contract_address())
+                        .get_results::<(Vec<u8>, Vec<u8>, Vec<u8>)>(conn)
+                        .await?
+                }
             };
 
             Ok(rows
@@ -1349,15 +1398,15 @@ mod data {
                 .map(|row| CachedEthereumCall {
                     blake3_id: row.0,
                     block_ptr: block_ptr.clone(),
-                    contract_address: H160::from_slice(&row.2[..]),
+                    contract_address: Address::from_slice(&row.2[..]),
                     return_value: row.1,
                 })
                 .collect())
         }
 
-        pub(super) fn clear_call_cache(
+        pub(super) async fn clear_call_cache(
             &self,
-            conn: &mut PgConnection,
+            conn: &mut AsyncPgConnection,
             head: BlockNumber,
             from: BlockNumber,
             to: BlockNumber,
@@ -1365,7 +1414,7 @@ mod data {
             if from <= 0 && to >= head {
                 // We are removing the entire cache. Truncating is much
                 // faster in that case
-                self.truncate_call_cache(conn)?;
+                self.truncate_call_cache(conn).await?;
                 return Ok(());
             }
             match self {
@@ -1377,6 +1426,7 @@ mod data {
                             .filter(cache::block_number.le(to)),
                     )
                     .execute(conn)
+                    .await
                     .map_err(Error::from)?;
                     Ok(())
                 }
@@ -1392,15 +1442,207 @@ mod data {
                         .bind::<Integer, _>(from)
                         .bind::<Integer, _>(to)
                         .execute(conn)
+                        .await
                         .map_err(Error::from)
                         .map(|_| ())
                 }
             }
         }
 
-        pub(super) fn update_accessed_at(
+        pub async fn clear_stale_call_cache(
             &self,
-            conn: &mut PgConnection,
+            conn: &mut AsyncPgConnection,
+            logger: &Logger,
+            ttl_days: i32,
+            ttl_max_contracts: Option<i64>,
+        ) -> Result<(), Error> {
+            let mut total_calls: usize = 0;
+            let mut total_contracts: i64 = 0;
+            // We process contracts in batches to avoid loading too many entries into memory
+            // at once. Each contract can have many calls, so we also delete calls in batches.
+            // Note: The batch sizes were chosen based on experimentation. Potentially, they
+            // could be made configurable via ENV vars.
+            let contracts_batch_size: i64 = 2000;
+            let cache_batch_size: usize = 10000;
+
+            // Limits the number of contracts to process if ttl_max_contracts is set.
+            // Used also to adjust the final batch size, so we don't process more
+            // contracts than the set limit.
+            let remaining_contracts = |processed: i64| -> Option<i64> {
+                ttl_max_contracts.map(|limit| limit.saturating_sub(processed))
+            };
+
+            match self {
+                Storage::Shared => {
+                    use public::eth_call_cache as cache;
+                    use public::eth_call_meta as meta;
+
+                    loop {
+                        if let Some(0) = remaining_contracts(total_contracts) {
+                            info!(
+                                logger,
+                                "Finished cleaning call cache: deleted {} entries for {} contracts (limit reached)",
+                                total_calls,
+                                total_contracts
+                            );
+                            break;
+                        }
+
+                        let batch_limit = remaining_contracts(total_contracts)
+                            .map(|left| left.min(contracts_batch_size))
+                            .unwrap_or(contracts_batch_size);
+
+                        let stale_contracts = meta::table
+                            .select(meta::contract_address)
+                            .filter(
+                                meta::accessed_at
+                                    .lt(diesel::dsl::date(diesel::dsl::now - ttl_days.days())),
+                            )
+                            .limit(batch_limit)
+                            .get_results::<Vec<u8>>(conn)
+                            .await?;
+
+                        if stale_contracts.is_empty() {
+                            info!(
+                                logger,
+                                "Finished cleaning call cache: deleted {} entries for {} contracts",
+                                total_calls,
+                                total_contracts
+                            );
+                            break;
+                        }
+
+                        loop {
+                            let next_batch = cache::table
+                                .select(cache::id)
+                                .filter(cache::contract_address.eq_any(&stale_contracts))
+                                .limit(cache_batch_size as i64)
+                                .get_results::<Vec<u8>>(conn)
+                                .await?;
+                            let deleted_count =
+                                diesel::delete(cache::table.filter(cache::id.eq_any(&next_batch)))
+                                    .execute(conn)
+                                    .await?;
+
+                            total_calls += deleted_count;
+
+                            if deleted_count < cache_batch_size {
+                                break;
+                            }
+                        }
+
+                        let deleted_contracts = diesel::delete(
+                            meta::table.filter(meta::contract_address.eq_any(&stale_contracts)),
+                        )
+                        .execute(conn)
+                        .await?;
+
+                        total_contracts += deleted_contracts as i64;
+                    }
+
+                    Ok(())
+                }
+                Storage::Private(Schema {
+                    call_cache,
+                    call_meta,
+                    ..
+                }) => {
+                    let select_query = format!(
+                        "WITH stale_contracts AS (
+                            SELECT contract_address
+                            FROM {}
+                            WHERE accessed_at < current_date - interval '{} days'
+                            LIMIT $1
+                        )
+                        SELECT contract_address FROM stale_contracts",
+                        call_meta.qname, ttl_days
+                    );
+
+                    let delete_cache_query = format!(
+                        "WITH targets AS (
+                            SELECT id
+                            FROM {}
+                            WHERE contract_address = ANY($1)
+                            LIMIT {}
+                        )
+                        DELETE FROM {} USING targets
+                        WHERE {}.id = targets.id",
+                        call_cache.qname, cache_batch_size, call_cache.qname, call_cache.qname
+                    );
+
+                    let delete_meta_query = format!(
+                        "DELETE FROM {} WHERE contract_address = ANY($1)",
+                        call_meta.qname
+                    );
+
+                    #[derive(QueryableByName)]
+                    struct ContractAddress {
+                        #[diesel(sql_type = Bytea)]
+                        contract_address: Vec<u8>,
+                    }
+
+                    loop {
+                        if let Some(0) = remaining_contracts(total_contracts) {
+                            info!(
+                                logger,
+                                "Finished cleaning call cache: deleted {} entries for {} contracts (limit reached)",
+                                total_calls,
+                                total_contracts
+                            );
+                            break;
+                        }
+
+                        let batch_limit = remaining_contracts(total_contracts)
+                            .map(|left| left.min(contracts_batch_size))
+                            .unwrap_or(contracts_batch_size);
+
+                        let stale_contracts: Vec<Vec<u8>> = sql_query(&select_query)
+                            .bind::<BigInt, _>(batch_limit)
+                            .load::<ContractAddress>(conn)
+                            .await?
+                            .into_iter()
+                            .map(|r| r.contract_address)
+                            .collect();
+
+                        if stale_contracts.is_empty() {
+                            info!(
+                                logger,
+                                "Finished cleaning call cache: deleted {} entries for {} contracts",
+                                total_calls,
+                                total_contracts
+                            );
+                            break;
+                        }
+
+                        loop {
+                            let deleted_count = sql_query(&delete_cache_query)
+                                .bind::<Array<Bytea>, _>(&stale_contracts)
+                                .execute(conn)
+                                .await?;
+
+                            total_calls += deleted_count;
+
+                            if deleted_count < cache_batch_size {
+                                break;
+                            }
+                        }
+
+                        let deleted_contracts = sql_query(&delete_meta_query)
+                            .bind::<Array<Bytea>, _>(&stale_contracts)
+                            .execute(conn)
+                            .await?;
+
+                        total_contracts += deleted_contracts as i64;
+                    }
+
+                    Ok(())
+                }
+            }
+        }
+
+        pub(super) async fn update_accessed_at(
+            &self,
+            conn: &mut AsyncPgConnection,
             contract_address: &[u8],
         ) -> Result<(), Error> {
             let result = match self {
@@ -1410,6 +1652,7 @@ mod data {
                     update(meta::table.find::<&[u8]>(contract_address.as_ref()))
                         .set(meta::accessed_at.eq(sql("CURRENT_DATE")))
                         .execute(conn)
+                        .await
                 }
                 Storage::Private(Schema { call_meta, .. }) => {
                     let query = format!(
@@ -1419,14 +1662,15 @@ mod data {
                     sql_query(query)
                         .bind::<Bytea, _>(contract_address)
                         .execute(conn)
+                        .await
                 }
             };
             result.map(|_| ()).map_err(Error::from)
         }
 
-        pub(super) fn set_call(
+        pub(super) async fn set_call(
             &self,
-            conn: &mut PgConnection,
+            conn: &mut AsyncPgConnection,
             id: &[u8],
             contract_address: &[u8],
             block_number: i32,
@@ -1445,7 +1689,8 @@ mod data {
                             cache::return_value.eq(return_value),
                         ))
                         .on_conflict_do_nothing()
-                        .execute(conn)?;
+                        .execute(conn)
+                        .await?;
 
                     // See comment in the Private branch for why the
                     // raciness of this check is ok
@@ -1453,6 +1698,7 @@ mod data {
                         .filter(meta::contract_address.eq(contract_address))
                         .select(sql::<Bool>("accessed_at < current_date"))
                         .first::<bool>(conn)
+                        .await
                         .optional()?
                         .unwrap_or(true);
                     if update_meta {
@@ -1469,6 +1715,7 @@ mod data {
                             // branch to avoid unnecessary updates (not entirely
                             // trivial with diesel)
                             .execute(conn)
+                            .await
                     } else {
                         Ok(0)
                     }
@@ -1488,7 +1735,8 @@ mod data {
                         .bind::<Bytea, _>(contract_address)
                         .bind::<Integer, _>(block_number)
                         .bind::<Bytea, _>(return_value)
-                        .execute(conn)?;
+                        .execute(conn)
+                        .await?;
 
                     // Check whether we need to update `call_meta`. The
                     // check is racy, since an update can happen between the
@@ -1501,6 +1749,7 @@ mod data {
                         .filter(call_meta.contract_address().eq(contract_address))
                         .select(sql::<Bool>("accessed_at < current_date"))
                         .first::<bool>(conn)
+                        .await
                         .optional()?
                         .unwrap_or(true);
 
@@ -1516,6 +1765,7 @@ mod data {
                         sql_query(query)
                             .bind::<Bytea, _>(contract_address)
                             .execute(conn)
+                            .await
                     } else {
                         Ok(0)
                     }
@@ -1526,7 +1776,7 @@ mod data {
 
         #[cfg(debug_assertions)]
         // used by `super::set_chain` for test support
-        pub(super) fn remove_chain(&self, conn: &mut PgConnection, chain_name: &str) {
+        pub(super) async fn remove_chain(&self, conn: &mut AsyncPgConnection, chain_name: &str) {
             match self {
                 Storage::Shared => {
                     use public::eth_call_cache as c;
@@ -1535,11 +1785,12 @@ mod data {
 
                     diesel::delete(b::table.filter(b::network_name.eq(chain_name)))
                         .execute(conn)
+                        .await
                         .expect("Failed to delete ethereum_blocks");
                     // We don't have a good way to clean out the call cache
                     // per chain; just nuke everything
-                    diesel::delete(c::table).execute(conn).unwrap();
-                    diesel::delete(m::table).execute(conn).unwrap();
+                    diesel::delete(c::table).execute(conn).await.unwrap();
+                    diesel::delete(m::table).execute(conn).await.unwrap();
                 }
                 Storage::Private(Schema {
                     blocks,
@@ -1551,6 +1802,7 @@ mod data {
                         let query = format!("delete from {}", qname);
                         sql_query(query)
                             .execute(conn)
+                            .await
                             .unwrap_or_else(|_| panic!("Failed to delete {}", qname));
                     }
                 }
@@ -1558,10 +1810,10 @@ mod data {
         }
 
         /// Queries the database for all the transaction receipts in a given block.
-        pub(crate) fn find_transaction_receipts_in_block(
+        pub(crate) async fn find_transaction_receipts_in_block(
             &self,
-            conn: &mut PgConnection,
-            block_hash: H256,
+            conn: &mut AsyncPgConnection,
+            block_hash: B256,
         ) -> anyhow::Result<Vec<LightTransactionReceipt>> {
             let query = sql_query(format!(
                 "
@@ -1587,12 +1839,18 @@ from (
                 // `chain*.blocks` tables, so we must check which one is being queried to bind the
                 // `block_hash` parameter to the correct type
                 match self {
-                    Storage::Shared => query
-                        .bind::<Text, _>(format!("{:x}", block_hash))
-                        .get_results(conn),
-                    Storage::Private(_) => query
-                        .bind::<Binary, _>(block_hash.as_bytes())
-                        .get_results(conn),
+                    Storage::Shared => {
+                        query
+                            .bind::<Text, _>(format!("{:x}", block_hash))
+                            .get_results(conn)
+                            .await
+                    }
+                    Storage::Private(_) => {
+                        query
+                            .bind::<Binary, _>(block_hash.as_slice())
+                            .get_results(conn)
+                            .await
+                    }
                 }
             };
             query_results
@@ -1616,6 +1874,10 @@ pub struct ChainStoreMetrics {
     chain_head_cache_latest_block_num: Box<GaugeVec>,
     chain_head_cache_hits: Box<CounterVec>,
     chain_head_cache_misses: Box<CounterVec>,
+    // Metrics for chain_head_ptr() cache
+    chain_head_ptr_cache_hits: Box<CounterVec>,
+    chain_head_ptr_cache_misses: Box<CounterVec>,
+    chain_head_ptr_cache_block_time_ms: Box<GaugeVec>,
 }
 
 impl ChainStoreMetrics {
@@ -1657,12 +1919,37 @@ impl ChainStoreMetrics {
             )
             .expect("Can't register the counter");
 
+        let chain_head_ptr_cache_hits = registry
+            .new_counter_vec(
+                "chain_head_ptr_cache_hits",
+                "Number of times the chain_head_ptr cache was hit",
+                vec!["network".to_string()],
+            )
+            .expect("Can't register the counter");
+        let chain_head_ptr_cache_misses = registry
+            .new_counter_vec(
+                "chain_head_ptr_cache_misses",
+                "Number of times the chain_head_ptr cache was missed",
+                vec!["network".to_string()],
+            )
+            .expect("Can't register the counter");
+        let chain_head_ptr_cache_block_time_ms = registry
+            .new_gauge_vec(
+                "chain_head_ptr_cache_block_time_ms",
+                "Estimated block time in milliseconds used for adaptive cache TTL",
+                vec!["network".to_string()],
+            )
+            .expect("Can't register the gauge");
+
         Self {
             chain_head_cache_size,
             chain_head_cache_oldest_block_num,
             chain_head_cache_latest_block_num,
             chain_head_cache_hits,
             chain_head_cache_misses,
+            chain_head_ptr_cache_hits,
+            chain_head_ptr_cache_misses,
+            chain_head_ptr_cache_block_time_ms,
         }
     }
 
@@ -1702,12 +1989,149 @@ impl ChainStoreMetrics {
             .unwrap()
             .inc_by(misses as f64);
     }
+
+    pub fn record_chain_head_ptr_cache_hit(&self, network: &str) {
+        self.chain_head_ptr_cache_hits
+            .with_label_values(&[network])
+            .inc();
+    }
+
+    pub fn record_chain_head_ptr_cache_miss(&self, network: &str) {
+        self.chain_head_ptr_cache_misses
+            .with_label_values(&[network])
+            .inc();
+    }
+
+    pub fn set_chain_head_ptr_block_time(&self, network: &str, block_time_ms: u64) {
+        self.chain_head_ptr_cache_block_time_ms
+            .with_label_values(&[network])
+            .set(block_time_ms as f64);
+    }
 }
 
-#[derive(Clone, CheapClone)]
-enum BlocksLookupResult {
-    ByHash(Arc<Result<Vec<JsonBlock>, StoreError>>),
-    ByNumber(Arc<Result<BTreeMap<BlockNumber, Vec<JsonBlock>>, StoreError>>),
+const MIN_TTL_MS: u64 = 20;
+const MAX_TTL_MS: u64 = 2000;
+const MIN_OBSERVATIONS: u64 = 5;
+
+/// Adaptive cache for chain_head_ptr() that learns optimal TTL from block frequency.
+struct ChainHeadPtrCache {
+    /// Cached value and when it expires
+    entry: RwLock<Option<(BlockPtr, Instant)>>,
+    /// Estimated milliseconds between blocks (EWMA)
+    estimated_block_time_ms: AtomicU64,
+    /// When we last observed the chain head change
+    last_change: RwLock<Instant>,
+    /// Number of block changes observed (for warmup)
+    observations: AtomicU64,
+    /// Metrics for recording cache hits/misses
+    metrics: Arc<ChainStoreMetrics>,
+    /// Chain name for metric labels
+    chain: String,
+}
+
+impl ChainHeadPtrCache {
+    fn new(metrics: Arc<ChainStoreMetrics>, chain: String) -> Self {
+        Self {
+            entry: RwLock::new(None),
+            estimated_block_time_ms: AtomicU64::new(0),
+            last_change: RwLock::new(Instant::now()),
+            observations: AtomicU64::new(0),
+            metrics,
+            chain,
+        }
+    }
+
+    /// Returns cached value if still valid, or None if cache is disabled/missed.
+    /// Records hit/miss metrics automatically.
+    fn get(&self) -> Option<BlockPtr> {
+        if ENV_VARS.store.disable_chain_head_ptr_cache {
+            return None;
+        }
+        let guard = self.entry.read();
+        if let Some((value, expires)) = guard.as_ref() {
+            if Instant::now() < *expires {
+                self.metrics.record_chain_head_ptr_cache_hit(&self.chain);
+                return Some(value.clone());
+            }
+        }
+        self.metrics.record_chain_head_ptr_cache_miss(&self.chain);
+        None
+    }
+
+    /// Compute current TTL - MIN_TTL during warmup, then 1/4 of estimated block time
+    fn current_ttl(&self) -> Duration {
+        let obs = AtomicU64::load(&self.observations, Ordering::Relaxed);
+        if obs < MIN_OBSERVATIONS {
+            return Duration::from_millis(MIN_TTL_MS);
+        }
+
+        let block_time = AtomicU64::load(&self.estimated_block_time_ms, Ordering::Relaxed);
+        let ttl_ms = (block_time / 4).clamp(MIN_TTL_MS, MAX_TTL_MS);
+        Duration::from_millis(ttl_ms)
+    }
+
+    /// Cache a new value, updating block time estimate if value changed.
+    /// Does nothing if cache is disabled.
+    fn set(&self, new_value: BlockPtr) {
+        if ENV_VARS.store.disable_chain_head_ptr_cache {
+            return;
+        }
+        let now = Instant::now();
+
+        // Check if block changed
+        let old_value = {
+            let guard = self.entry.read();
+            guard.as_ref().map(|(v, _)| v.clone())
+        };
+
+        // Only update estimate if we have a previous value and block number advanced
+        // (skip reorgs where new block number <= old)
+        if let Some(old_ptr) = old_value.as_ref() {
+            if new_value.number > old_ptr.number {
+                let mut last_change = self.last_change.write();
+                let delta_ms = now.duration_since(*last_change).as_millis() as u64;
+                *last_change = now;
+
+                let blocks_advanced = (new_value.number - old_ptr.number) as u64;
+
+                // Increment observation count
+                let obs = AtomicU64::fetch_add(&self.observations, 1, Ordering::Relaxed);
+
+                // Ignore unreasonable deltas (> 60s)
+                if delta_ms > 0 && delta_ms < 60_000 {
+                    let per_block_ms = delta_ms / blocks_advanced;
+                    let new_estimate = if obs == 0 {
+                        // First observation - use as initial estimate
+                        per_block_ms
+                    } else {
+                        // EWMA: new = 0.8 * old + 0.2 * observed
+                        let old_estimate =
+                            AtomicU64::load(&self.estimated_block_time_ms, Ordering::Relaxed);
+                        (old_estimate * 4 + per_block_ms) / 5
+                    };
+                    AtomicU64::store(
+                        &self.estimated_block_time_ms,
+                        new_estimate,
+                        Ordering::Relaxed,
+                    );
+
+                    // Update metric gauge
+                    self.metrics
+                        .set_chain_head_ptr_block_time(&self.chain, new_estimate);
+                }
+            }
+        }
+
+        // Compute TTL and store with expiry
+        let ttl = self.current_ttl();
+        *self.entry.write() = Some((new_value, now + ttl));
+    }
+
+    /// Clear the cached value. Used in tests when chain is reset.
+    #[cfg(debug_assertions)]
+    fn clear(&self) {
+        *self.entry.write() = None;
+    }
 }
 
 pub struct ChainStore {
@@ -1724,7 +2148,15 @@ pub struct ChainStore {
     // with the database and to correctly implement invalidation. So, a
     // conservative approach is acceptable.
     recent_blocks_cache: RecentBlocksCache,
-    lookup_herd: HerdCache<BlocksLookupResult>,
+    // Typed herd caches to avoid thundering herd on concurrent lookups
+    blocks_by_hash_cache: HerdCache<Arc<Result<Vec<JsonBlock>, StoreError>>>,
+    blocks_by_number_cache:
+        HerdCache<Arc<Result<BTreeMap<BlockNumber, Vec<JsonBlock>>, StoreError>>>,
+    ancestor_cache: HerdCache<Arc<Result<Option<(json::Value, BlockPtr)>, StoreError>>>,
+    /// Adaptive cache for chain_head_ptr()
+    chain_head_ptr_cache: ChainHeadPtrCache,
+    /// Herd cache to prevent thundering herd on chain_head_ptr() lookups
+    chain_head_ptr_herd: HerdCache<Arc<Result<Option<BlockPtr>, StoreError>>>,
 }
 
 impl ChainStore {
@@ -1739,8 +2171,12 @@ impl ChainStore {
         metrics: Arc<ChainStoreMetrics>,
     ) -> Self {
         let recent_blocks_cache =
-            RecentBlocksCache::new(recent_blocks_cache_capacity, chain.clone(), metrics);
-        let lookup_herd = HerdCache::new(format!("chain_{}_herd_cache", chain));
+            RecentBlocksCache::new(recent_blocks_cache_capacity, chain.clone(), metrics.clone());
+        let blocks_by_hash_cache = HerdCache::new(format!("chain_{}_blocks_by_hash", chain));
+        let blocks_by_number_cache = HerdCache::new(format!("chain_{}_blocks_by_number", chain));
+        let ancestor_cache = HerdCache::new(format!("chain_{}_ancestor", chain));
+        let chain_head_ptr_cache = ChainHeadPtrCache::new(metrics, chain.clone());
+        let chain_head_ptr_herd = HerdCache::new(format!("chain_{}_head_ptr", chain));
         ChainStore {
             logger,
             pool,
@@ -1749,7 +2185,11 @@ impl ChainStore {
             status,
             chain_head_update_sender,
             recent_blocks_cache,
-            lookup_herd,
+            blocks_by_hash_cache,
+            blocks_by_number_cache,
+            ancestor_cache,
+            chain_head_ptr_cache,
+            chain_head_ptr_herd,
         }
     }
 
@@ -1757,65 +2197,98 @@ impl ChainStore {
         matches!(self.status, ChainStatus::Ingestible)
     }
 
-    fn get_conn(&self) -> Result<PooledConnection<ConnectionManager<PgConnection>>, Error> {
-        self.pool.get().map_err(Error::from)
+    /// Execute a cached query, avoiding thundering herd for identical requests.
+    /// Returns `(result, was_cached)`.
+    async fn cached_lookup<K, T, F>(
+        &self,
+        cache: &HerdCache<Arc<Result<T, StoreError>>>,
+        key: &K,
+        lookup: F,
+    ) -> (Result<T, StoreError>, bool)
+    where
+        K: graph::stable_hash::StableHash,
+        T: Clone + Send + 'static,
+        F: Future<Output = Result<T, StoreError>> + Send + 'static,
+    {
+        let hash = crypto_stable_hash(key);
+        let lookup_fut = async move { Arc::new(lookup.await) };
+        let (arc_result, cached) = cache.cached_query(hash, lookup_fut, &self.logger).await;
+        let result = Arc::try_unwrap(arc_result).unwrap_or_else(|arc| (*arc).clone());
+        (result, cached)
     }
 
-    pub(crate) fn create(&self, ident: &ChainIdentifier) -> Result<(), Error> {
+    pub(crate) async fn create(&self, ident: &ChainIdentifier) -> Result<(), Error> {
         use public::ethereum_networks::dsl::*;
 
-        let mut conn = self.get_conn()?;
+        let mut conn = self.pool.get_permitted().await?;
         conn.transaction(|conn| {
-            insert_into(ethereum_networks)
-                .values((
-                    name.eq(&self.chain),
-                    namespace.eq(&self.storage),
-                    head_block_hash.eq::<Option<String>>(None),
-                    head_block_number.eq::<Option<i64>>(None),
-                    net_version.eq(&ident.net_version),
-                    genesis_block_hash.eq(ident.genesis_block_hash.hash_hex()),
-                ))
-                .on_conflict(name)
-                .do_nothing()
-                .execute(conn)?;
-            self.storage.create(conn)
-        })?;
+            async move {
+                insert_into(ethereum_networks)
+                    .values((
+                        name.eq(&self.chain),
+                        namespace.eq(&self.storage),
+                        head_block_hash.eq::<Option<String>>(None),
+                        head_block_number.eq::<Option<i64>>(None),
+                        net_version.eq(&ident.net_version),
+                        genesis_block_hash.eq(ident.genesis_block_hash.hash_hex()),
+                    ))
+                    .on_conflict(name)
+                    .do_nothing()
+                    .execute(conn)
+                    .await?;
+                self.storage.create(conn).await
+            }
+            .scope_boxed()
+        })
+        .await?;
 
         Ok(())
     }
 
-    pub fn update_name(&self, name: &str) -> Result<(), Error> {
+    pub async fn update_name(&self, name: &str) -> Result<(), Error> {
         use public::ethereum_networks as n;
-        let mut conn = self.get_conn()?;
+        let mut conn = self.pool.get_permitted().await?;
         conn.transaction(|conn| {
-            update(n::table.filter(n::name.eq(&self.chain)))
-                .set(n::name.eq(name))
-                .execute(conn)?;
-            Ok(())
+            async {
+                update(n::table.filter(n::name.eq(&self.chain)))
+                    .set(n::name.eq(name))
+                    .execute(conn)
+                    .await?;
+                Ok(())
+            }
+            .scope_boxed()
         })
+        .await
     }
 
-    pub(crate) fn drop_chain(&self) -> Result<(), Error> {
+    pub(crate) async fn drop_chain(&self) -> Result<(), Error> {
         use diesel::dsl::delete;
         use public::ethereum_networks as n;
 
-        let mut conn = self.get_conn()?;
+        let mut conn = self.pool.get_permitted().await?;
         conn.transaction(|conn| {
-            self.storage.drop_storage(conn, &self.chain)?;
+            async {
+                self.storage.drop_storage(conn, &self.chain).await?;
 
-            delete(n::table.filter(n::name.eq(&self.chain))).execute(conn)?;
-            Ok(())
+                delete(n::table.filter(n::name.eq(&self.chain)))
+                    .execute(conn)
+                    .await?;
+                Ok(())
+            }
+            .scope_boxed()
         })
+        .await
     }
 
-    pub fn chain_head_pointers(
-        conn: &mut PgConnection,
+    pub async fn chain_head_pointers(
+        conn: &mut AsyncPgConnection,
     ) -> Result<HashMap<String, BlockPtr>, StoreError> {
         use public::ethereum_networks as n;
 
         let pointers: Vec<(String, BlockPtr)> = n::table
             .select((n::name, n::head_block_hash, n::head_block_number))
-            .load::<(String, Option<String>, Option<i64>)>(conn)?
+            .load::<(String, Option<String>, Option<i64>)>(conn)
+            .await?
             .into_iter()
             .filter_map(|(name, hash, number)| match (hash, number) {
                 (Some(hash), Some(number)) => Some((name, hash, number)),
@@ -1828,13 +2301,14 @@ impl ChainStore {
         Ok(HashMap::from_iter(pointers))
     }
 
-    pub fn chain_head_block(&self, chain: &str) -> Result<Option<BlockNumber>, StoreError> {
+    pub async fn chain_head_block(&self, chain: &str) -> Result<Option<BlockNumber>, StoreError> {
         use public::ethereum_networks as n;
 
         let number: Option<i64> = n::table
             .filter(n::name.eq(chain))
             .select(n::head_block_number)
-            .first::<Option<i64>>(&mut self.get_conn()?)
+            .first::<Option<i64>>(&mut self.pool.get_permitted().await?)
+            .await
             .optional()?
             .flatten();
 
@@ -1850,24 +2324,28 @@ impl ChainStore {
         )
     }
 
-    pub(crate) fn set_chain_identifier(&self, ident: &ChainIdentifier) -> Result<(), Error> {
+    pub(crate) async fn set_chain_identifier(&self, ident: &ChainIdentifier) -> Result<(), Error> {
         use public::ethereum_networks as n;
 
-        let mut conn = self.pool.get()?;
+        let mut conn = self.pool.get_permitted().await?;
 
         diesel::update(n::table.filter(n::name.eq(&self.chain)))
             .set((
                 n::genesis_block_hash.eq(ident.genesis_block_hash.hash_hex()),
                 n::net_version.eq(&ident.net_version),
             ))
-            .execute(&mut conn)?;
+            .execute(&mut conn)
+            .await?;
 
         Ok(())
     }
 
     #[cfg(debug_assertions)]
-    pub fn set_chain_identifier_for_tests(&self, ident: &ChainIdentifier) -> Result<(), Error> {
-        self.set_chain_identifier(ident)
+    pub async fn set_chain_identifier_for_tests(
+        &self,
+        ident: &ChainIdentifier,
+    ) -> Result<(), Error> {
+        self.set_chain_identifier(ident).await
     }
 
     /// Store the given chain as the blocks for the `network` set the
@@ -1879,10 +2357,15 @@ impl ChainStore {
         genesis_hash: &str,
         chain: Vec<Arc<dyn Block>>,
     ) -> Vec<(BlockPtr, BlockHash)> {
-        let mut conn = self.pool.get().expect("can get a database connection");
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .expect("can get a database connection");
 
-        self.storage.remove_chain(&mut conn, &self.chain);
+        self.storage.remove_chain(&mut conn, &self.chain).await;
         self.recent_blocks_cache.clear();
+        self.chain_head_ptr_cache.clear();
 
         for block in chain {
             self.upsert_block(block).await.expect("can upsert block");
@@ -1892,6 +2375,7 @@ impl ChainStore {
             net_version: "0".to_string(),
             genesis_block_hash: BlockHash::try_from(genesis_hash).expect("valid block hash"),
         })
+        .await
         .expect("unable to set chain identifier");
 
         use public::ethereum_networks as n;
@@ -1902,32 +2386,35 @@ impl ChainStore {
                 n::head_block_number.eq::<Option<i64>>(None),
             ))
             .execute(&mut conn)
+            .await
             .unwrap();
         self.recent_blocks_cache.blocks()
     }
 
-    pub fn delete_blocks(&self, block_hashes: &[&H256]) -> Result<usize, Error> {
-        let mut conn = self.get_conn()?;
+    pub async fn delete_blocks(&self, block_hashes: &[&B256]) -> Result<usize, Error> {
+        let mut conn = self.pool.get_permitted().await?;
         self.storage
             .delete_blocks_by_hash(&mut conn, &self.chain, block_hashes)
+            .await
     }
 
-    pub fn cleanup_shallow_blocks(&self, lowest_block: i32) -> Result<(), StoreError> {
-        let mut conn = self.get_conn()?;
+    pub async fn cleanup_shallow_blocks(&self, lowest_block: i32) -> Result<(), StoreError> {
+        let mut conn = self.pool.get_permitted().await?;
         self.storage
-            .cleanup_shallow_blocks(&mut conn, lowest_block)?;
+            .cleanup_shallow_blocks(&mut conn, lowest_block)
+            .await?;
         Ok(())
     }
 
     // remove_cursor delete the chain_store cursor and return true if it was present
-    pub fn remove_cursor(&self, chain: &str) -> Result<Option<BlockNumber>, StoreError> {
-        let mut conn = self.get_conn()?;
-        self.storage.remove_cursor(&mut conn, chain)
+    pub async fn remove_cursor(&self, chain: &str) -> Result<Option<BlockNumber>, StoreError> {
+        let mut conn = self.pool.get_permitted().await?;
+        self.storage.remove_cursor(&mut conn, chain).await
     }
 
-    pub fn truncate_block_cache(&self) -> Result<(), StoreError> {
-        let mut conn = self.get_conn()?;
-        self.storage.truncate_block_cache(&mut conn)?;
+    pub async fn truncate_block_cache(&self) -> Result<(), StoreError> {
+        let mut conn = self.pool.get_permitted().await?;
+        self.storage.truncate_block_cache(&mut conn).await?;
         Ok(())
     }
 
@@ -1935,16 +2422,8 @@ impl ChainStore {
         self: &Arc<Self>,
         hashes: Vec<BlockHash>,
     ) -> Result<Vec<JsonBlock>, StoreError> {
-        let store = self.cheap_clone();
-        let pool = self.pool.clone();
-        let values = pool
-            .with_conn(move |conn, _| {
-                store
-                    .storage
-                    .blocks(conn, &store.chain, &hashes)
-                    .map_err(CancelableError::from)
-            })
-            .await?;
+        let mut conn = self.pool.get_permitted().await?;
+        let values = self.storage.blocks(&mut conn, &self.chain, &hashes).await?;
         Ok(values)
     }
 
@@ -1952,16 +2431,10 @@ impl ChainStore {
         self: &Arc<Self>,
         numbers: Vec<BlockNumber>,
     ) -> Result<BTreeMap<BlockNumber, Vec<JsonBlock>>, StoreError> {
-        let store = self.cheap_clone();
-        let pool = self.pool.clone();
-
-        let values = pool
-            .with_conn(move |conn, _| {
-                store
-                    .storage
-                    .block_ptrs_by_numbers(conn, &store.chain, &numbers)
-                    .map_err(CancelableError::from)
-            })
+        let mut conn = self.pool.get_permitted().await?;
+        let values = self
+            .storage
+            .block_ptrs_by_numbers(&mut conn, &self.chain, &numbers)
             .await?;
 
         let mut block_map = BTreeMap::new();
@@ -1976,6 +2449,67 @@ impl ChainStore {
 
         Ok(block_map)
     }
+
+    async fn attempt_chain_head_update_inner(
+        &self,
+        ancestor_count: BlockNumber,
+    ) -> Result<(Option<B256>, Option<(String, i64)>), StoreError> {
+        use public::ethereum_networks as n;
+
+        let genesis_block_ptr = self.genesis_block_ptr().await?.hash.as_b256();
+
+        let mut conn = self.pool.get_permitted().await?;
+        let candidate = self
+            .storage
+            .chain_head_candidate(&mut conn, &self.chain)
+            .await?;
+        let (ptr, first_block) = match &candidate {
+            None => return Ok((None, None)),
+            Some(ptr) => (ptr, 0.max(ptr.number.saturating_sub(ancestor_count))),
+        };
+
+        match self
+            .storage
+            .missing_parent(
+                &mut conn,
+                &self.chain,
+                first_block as i64,
+                ptr.hash.as_b256(),
+                genesis_block_ptr,
+            )
+            .await?
+        {
+            Some(missing) => {
+                return Ok((Some(missing), None));
+            }
+            None => { /* we have a complete chain, no missing parents */ }
+        }
+
+        let hash = ptr.hash_hex();
+        let number = ptr.number as i64;
+        conn.transaction::<(Option<B256>, Option<(String, i64)>), StoreError, _>(|conn| {
+            async move {
+                update(n::table.filter(n::name.eq(&self.chain)))
+                    .set((
+                        n::head_block_hash.eq(&hash),
+                        n::head_block_number.eq(number),
+                    ))
+                    .execute(conn)
+                    .await?;
+                Ok((None, Some((hash, number))))
+            }
+            .scope_boxed()
+        })
+        .await
+    }
+
+    /// Helper for tests that need to directly modify the tables for the
+    /// chain store
+    #[cfg(debug_assertions)]
+    pub async fn get_conn_for_test(&self) -> Result<crate::pool::PermittedConnection, Error> {
+        let conn = self.pool.get_permitted().await?;
+        Ok(conn)
+    }
 }
 
 fn json_block_to_block_ptr_ext(json_block: &JsonBlock) -> Result<ExtendedBlockPtr, Error> {
@@ -1988,7 +2522,7 @@ fn json_block_to_block_ptr_ext(json_block: &JsonBlock) -> Result<ExtendedBlockPt
         .ok_or_else(|| anyhow!("Timestamp is missing"))?;
 
     let ptr =
-        ExtendedBlockPtr::try_from((hash.as_h256(), number, parent_hash.as_h256(), timestamp))
+        ExtendedBlockPtr::try_from((hash.as_b256(), number, parent_hash.as_b256(), timestamp))
             .map_err(|e| anyhow!("Failed to convert to ExtendedBlockPtr: {}", e))?;
 
     Ok(ptr)
@@ -1999,46 +2533,68 @@ impl ChainHeadStore for ChainStore {
     async fn chain_head_ptr(self: Arc<Self>) -> Result<Option<BlockPtr>, Error> {
         use public::ethereum_networks::dsl::*;
 
-        Ok(self
-            .cheap_clone()
-            .pool
-            .with_conn(move |conn, _| {
-                ethereum_networks
-                    .select((head_block_hash, head_block_number))
-                    .filter(name.eq(&self.chain))
-                    .load::<(Option<String>, Option<i64>)>(conn)
-                    .map(|rows| {
-                        rows.first()
-                            .map(|(hash_opt, number_opt)| match (hash_opt, number_opt) {
-                                (Some(hash), Some(number)) => Some(
-                                    (
-                                        // FIXME:
-                                        //
-                                        // workaround for arweave
-                                        H256::from_slice(&hex::decode(hash).unwrap()[..32]),
-                                        *number,
-                                    )
-                                        .into(),
-                                ),
-                                (None, None) => None,
-                                _ => unreachable!(),
-                            })
-                            .and_then(|opt: Option<BlockPtr>| opt)
-                    })
-                    .map_err(|e| CancelableError::from(StoreError::from(e)))
-            })
-            .await?)
+        // Check TTL cache first (handles disabled check and metrics internally)
+        if let Some(cached) = self.chain_head_ptr_cache.get() {
+            return Ok(Some(cached));
+        }
+
+        // Use HerdCache to ensure only one caller does the DB lookup
+        // when cache is expired. Other callers await the in-flight query.
+        let pool = self.pool.clone();
+        let chain = self.chain.clone();
+        let lookup = async move {
+            let mut conn = pool.get_permitted().await?;
+            ethereum_networks
+                .select((head_block_hash, head_block_number))
+                .filter(name.eq(&chain))
+                .load::<(Option<String>, Option<i64>)>(&mut conn)
+                .await
+                .map(|rows| {
+                    rows.as_slice()
+                        .first()
+                        .map(|(hash_opt, number_opt)| match (hash_opt, number_opt) {
+                            (Some(hash), Some(number)) => Some(
+                                (
+                                    // FIXME:
+                                    //
+                                    // workaround for arweave
+                                    B256::from_slice(&hex::decode(hash).unwrap()[..32]),
+                                    *number,
+                                )
+                                    .into(),
+                            ),
+                            (None, None) => None,
+                            _ => unreachable!(),
+                        })
+                        .and_then(|opt: Option<BlockPtr>| opt)
+                })
+                .map_err(StoreError::from)
+        };
+
+        let (result, _cached) = self
+            .cached_lookup(&self.chain_head_ptr_herd, &self.chain, lookup)
+            .await;
+
+        // Update TTL cache with the result
+        // (set() handles disabled check internally)
+        if let Ok(Some(ref ptr)) = result {
+            self.chain_head_ptr_cache.set(ptr.clone());
+        }
+
+        result.map_err(Error::from)
     }
 
-    fn chain_head_cursor(&self) -> Result<Option<String>, Error> {
+    async fn chain_head_cursor(&self) -> Result<Option<String>, Error> {
         use public::ethereum_networks::dsl::*;
 
         ethereum_networks
             .select(head_block_cursor)
             .filter(name.eq(&self.chain))
-            .load::<Option<String>>(&mut self.get_conn()?)
+            .load::<Option<String>>(&mut self.pool.get_permitted().await?)
+            .await
             .map(|rows| {
-                rows.first()
+                rows.as_slice()
+                    .first()
                     .map(|cursor_opt| cursor_opt.as_ref().cloned())
                     .and_then(|opt| opt)
             })
@@ -2052,22 +2608,19 @@ impl ChainHeadStore for ChainStore {
     ) -> Result<(), Error> {
         use public::ethereum_networks as n;
 
-        let pool = self.pool.clone();
-        let network = self.chain.clone();
-        let storage = self.storage.clone();
-
         let ptr = block.ptr();
         let hash = ptr.hash_hex();
         let number = ptr.number as i64; //block height
 
         //this will send an update via postgres, channel: chain_head_updates
-        self.chain_head_update_sender.send(&hash, number)?;
+        self.chain_head_update_sender.send(&hash, number).await?;
 
-        pool.with_conn(move |conn, _| {
-            conn.transaction(|conn| -> Result<(), StoreError> {
-                storage
-                    .upsert_block(conn, &network, block.as_ref(), true)
-                    .map_err(CancelableError::from)?;
+        let mut conn = self.pool.get_permitted().await?;
+        conn.transaction(|conn| {
+            async {
+                self.storage
+                    .upsert_block(conn, &self.chain, block.as_ref(), true)
+                    .await?;
 
                 update(n::table.filter(n::name.eq(&self.chain)))
                     .set((
@@ -2075,22 +2628,22 @@ impl ChainHeadStore for ChainStore {
                         n::head_block_number.eq(number),
                         n::head_block_cursor.eq(cursor),
                     ))
-                    .execute(conn)?;
+                    .execute(conn)
+                    .await?;
 
-                Ok(())
-            })
-            .map_err(CancelableError::from)
+                Ok::<(), StoreError>(())
+            }
+            .scope_boxed()
         })
         .await?;
-
         Ok(())
     }
 }
 
 #[async_trait]
 impl ChainStoreTrait for ChainStore {
-    fn genesis_block_ptr(&self) -> Result<BlockPtr, Error> {
-        let ident = self.chain_identifier()?;
+    async fn genesis_block_ptr(&self) -> Result<BlockPtr, Error> {
+        let ident = self.chain_identifier().await?;
 
         Ok(BlockPtr {
             hash: ident.genesis_block_hash,
@@ -2105,25 +2658,22 @@ impl ChainStoreTrait for ChainStore {
             self.recent_blocks_cache.insert_block(block);
         }
 
-        let pool = self.pool.clone();
-        let network = self.chain.clone();
-        let storage = self.storage.clone();
-        pool.with_conn(move |conn, _| {
-            conn.transaction(|conn| {
-                storage
-                    .upsert_block(conn, &network, block.as_ref(), true)
-                    .map_err(CancelableError::from)
-            })
+        let mut conn = self.pool.get_permitted().await?;
+        conn.transaction(|conn| {
+            self.storage
+                .upsert_block(conn, &self.chain, block.as_ref(), true)
+                .scope_boxed()
         })
         .await
         .map_err(Error::from)
     }
 
-    fn upsert_light_blocks(&self, blocks: &[&dyn Block]) -> Result<(), Error> {
-        let mut conn = self.pool.get()?;
+    async fn upsert_light_blocks(&self, blocks: &[&dyn Block]) -> Result<(), Error> {
+        let mut conn = self.pool.get_permitted().await?;
         for block in blocks {
             self.storage
-                .upsert_block(&mut conn, &self.chain, *block, false)?;
+                .upsert_block(&mut conn, &self.chain, *block, false)
+                .await?;
         }
         Ok(())
     }
@@ -2131,60 +2681,11 @@ impl ChainStoreTrait for ChainStore {
     async fn attempt_chain_head_update(
         self: Arc<Self>,
         ancestor_count: BlockNumber,
-    ) -> Result<Option<H256>, Error> {
-        use public::ethereum_networks as n;
+    ) -> Result<Option<B256>, Error> {
+        let (missing, ptr) = self.attempt_chain_head_update_inner(ancestor_count).await?;
 
-        let (missing, ptr) = {
-            let chain_store = self.clone();
-            let genesis_block_ptr = self.genesis_block_ptr()?.hash_as_h256();
-            self.pool
-                .with_conn(move |conn, _| {
-                    let candidate = chain_store
-                        .storage
-                        .chain_head_candidate(conn, &chain_store.chain)
-                        .map_err(CancelableError::from)?;
-                    let (ptr, first_block) = match &candidate {
-                        None => return Ok((None, None)),
-                        Some(ptr) => (ptr, 0.max(ptr.number.saturating_sub(ancestor_count))),
-                    };
-
-                    match chain_store
-                        .storage
-                        .missing_parent(
-                            conn,
-                            &chain_store.chain,
-                            first_block as i64,
-                            ptr.hash_as_h256(),
-                            genesis_block_ptr,
-                        )
-                        .map_err(CancelableError::from)?
-                    {
-                        Some(missing) => {
-                            return Ok((Some(missing), None));
-                        }
-                        None => { /* we have a complete chain, no missing parents */ }
-                    }
-
-                    let hash = ptr.hash_hex();
-                    let number = ptr.number as i64;
-
-                    conn.transaction(
-                        |conn| -> Result<(Option<H256>, Option<(String, i64)>), StoreError> {
-                            update(n::table.filter(n::name.eq(&chain_store.chain)))
-                                .set((
-                                    n::head_block_hash.eq(&hash),
-                                    n::head_block_number.eq(number),
-                                ))
-                                .execute(conn)?;
-                            Ok((None, Some((hash, number))))
-                        },
-                    )
-                    .map_err(CancelableError::from)
-                })
-                .await?
-        };
         if let Some((hash, number)) = ptr {
-            self.chain_head_update_sender.send(&hash, number)?;
+            self.chain_head_update_sender.send(&hash, number).await?;
         }
 
         Ok(missing)
@@ -2208,23 +2709,17 @@ impl ChainStoreTrait for ChainStore {
                     .cloned()
                     .collect::<Vec<_>>();
 
-                let hash = crypto_stable_hash(&missing_numbers);
                 let this = self.clone();
-                let lookup_fut = async move {
-                    let res = this.blocks_from_store_by_numbers(missing_numbers).await;
-                    BlocksLookupResult::ByNumber(Arc::new(res))
-                };
-                let lookup_herd = self.lookup_herd.cheap_clone();
-                let logger = self.logger.cheap_clone();
-                let res = match lookup_herd.cached_query(hash, lookup_fut, &logger).await {
-                    (BlocksLookupResult::ByNumber(res), _) => res,
-                    _ => unreachable!(),
-                };
-                let res = Arc::try_unwrap(res).unwrap_or_else(|arc| (*arc).clone());
+                let missing_clone = missing_numbers.clone();
+                let (res, _) = self
+                    .cached_lookup(&self.blocks_by_number_cache, &missing_numbers, async move {
+                        this.blocks_from_store_by_numbers(missing_clone).await
+                    })
+                    .await;
 
                 match res {
                     Ok(blocks) => {
-                        for (_, blocks_for_num) in &blocks {
+                        for blocks_for_num in blocks.values() {
                             if blocks.len() == 1 {
                                 self.recent_blocks_cache
                                     .insert_block(blocks_for_num[0].clone());
@@ -2247,9 +2742,7 @@ impl ChainStoreTrait for ChainStore {
 
             let mut result = cached_map;
             for (num, blocks) in stored {
-                if !result.contains_key(&num) {
-                    result.insert(num, blocks);
-                }
+                result.entry(num).or_insert(blocks);
             }
 
             result
@@ -2283,7 +2776,7 @@ impl ChainStoreTrait for ChainStore {
             let stored = if cached.len() < hashes.len() {
                 let hashes = hashes
                     .iter()
-                    .filter(|hash| cached.iter().find(|(ptr, _)| &ptr.hash == *hash).is_none())
+                    .filter(|hash| !cached.iter().any(|(ptr, _)| &ptr.hash == *hash))
                     .cloned()
                     .collect::<Vec<_>>();
                 // We key this off the entire list of hashes, which means
@@ -2294,32 +2787,15 @@ impl ChainStoreTrait for ChainStore {
                 // the database for one block hash, `h3`, is not much faster
                 // than looking up `[h1, h3]` though it would require less
                 // IO bandwidth
-                let hash = crypto_stable_hash(&hashes);
                 let this = self.clone();
-                let lookup_fut = async move {
-                    let res = this.blocks_from_store(hashes).await;
-                    BlocksLookupResult::ByHash(Arc::new(res))
-                };
-                let lookup_herd = self.lookup_herd.cheap_clone();
-                let logger = self.logger.cheap_clone();
-                // This match can only return ByHash because lookup_fut explicitly constructs
-                // BlocksLookupResult::ByHash. The cache preserves the exact future result,
-                // so ByNumber variant is structurally impossible here.
-                let res = match lookup_herd.cached_query(hash, lookup_fut, &logger).await {
-                    (BlocksLookupResult::ByHash(res), _) => res,
-                    (BlocksLookupResult::ByNumber(_), _) => {
-                        Arc::new(Err(StoreError::Unknown(anyhow::anyhow!(
-                            "Unexpected BlocksLookupResult::ByNumber returned from cached block lookup by hash"
-                        ))))
-                    }
-                };
+                let hashes_clone = hashes.clone();
+                let (res, _) = self
+                    .cached_lookup(&self.blocks_by_hash_cache, &hashes, async move {
+                        this.blocks_from_store(hashes_clone).await
+                    })
+                    .await;
 
-                // Try to avoid cloning a non-concurrent lookup; it's not
-                // entirely clear whether that will actually avoid a clone
-                // since it depends on a lot of the details of how the
-                // `HerdCache` is implemented
-                let res = Arc::try_unwrap(res).unwrap_or_else(|arc| (*arc).clone());
-                let stored = match res {
+                match res {
                     Ok(blocks) => {
                         for block in &blocks {
                             self.recent_blocks_cache.insert_block(block.clone());
@@ -2329,8 +2805,7 @@ impl ChainStoreTrait for ChainStore {
                     Err(e) => {
                         return Err(e.into());
                     }
-                };
-                stored
+                }
             } else {
                 Vec::new()
             };
@@ -2355,31 +2830,65 @@ impl ChainStoreTrait for ChainStore {
             block_ptr.hash_hex()
         );
 
-        // Check the local cache first.
-        let block_cache = self
-            .recent_blocks_cache
-            .get_ancestor(&block_ptr, offset)
-            .and_then(|x| Some(x.0).zip(x.1));
-        if let Some((ptr, data)) = block_cache {
-            return Ok(Some((data, ptr)));
+        // Use herd cache to avoid thundering herd when multiple callers
+        // request the same ancestor block simultaneously. The cache check
+        // is inside the future so that only one caller checks and populates
+        // the cache.
+        let key = (&block_ptr, offset, &root);
+        let this = self.cheap_clone();
+        let block_ptr_clone = block_ptr.clone();
+        let root_clone = root.clone();
+        let (res, cached) = self
+            .cached_lookup(&self.ancestor_cache, &key, async move {
+                // Check the local cache first.
+                let block_cache = this
+                    .recent_blocks_cache
+                    .get_ancestor(&block_ptr_clone, offset)
+                    .and_then(|x| Some(x.0).zip(x.1));
+                if let Some((ptr, data)) = block_cache {
+                    return Ok(Some((data, ptr)));
+                }
+
+                // Cache miss, query the database
+                let mut conn = this.pool.get_permitted().await?;
+                let result = this
+                    .storage
+                    .ancestor_block(&mut conn, block_ptr_clone, offset, root_clone)
+                    .await
+                    .map_err(StoreError::from)?;
+
+                // Insert into cache if we got a result
+                if let Some((ref data, ref ptr)) = result {
+                    // Extract parent_hash from data["block"]["parentHash"] or
+                    // data["parentHash"]
+                    if let Some(parent_hash) = data
+                        .get("block")
+                        .unwrap_or(data)
+                        .get("parentHash")
+                        .and_then(|h| h.as_str())
+                        .and_then(|h| h.parse().ok())
+                    {
+                        let block = JsonBlock::new(ptr.clone(), parent_hash, Some(data.clone()));
+                        this.recent_blocks_cache.insert_block(block);
+                    }
+                }
+
+                Ok(result)
+            })
+            .await;
+        let result = res?;
+
+        if cached {
+            // If we had a hit in the herd cache, we never ran the future
+            // that we pass to cached_lookup but we want to pretend that we
+            // actually looked the value up from the recent blocks cache
+            self.recent_blocks_cache.register_hit();
         }
 
-        let block_ptr_clone = block_ptr.clone();
-        let chain_store = self.cheap_clone();
-
-        self.pool
-            .with_conn(move |conn, _| {
-                chain_store
-                    .storage
-                    .ancestor_block(conn, block_ptr_clone, offset, root)
-                    .map_err(StoreError::from)
-                    .map_err(CancelableError::from)
-            })
-            .await
-            .map_err(Into::into)
+        Ok(result)
     }
 
-    fn cleanup_cached_blocks(
+    async fn cleanup_cached_blocks(
         &self,
         ancestor_count: BlockNumber,
     ) -> Result<Option<(BlockNumber, usize)>, Error> {
@@ -2410,7 +2919,7 @@ impl ChainStoreTrait for ChainStore {
         //
         // See 8b6ad0c64e244023ac20ced7897fe666
 
-        let mut conn = self.get_conn()?;
+        let mut conn = self.pool.get_permitted().await?;
         let query = "
             select coalesce(
                    least(a.block,
@@ -2428,58 +2937,61 @@ impl ChainStoreTrait for ChainStore {
                    and a.id = d.id
                    and not d.failed
                    and ds.network = $2) a;";
-        diesel::sql_query(query)
+        let Some(block) = diesel::sql_query(query)
             .bind::<Integer, _>(ancestor_count)
             .bind::<Text, _>(&self.chain)
-            .load::<MinBlock>(&mut conn)?
+            .load::<MinBlock>(&mut conn)
+            .await?
+            .as_slice()
             .first()
-            .map(|MinBlock { block }| {
-                // If we could not determine a minimum block, the query
-                // returns -1, and we should not do anything. We also guard
-                // against removing the genesis block
-                if *block > 0 {
-                    self.storage
-                        .delete_blocks_before(&mut conn, &self.chain, *block as i64)
-                        .map(|rows| Some((*block, rows)))
-                } else {
-                    Ok(None)
-                }
-            })
-            .unwrap_or(Ok(None))
-            .map_err(Into::into)
+            .map(|MinBlock { block }| *block)
+        else {
+            return Ok(None);
+        };
+        // If we could not determine a minimum block, the query
+        // returns -1, and we should not do anything. We also guard
+        // against removing the genesis block
+        if block > 0 {
+            self.storage
+                .delete_blocks_before(&mut conn, &self.chain, block as i64)
+                .await
+                .map(|rows| Some((block, rows)))
+        } else {
+            Ok(None)
+        }
     }
 
-    fn block_hashes_by_block_number(&self, number: BlockNumber) -> Result<Vec<BlockHash>, Error> {
-        let mut conn = self.get_conn()?;
+    async fn block_hashes_by_block_number(
+        &self,
+        number: BlockNumber,
+    ) -> Result<Vec<BlockHash>, Error> {
+        let mut conn = self.pool.get_permitted().await?;
         self.storage
             .block_hashes_by_block_number(&mut conn, &self.chain, number)
+            .await
     }
 
-    fn confirm_block_hash(&self, number: BlockNumber, hash: &BlockHash) -> Result<usize, Error> {
-        let mut conn = self.get_conn()?;
+    async fn confirm_block_hash(
+        &self,
+        number: BlockNumber,
+        hash: &BlockHash,
+    ) -> Result<usize, Error> {
+        let mut conn = self.pool.get_permitted().await?;
         self.storage
             .confirm_block_hash(&mut conn, &self.chain, number, hash)
+            .await
     }
 
     async fn block_number(
         &self,
         hash: &BlockHash,
     ) -> Result<Option<(String, BlockNumber, Option<u64>, Option<BlockHash>)>, StoreError> {
-        let hash = hash.clone();
-        let storage = self.storage.clone();
-        let chain = self.chain.clone();
-        self.pool
-            .with_conn(move |conn, _| {
-                storage
-                    .block_number(conn, &hash)
-                    .map(|opt| {
-                        opt.map(|(number, timestamp, parent_hash)| {
-                            (chain.clone(), number, timestamp, parent_hash)
-                        })
-                    })
-                    .map_err(|e| e.into())
+        let mut conn = self.pool.get_permitted().await?;
+        self.storage.block_number(&mut conn, hash).await.map(|opt| {
+            opt.map(|(number, timestamp, parent_hash)| {
+                (self.chain.clone(), number, timestamp, parent_hash)
             })
-            .await
+        })
     }
 
     async fn block_numbers(
@@ -2490,46 +3002,52 @@ impl ChainStoreTrait for ChainStore {
             return Ok(HashMap::new());
         }
 
-        let storage = self.storage.clone();
-        self.pool
-            .with_conn(move |conn, _| {
-                storage
-                    .block_numbers(conn, hashes.as_slice())
-                    .map_err(|e| e.into())
-            })
+        let mut conn = self.pool.get_permitted().await?;
+        self.storage
+            .block_numbers(&mut conn, hashes.as_slice())
             .await
     }
 
     async fn clear_call_cache(&self, from: BlockNumber, to: BlockNumber) -> Result<(), Error> {
-        let mut conn = self.get_conn()?;
-        if let Some(head) = self.chain_head_block(&self.chain)? {
-            self.storage.clear_call_cache(&mut conn, head, from, to)?;
+        let mut conn = self.pool.get_permitted().await?;
+        if let Some(head) = self.chain_head_block(&self.chain).await? {
+            self.storage
+                .clear_call_cache(&mut conn, head, from, to)
+                .await?;
         }
         Ok(())
     }
 
-    async fn transaction_receipts_in_block(
+    async fn clear_stale_call_cache(
         &self,
-        block_hash: &H256,
-    ) -> Result<Vec<LightTransactionReceipt>, StoreError> {
-        let pool = self.pool.clone();
-        let storage = self.storage.clone();
-        let block_hash = *block_hash;
-        pool.with_conn(move |conn, _| {
-            storage
-                .find_transaction_receipts_in_block(conn, block_hash)
-                .map_err(|e| StoreError::from(e).into())
-        })
-        .await
+        ttl_days: i32,
+        ttl_max_contracts: Option<i64>,
+    ) -> Result<(), Error> {
+        let conn = &mut self.pool.get_permitted().await?;
+        self.storage
+            .clear_stale_call_cache(conn, &self.logger, ttl_days, ttl_max_contracts)
+            .await
     }
 
-    fn chain_identifier(&self) -> Result<ChainIdentifier, Error> {
-        let mut conn = self.pool.get()?;
+    async fn transaction_receipts_in_block(
+        &self,
+        block_hash: &B256,
+    ) -> Result<Vec<LightTransactionReceipt>, StoreError> {
+        let mut conn = self.pool.get_permitted().await?;
+        self.storage
+            .find_transaction_receipts_in_block(&mut conn, *block_hash)
+            .await
+            .map_err(StoreError::from)
+    }
+
+    async fn chain_identifier(&self) -> Result<ChainIdentifier, Error> {
+        let mut conn = self.pool.get_permitted().await?;
         use public::ethereum_networks as n;
         let (genesis_block_hash, net_version) = n::table
             .select((n::genesis_block_hash, n::net_version))
             .filter(n::name.eq(&self.chain))
-            .get_result::<(BlockHash, String)>(&mut conn)?;
+            .get_result::<(BlockHash, String)>(&mut conn)
+            .await?;
 
         Ok(ChainIdentifier {
             net_version,
@@ -2651,6 +3169,11 @@ mod recent_blocks_cache {
             }
         }
 
+        pub fn register_hit(&self) {
+            let inner = self.inner.read();
+            inner.metrics.record_cache_hit(&inner.network);
+        }
+
         pub fn clear(&self) {
             self.inner.write().blocks.clear();
             self.inner.read().update_write_metrics();
@@ -2757,34 +3280,45 @@ fn try_parse_timestamp(ts: Option<String>) -> Result<Option<u64>, StoreError> {
         .map(Some)
 }
 
+#[async_trait]
 impl EthereumCallCache for ChainStore {
-    fn get_call(
+    async fn get_call(
         &self,
         req: &call::Request,
         block: BlockPtr,
     ) -> Result<Option<call::Response>, Error> {
+        if ENV_VARS.store_call_cache_disabled() {
+            return Ok(None);
+        }
+
         let id = contract_call_id(req, &block);
-        let conn = &mut *self.get_conn()?;
-        let return_value = conn.transaction::<_, Error, _>(|conn| {
-            if let Some((return_value, update_accessed_at)) =
-                self.storage.get_call_and_access(conn, id.as_ref())?
-            {
-                if update_accessed_at {
-                    self.storage
-                        .update_accessed_at(conn, req.address.as_ref())?;
+        let conn = &mut self.pool.get_permitted().await?;
+        let return_value = conn
+            .transaction::<_, Error, _>(|conn| {
+                async {
+                    if let Some((return_value, update_accessed_at)) =
+                        self.storage.get_call_and_access(conn, id.as_ref()).await?
+                    {
+                        if update_accessed_at {
+                            self.storage
+                                .update_accessed_at(conn, req.address.as_ref())
+                                .await?;
+                        }
+                        Ok(Some(return_value))
+                    } else {
+                        Ok(None)
+                    }
                 }
-                Ok(Some(return_value))
-            } else {
-                Ok(None)
-            }
-        })?;
+                .scope_boxed()
+            })
+            .await?;
         Ok(return_value.map(|return_value| {
             req.cheap_clone()
                 .response(call::Retval::Value(return_value), call::Source::Store)
         }))
     }
 
-    fn get_calls(
+    async fn get_calls(
         &self,
         reqs: &[call::Request],
         block: BlockPtr,
@@ -2794,14 +3328,19 @@ impl EthereumCallCache for ChainStore {
         }
 
         let ids: Vec<_> = reqs
-            .into_iter()
+            .iter()
             .map(|req| contract_call_id(req, &block))
             .collect();
         let id_refs: Vec<_> = ids.iter().map(|id| id.as_slice()).collect();
 
-        let conn = &mut *self.get_conn()?;
+        let conn = &mut self.pool.get_permitted().await?;
         let rows = conn
-            .transaction::<_, Error, _>(|conn| self.storage.get_calls_and_access(conn, &id_refs))?;
+            .transaction::<_, Error, _>(|conn| {
+                self.storage
+                    .get_calls_and_access(conn, &id_refs)
+                    .scope_boxed()
+            })
+            .await?;
 
         let mut found: Vec<usize> = Vec::new();
         let mut resps = Vec::new();
@@ -2819,44 +3358,62 @@ impl EthereumCallCache for ChainStore {
             resps.push(resp);
         }
         let calls = reqs
-            .into_iter()
+            .iter()
             .enumerate()
-            .filter(|(idx, _)| !found.contains(&idx))
+            .filter(|(idx, _)| !found.contains(idx))
             .map(|(_, call)| call.cheap_clone())
             .collect();
         Ok((resps, calls))
     }
 
-    fn get_calls_in_block(&self, block: BlockPtr) -> Result<Vec<CachedEthereumCall>, Error> {
-        let conn = &mut *self.get_conn()?;
-        conn.transaction::<_, Error, _>(|conn| self.storage.get_calls_in_block(conn, block))
+    async fn get_calls_in_block(&self, block: BlockPtr) -> Result<Vec<CachedEthereumCall>, Error> {
+        let conn = &mut self.pool.get_permitted().await?;
+        conn.transaction::<_, Error, _>(|conn| {
+            self.storage.get_calls_in_block(conn, block).scope_boxed()
+        })
+        .await
     }
 
-    fn set_call(
-        &self,
+    async fn set_call(
+        self: Arc<Self>,
         _: &Logger,
         call: call::Request,
         block: BlockPtr,
         return_value: call::Retval,
     ) -> Result<(), Error> {
-        let call::Retval::Value(return_value) = return_value else {
-            // We do not want to cache unsuccessful calls as some RPC nodes
-            // have weird behavior near the chain head. The details are lost
-            // to time, but we had issues with some RPC clients in the past
-            // where calls first failed and later succeeded
+        if ENV_VARS.store_call_cache_disabled() {
             return Ok(());
+        }
+
+        let return_value = match return_value {
+            call::Retval::Value(return_value) if !return_value.is_empty() => return_value,
+            _ => {
+                // We do not want to cache unsuccessful calls as some RPC nodes
+                // have weird behavior near the chain head. The details are lost
+                // to time, but we had issues with some RPC clients in the past
+                // where calls first failed and later succeeded
+                // Also in some cases RPC nodes may return empty ("0x") values
+                // which in the context of graph-node most likely means an issue
+                // with the RPC node rather than a successful call.
+                return Ok(());
+            }
         };
+
         let id = contract_call_id(&call, &block);
-        let conn = &mut *self.get_conn()?;
-        conn.transaction(|conn| {
-            self.storage.set_call(
-                conn,
-                id.as_ref(),
-                call.address.as_ref(),
-                block.number,
-                &return_value,
-            )
+        let conn = &mut self.pool.get_permitted().await?;
+        conn.transaction::<_, anyhow::Error, _>(|conn| {
+            self.storage
+                .set_call(
+                    conn,
+                    id.as_ref(),
+                    call.address.as_ref(),
+                    block.number,
+                    &return_value,
+                )
+                .scope_boxed()
         })
+        .await?;
+        Ok(())
     }
 }
 

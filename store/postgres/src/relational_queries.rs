@@ -1,10 +1,10 @@
-///! This module contains the gory details of using Diesel to query
-///! a database schema that is not known at compile time. The code in this
-///! module is mostly concerned with constructing SQL queries and some
-///! helpers for serializing and deserializing entities.
-///!
-///! Code in this module works very hard to minimize the number of allocations
-///! that it performs
+//! This module contains the gory details of using Diesel to query
+//! a database schema that is not known at compile time. The code in this
+//! module is mostly concerned with constructing SQL queries and some
+//! helpers for serializing and deserializing entities.
+//!
+//! Code in this module works very hard to minimize the number of allocations
+//! that it performs
 use diesel::pg::Pg;
 use diesel::query_builder::{AstPass, Query, QueryFragment, QueryId};
 use diesel::query_dsl::RunQueryDsl;
@@ -14,6 +14,8 @@ use diesel::sql_types::{Array, BigInt, Binary, Bool, Int8, Integer, Jsonb, Text,
 use diesel::QuerySource as _;
 use graph::components::store::write::{EntityWrite, RowGroup, WriteChunk};
 use graph::components::store::{Child as StoreChild, DerivedEntityQuery};
+
+use graph::data::graphql::IntoValue;
 use graph::data::store::{Id, IdType, NULL};
 use graph::data::store::{IdList, IdRef, QueryObject};
 use graph::data::value::{Object, Word};
@@ -52,8 +54,11 @@ use crate::{
 /// Those are columns that we always want to fetch from the database.
 const BASE_SQL_COLUMNS: [&str; 2] = ["id", "vid"];
 
-/// The maximum number of bind variables that can be used in a query
-pub(crate) const POSTGRES_MAX_PARAMETERS: usize = u16::MAX as usize; // 65535
+/// The maximum number of bind variables that can be used in a query.
+/// Because of [this
+/// bug](https://github.com/rust-postgres/rust-postgres/issues/1302) we use
+/// i16::MAX instead of u16::MAX which is what Postgres actually supports
+pub(crate) const POSTGRES_MAX_PARAMETERS: usize = i16::MAX as usize; // 32767
 
 const SORT_KEY_COLUMN: &str = "sort_key$";
 
@@ -330,7 +335,7 @@ impl FromColumnValue for r::Value {
 
     fn from_timestamp(i: &str) -> Result<Self, StoreError> {
         scalar::Timestamp::from_rfc3339(i)
-            .map(|v| r::Value::Timestamp(v))
+            .map(r::Value::Timestamp)
             .map_err(|e| {
                 StoreError::Unknown(anyhow!("failed to convert {} to Timestamp: {}", i, e))
             })
@@ -436,6 +441,47 @@ pub fn parse_id(id_type: IdType, json: serde_json::Value) -> Result<Id, StoreErr
             json,
             id_type
         ))
+    }
+}
+
+#[derive(QueryableByName, Debug)]
+pub struct JSONData {
+    #[diesel(sql_type = Jsonb)]
+    pub data: serde_json::Value,
+}
+
+impl IntoValue for JSONData {
+    fn into_value(self) -> r::Value {
+        JSONData::to_value(self.data)
+    }
+}
+
+impl JSONData {
+    pub fn to_value(data: serde_json::Value) -> r::Value {
+        match data {
+            serde_json::Value::Null => r::Value::Null,
+            serde_json::Value::Bool(b) => r::Value::Boolean(b),
+            serde_json::Value::Number(n) => {
+                if let Some(i) = n.as_i64() {
+                    r::Value::Int(i)
+                } else {
+                    r::Value::Float(n.as_f64().unwrap())
+                }
+            }
+            serde_json::Value::String(s) => r::Value::String(s),
+            serde_json::Value::Array(vals) => {
+                let vals: Vec<_> = vals.into_iter().map(JSONData::to_value).collect::<Vec<_>>();
+                r::Value::List(vals)
+            }
+            serde_json::Value::Object(map) => {
+                let mut m = std::collections::BTreeMap::new();
+                for (k, v) in map {
+                    let value = JSONData::to_value(v);
+                    m.insert(Word::from(k), value);
+                }
+                r::Value::object(m)
+            }
+        }
     }
 }
 
@@ -599,7 +645,7 @@ impl<'a> SqlValue<'a> {
             BigDecimal(d) => {
                 S::Numeric(d.to_string())
             }
-            Timestamp(ts) => S::Timestamp(ts.clone()),
+            Timestamp(ts) => S::Timestamp(*ts),
             Bool(b) => S::Bool(*b),
             List(values) => {
                 match column_type {
@@ -639,7 +685,7 @@ impl std::fmt::Display for SqlValue<'_> {
             S::Int(i) => write!(f, "{}", i),
             S::Int8(i) => write!(f, "{}", i),
             S::Numeric(s) => write!(f, "{}", s),
-            S::Timestamp(ts) => write!(f, "{}", ts.as_microseconds_since_epoch().to_string()),
+            S::Timestamp(ts) => write!(f, "{}", ts.as_microseconds_since_epoch()),
             S::Numerics(values) => write!(f, "{:?}", values),
             S::Bool(b) => write!(f, "{}", b),
             S::List(values) => write!(f, "{:?}", values),
@@ -664,7 +710,7 @@ impl<'a> QueryValue<'a> {
         Ok(Self { value, column_type })
     }
 
-    fn many(values: &'a Vec<Value>, column_type: &'a ColumnType) -> QueryResult<Vec<Self>> {
+    fn many(values: &'a [Value], column_type: &'a ColumnType) -> QueryResult<Vec<Self>> {
         values
             .iter()
             .map(|value| Self::new(value, column_type))
@@ -672,10 +718,7 @@ impl<'a> QueryValue<'a> {
     }
 
     fn is_null(&self) -> bool {
-        match &self.value {
-            SqlValue::Null => true,
-            _ => false,
-        }
+        matches!(&self.value, SqlValue::Null)
     }
 }
 
@@ -771,7 +814,7 @@ impl<'a> QueryFragment<Pg> for QueryValue<'a> {
 }
 
 fn process_vec_ast<'a, T: diesel::serialize::ToSql<Text, Pg>>(
-    values: &'a Vec<T>,
+    values: &'a [T],
     out: &mut AstPass<'_, 'a, Pg>,
     sql_language: &str,
 ) -> Result<(), DieselError> {
@@ -845,12 +888,10 @@ impl Comparison {
                 | Comparison::Greater,
                 Value::Bool(_) | Value::List(_) | Value::Null,
             )
-            | (Comparison::Match, _) => {
-                return Err(StoreError::UnsupportedFilter(
-                    self.to_string(),
-                    value.to_string(),
-                ));
-            }
+            | (Comparison::Match, _) => Err(StoreError::UnsupportedFilter(
+                self.to_string(),
+                value.to_string(),
+            )),
         }
     }
 }
@@ -963,7 +1004,7 @@ impl PrefixType {
     }
 }
 
-fn is_large_string(s: &String) -> Result<bool, ()> {
+fn is_large_string(s: &str) -> Result<bool, ()> {
     let len = if s.starts_with("0x") {
         (s.len() - 2) / 2
     } else {
@@ -1232,19 +1273,17 @@ impl<'a> QueryFragment<Pg> for QueryChild<'a> {
                 out.push_sql(" = ");
                 child_column.walk_ast(out.reborrow())?;
             }
+        } else if parent_column.is_list() {
+            // Type C: i.id = any(c.child_ids)
+            child_column.walk_ast(out.reborrow())?;
+            out.push_sql(" = any(");
+            parent_column.walk_ast(out.reborrow())?;
+            out.push_sql(")");
         } else {
-            if parent_column.is_list() {
-                // Type C: i.id = any(c.child_ids)
-                child_column.walk_ast(out.reborrow())?;
-                out.push_sql(" = any(");
-                parent_column.walk_ast(out.reborrow())?;
-                out.push_sql(")");
-            } else {
-                // Type D: i.id = c.child_id
-                child_column.walk_ast(out.reborrow())?;
-                out.push_sql(" = ");
-                parent_column.walk_ast(out.reborrow())?;
-            }
+            // Type D: i.id = c.child_id
+            child_column.walk_ast(out.reborrow())?;
+            out.push_sql(" = ");
+            parent_column.walk_ast(out.reborrow())?;
         }
 
         out.push_sql(" and ");
@@ -1329,7 +1368,7 @@ impl<'a> Filter<'a> {
     ) -> Result<Self, StoreError> {
         fn column_and_value<'v>(
             table: dsl::Table<'v>,
-            attr: &String,
+            attr: &str,
             value: &'v Value,
         ) -> Result<(dsl::Column<'v>, QueryValue<'v>), StoreError> {
             let column = table.column_for_field(attr)?;
@@ -1340,7 +1379,7 @@ impl<'a> Filter<'a> {
 
         fn starts_or_ends_with<'s>(
             table: dsl::Table<'s>,
-            attr: &String,
+            attr: &str,
             value: &Value,
             op: &'static str,
             starts_with: bool,
@@ -1368,18 +1407,16 @@ impl<'a> Filter<'a> {
                 | Value::Int(_)
                 | Value::Int8(_)
                 | Value::List(_)
-                | Value::Null => {
-                    return Err(StoreError::UnsupportedFilter(
-                        op.to_owned(),
-                        value.to_string(),
-                    ));
-                }
+                | Value::Null => Err(StoreError::UnsupportedFilter(
+                    op.to_owned(),
+                    value.to_string(),
+                )),
             }
         }
 
         fn cmp<'s>(
             table: dsl::Table<'s>,
-            attr: &String,
+            attr: &str,
             op: Comparison,
             value: &'s Value,
         ) -> Result<Filter<'s>, StoreError> {
@@ -1389,8 +1426,7 @@ impl<'a> Filter<'a> {
 
             if column.use_prefix_comparison() && !value.is_null() {
                 let column_type = column.column_type();
-                PrefixComparison::new(op, column, column_type, value)
-                    .map(|pc| Filter::PrefixCmp(pc))
+                PrefixComparison::new(op, column, column_type, value).map(Filter::PrefixCmp)
             } else {
                 let value = QueryValue::new(value, column.column_type())?;
                 Ok(Filter::Cmp(column, op, value))
@@ -1399,7 +1435,7 @@ impl<'a> Filter<'a> {
 
         fn contains<'s>(
             table: dsl::Table<'s>,
-            attr: &String,
+            attr: &str,
             op: ContainsOp,
             value: &'s Value,
         ) -> Result<Filter<'s>, StoreError> {
@@ -1476,7 +1512,7 @@ impl<'a> Filter<'a> {
             }
             NotIn(attr, values) => {
                 let column = table.column_for_field(attr.as_str())?;
-                let values = QueryValue::many(values, &column.column_type())?;
+                let values = QueryValue::many(values, column.column_type())?;
                 Ok(F::NotIn(column, values))
             }
             Contains(attr, value) => contains(table, attr, K::Like, value),
@@ -1709,7 +1745,7 @@ impl<'a> Filter<'a> {
 
         if have_non_nulls {
             if column.use_prefix_comparison()
-                && PrefixType::new(&column).is_ok()
+                && PrefixType::new(column).is_ok()
                 && values.iter().all(|v| match &v.value {
                     SqlValue::Text(s) => s.len() < STRING_PREFIX_SIZE,
                     SqlValue::String(s) => s.len() < STRING_PREFIX_SIZE,
@@ -1724,7 +1760,7 @@ impl<'a> Filter<'a> {
                 // query optimizer
                 // See PrefixComparison for a more detailed discussion of what
                 // is happening here
-                PrefixType::new(&column)?.push_column_prefix(&column, &mut out.reborrow())?;
+                PrefixType::new(column)?.push_column_prefix(column, &mut out.reborrow())?;
             } else {
                 column.walk_ast(out.reborrow())?;
             }
@@ -2186,7 +2222,7 @@ impl<'a> QueryFragment<Pg> for FindDerivedQuery<'a> {
         out.push_sql(self.table.qualified_name.as_str());
         out.push_sql(" e\n where ");
         // This clause with an empty array would filter out everything
-        if self.excluded_keys.len() > 0 {
+        if !self.excluded_keys.is_empty() {
             out.push_identifier(&self.table.primary_key().name)?;
             // For truly gigantic `excluded_keys` lists, this will be slow, and
             // we should rewrite this query to use a CTE or a temp table to hold
@@ -2270,7 +2306,7 @@ impl<'a> InsertRow<'a> {
                     })
                     .collect::<Result<_, _>>()?;
                 if let ColumnType::TSVector(config) = &column.column_type {
-                    InsertValue::Fulltext(fulltext_field_values, &config)
+                    InsertValue::Fulltext(fulltext_field_values, config)
                 } else {
                     return Err(StoreError::FulltextColumnMissingConfig);
                 }
@@ -2462,7 +2498,7 @@ impl<'a> ConflictingEntitiesQuery<'a> {
             .iter()
             .map(|entity| layout.table_for_entity(entity).map(|table| table.as_ref()))
             .collect::<Result<Vec<_>, _>>()?;
-        let ids = IdList::try_from_iter_ref(group.ids().map(|id| IdRef::from(id)))?;
+        let ids = IdList::try_from_iter_ref(group.ids().map(IdRef::from))?;
         Ok(ConflictingEntitiesQuery { tables, ids })
     }
 }
@@ -2971,11 +3007,11 @@ impl<'a> FilterWindow<'a> {
         out.push_sql("select '");
         out.push_sql(self.table.meta.object.as_str());
         out.push_sql("' as entity, c.id, c.vid, p.id::text as ");
-        out.push_sql(&*PARENT_ID);
+        out.push_sql(PARENT_ID);
         limit
             .sort_key
             .select(&mut out, SelectStatementLevel::InnerStatement)?;
-        self.children(true, &limit, &mut out)
+        self.children(true, limit, &mut out)
     }
 
     /// Collect all the parent id's from all windows
@@ -3541,7 +3577,7 @@ impl<'a> SortKey<'a> {
             direction: SortDirection,
         ) -> Result<Vec<ChildKeyAndIdSharedDetails<'a>>, QueryExecutionError> {
             assert!(entity_types.len() < 255);
-            return entity_types
+            entity_types
                 .iter()
                 .enumerate()
                 .map(|(i, entity_type)| {
@@ -3599,7 +3635,7 @@ impl<'a> SortKey<'a> {
                         })
                     }
                 })
-                .collect::<Result<Vec<ChildKeyAndIdSharedDetails<'a>>, QueryExecutionError>>();
+                .collect::<Result<Vec<ChildKeyAndIdSharedDetails<'a>>, QueryExecutionError>>()
         }
 
         fn with_child_interface_key<'a>(
@@ -3918,7 +3954,7 @@ impl<'a> SortKey<'a> {
     ) -> QueryResult<()> {
         fn order_by_parent_id(out: &mut AstPass<Pg>) {
             out.push_sql("order by ");
-            out.push_sql(&*PARENT_ID);
+            out.push_sql(PARENT_ID);
             out.push_sql(", ");
         }
 
@@ -4019,11 +4055,8 @@ impl<'a> SortKey<'a> {
                 ));
             }
 
-            match sort_by.column_type() {
-                ColumnType::TSVector(_) => {
-                    return Err(internal_error!("TSVector is not supported"));
-                }
-                _ => {}
+            if let ColumnType::TSVector(_) = sort_by.column_type() {
+                return Err(internal_error!("TSVector is not supported"));
             }
         }
 
@@ -4130,8 +4163,8 @@ impl<'a> SortKey<'a> {
             Ok(())
         }
 
-        match self {
-            SortKey::ChildKey(nested) => match nested {
+        if let SortKey::ChildKey(nested) = self {
+            match nested {
                 ChildKey::Single(child) => {
                     add(
                         &child.child_from,
@@ -4172,8 +4205,7 @@ impl<'a> SortKey<'a> {
                         out,
                     )?;
                 }
-            },
-            _ => {}
+            }
         }
         Ok(())
     }
@@ -4343,7 +4375,7 @@ impl<'a> FilterQuery<'a> {
         out.push_sql(" from (select ");
         write_column_names(&window.column_names, window.table, Some("c."), &mut out)?;
         out.push_sql(", p.id::text as ");
-        out.push_sql(&*PARENT_ID);
+        out.push_sql(PARENT_ID);
         window.children(false, &self.limit, &mut out)?;
         out.push_sql(") c");
         out.push_sql("\n ");
@@ -4617,7 +4649,7 @@ impl<'a> QueryFragment<Pg> for ClampRangeQuery<'a> {
         self.br_column.clamp(&mut out)?;
         out.push_sql("\n where ");
 
-        id_is_in(&self.entity_ids, &mut out)?;
+        id_is_in(self.entity_ids, &mut out)?;
         out.push_sql(" and (");
         self.br_column.latest(&mut out);
         out.push_sql(")");
@@ -5051,8 +5083,8 @@ fn jsonb_build_object(
 
 /// Helper function to iterate over the merged fields of BASE_SQL_COLUMNS and the provided attribute
 /// names, yielding valid SQL names for the given table.
-fn iter_column_names<'a, 'b>(
-    attribute_names: &'a BTreeSet<String>,
+fn iter_column_names<'b>(
+    attribute_names: &BTreeSet<String>,
     table: dsl::Table<'b>,
     include_block_range_column: bool,
 ) -> impl Iterator<Item = &'b str> {

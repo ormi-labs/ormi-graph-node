@@ -4,8 +4,8 @@ use graph::{
     cheap_clone::CheapClone,
     components::store::ChainStore as ChainStoreTrait,
     prelude::{
+        alloy::primitives::B256,
         anyhow::{self, anyhow, Context},
-        web3::types::H256,
     },
     slog::Logger,
 };
@@ -30,7 +30,7 @@ pub async fn by_number(
     logger: &Logger,
     delete_duplicates: bool,
 ) -> anyhow::Result<()> {
-    let block_hashes = steps::resolve_block_hash_from_block_number(number, &chain_store)?;
+    let block_hashes = steps::resolve_block_hash_from_block_number(number, &chain_store).await?;
 
     match &block_hashes.as_slice() {
         [] => bail!("Could not find a block with number {} in store", number),
@@ -54,14 +54,15 @@ pub async fn by_range(
     let range = ranges::Range::new(range_from, range_to)?;
     let max = match range.upper_bound {
         // When we have an open upper bound, we use the chain head's block number
-        None => steps::find_chain_head(&chain_store)?,
+        None => steps::find_chain_head(&chain_store).await?,
         Some(x) => x,
     };
     // FIXME: This performs poorly.
     // TODO: This could be turned into async code
     for block_number in range.lower_bound..=max {
         println!("Checking block [{block_number}/{max}]");
-        let block_hashes = steps::resolve_block_hash_from_block_number(block_number, &chain_store)?;
+        let block_hashes =
+            steps::resolve_block_hash_from_block_number(block_number, &chain_store).await?;
         match &block_hashes.as_slice() {
             [] => eprintln!("Found no block hash with number {block_number}"),
             [block_hash] => {
@@ -87,7 +88,7 @@ pub async fn by_range(
     Ok(())
 }
 
-pub fn truncate(chain_store: Arc<ChainStore>, skip_confirmation: bool) -> anyhow::Result<()> {
+pub async fn truncate(chain_store: Arc<ChainStore>, skip_confirmation: bool) -> anyhow::Result<()> {
     let prompt = format!(
         "This will delete all cached blocks for {}.\nProceed?",
         chain_store.chain
@@ -99,11 +100,12 @@ pub fn truncate(chain_store: Arc<ChainStore>, skip_confirmation: bool) -> anyhow
 
     chain_store
         .truncate_block_cache()
+        .await
         .with_context(|| format!("Failed to truncate block cache for {}", chain_store.chain))
 }
 
 async fn run(
-    block_hash: &H256,
+    block_hash: &B256,
     chain_store: Arc<ChainStore>,
     ethereum_adapter: &EthereumAdapter,
     logger: &Logger,
@@ -115,14 +117,14 @@ async fn run(
     let diff = steps::diff_block_pair(&cached_block, &provider_block);
     steps::report_difference(diff.as_deref(), block_hash);
     if diff.is_some() {
-        steps::delete_block(block_hash, &chain_store)?;
+        steps::delete_block(block_hash, &chain_store).await?;
     }
     Ok(())
 }
 
 async fn handle_multiple_block_hashes(
     block_number: i32,
-    block_hashes: &[H256],
+    block_hashes: &[B256],
     chain_store: &ChainStore,
     delete_duplicates: bool,
 ) -> anyhow::Result<()> {
@@ -138,7 +140,7 @@ async fn handle_multiple_block_hashes(
     if delete_duplicates {
         println!("Deleting duplicated blocks...");
         for hash in block_hashes {
-            steps::delete_block(hash, chain_store)?;
+            steps::delete_block(hash, chain_store).await?;
         }
     } else {
         eprintln!(
@@ -155,7 +157,10 @@ mod steps {
 
     use graph::{
         anyhow::bail,
-        prelude::serde_json::{self, Value},
+        prelude::{
+            alloy::primitives::B256,
+            serde_json::{self, Value},
+        },
     };
     use json_structural_diff::{colorize as diff_to_string, JsonDiff};
 
@@ -164,14 +169,14 @@ mod steps {
     /// Multiple block hashes can be returned as the store does not enforce uniqueness based on
     /// block numbers.
     /// Returns an empty vector if no block hash is found.
-    pub(super) fn resolve_block_hash_from_block_number(
+    pub(super) async fn resolve_block_hash_from_block_number(
         number: i32,
         chain_store: &ChainStore,
-    ) -> anyhow::Result<Vec<H256>> {
-        let block_hashes = chain_store.block_hashes_by_block_number(number)?;
+    ) -> anyhow::Result<Vec<B256>> {
+        let block_hashes = chain_store.block_hashes_by_block_number(number).await?;
         Ok(block_hashes
             .into_iter()
-            .map(|x| H256::from_slice(&x.as_slice()[..32]))
+            .map(|x| B256::from_slice(&x.as_slice()[..32]))
             .collect())
     }
 
@@ -179,7 +184,7 @@ mod steps {
     ///
     /// Errors on a non-unary result.
     pub(super) async fn fetch_single_cached_block(
-        block_hash: H256,
+        block_hash: B256,
         chain_store: Arc<ChainStore>,
     ) -> anyhow::Result<Value> {
         let blocks = chain_store.blocks(vec![block_hash.into()]).await?;
@@ -197,7 +202,7 @@ mod steps {
     /// Errors on provider failure or if the returned block has a different hash than the one
     /// requested.
     pub(super) async fn fetch_single_provider_block(
-        block_hash: &H256,
+        block_hash: &B256,
         ethereum_adapter: &EthereumAdapter,
         logger: &Logger,
     ) -> anyhow::Result<Value> {
@@ -207,7 +212,7 @@ mod steps {
             .with_context(|| format!("failed to fetch block {block_hash}"))?
             .ok_or_else(|| anyhow!("JRPC provider found no block with hash {block_hash:?}"))?;
         ensure!(
-            provider_block.hash == Some(*block_hash),
+            provider_block.header.hash == *block_hash,
             "Provider responded with a different block hash"
         );
         serde_json::to_value(provider_block)
@@ -235,7 +240,7 @@ mod steps {
     }
 
     /// Prints the difference between two [`serde_json::Value`] values to the user.
-    pub(super) fn report_difference(difference: Option<&str>, hash: &H256) {
+    pub(super) fn report_difference(difference: Option<&str>, hash: &B256) {
         if let Some(diff) = difference {
             eprintln!("block {hash} diverges from cache:");
             eprintln!("{diff}");
@@ -245,29 +250,29 @@ mod steps {
     }
 
     /// Attempts to delete a block from the block cache.
-    pub(super) fn delete_block(hash: &H256, chain_store: &ChainStore) -> anyhow::Result<()> {
+    pub(super) async fn delete_block(hash: &B256, chain_store: &ChainStore) -> anyhow::Result<()> {
         println!("Deleting block {hash} from cache.");
-        chain_store.delete_blocks(&[hash])?;
+        chain_store.delete_blocks(&[hash]).await?;
         println!("Done.");
         Ok(())
     }
 
     /// Queries the [`ChainStore`] about the chain head.
-    pub(super) fn find_chain_head(chain_store: &ChainStore) -> anyhow::Result<i32> {
-        let chain_head: Option<i32> = chain_store.chain_head_block(&chain_store.chain)?;
+    pub(super) async fn find_chain_head(chain_store: &ChainStore) -> anyhow::Result<i32> {
+        let chain_head: Option<i32> = chain_store.chain_head_block(&chain_store.chain).await?;
         chain_head.ok_or_else(|| anyhow!("Could not find the chain head for {}", chain_store.chain))
     }
 }
 
 mod helpers {
     use super::*;
-    use graph::prelude::hex;
+    use graph::prelude::{alloy::primitives::B256, hex};
 
-    /// Tries to parse a [`H256`] from a hex string.
-    pub(super) fn parse_block_hash(hash: &str) -> anyhow::Result<H256> {
+    /// Tries to parse a [`B256`] from a hex string.
+    pub(super) fn parse_block_hash(hash: &str) -> anyhow::Result<B256> {
         let hash = hash.trim_start_matches("0x");
         let hash = hex::decode(hash)?;
-        Ok(H256::from_slice(&hash))
+        Ok(B256::from_slice(&hash))
     }
 }
 

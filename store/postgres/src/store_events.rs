@@ -2,10 +2,12 @@ use graph::futures01::Stream;
 use graph::futures03::compat::Stream01CompatExt;
 use graph::futures03::stream::StreamExt;
 use graph::futures03::TryStreamExt;
-use graph::tokio_stream::wrappers::ReceiverStream;
-use std::sync::{atomic::Ordering, Arc, RwLock};
+use std::sync::{atomic::Ordering, Arc};
+
+use graph::parking_lot::RwLock;
 use std::{collections::HashMap, sync::atomic::AtomicUsize};
 use tokio::sync::mpsc::{channel, Sender};
+use tokio_stream::wrappers::ReceiverStream;
 
 use crate::notification_listener::{NotificationListener, SafeChannelName};
 use graph::components::store::SubscriptionManager as SubscriptionManagerTrait;
@@ -92,15 +94,21 @@ pub struct SubscriptionManager {
 
     /// Keep the notification listener alive
     listener: StoreEventListener,
+
+    logger: Logger,
 }
 
 impl SubscriptionManager {
     pub fn new(logger: Logger, postgres_url: String, registry: Arc<MetricsRegistry>) -> Self {
-        let (listener, store_events) = StoreEventListener::new(logger, postgres_url, registry);
+        let logger = logger.new(o!("component" => "StoreEventListener"));
+
+        let (listener, store_events) =
+            StoreEventListener::new(logger.cheap_clone(), postgres_url, registry);
 
         let mut manager = SubscriptionManager {
             subscriptions: Arc::new(RwLock::new(HashMap::new())),
             listener,
+            logger,
         };
 
         // Deal with store subscriptions
@@ -112,6 +120,32 @@ impl SubscriptionManager {
         manager
     }
 
+    async fn broadcast_event(
+        logger: &Logger,
+        subscriptions: &Arc<RwLock<HashMap<usize, Sender<Arc<StoreEvent>>>>>,
+        event: StoreEvent,
+    ) {
+        let event = Arc::new(event);
+
+        // Send to `subscriptions`.
+        {
+            let senders = subscriptions.read().clone();
+
+            // Write change to all matching subscription streams; remove subscriptions
+            // whose receiving end has been dropped
+            for (id, sender) in senders {
+                if let Err(e) = sender.send(event.cheap_clone()).await {
+                    error!(
+                        logger,
+                        "Failed to send store event to subscriber {}: {}", id, e
+                    );
+                    // Receiver was dropped
+                    subscriptions.write().remove(&id);
+                }
+            }
+        }
+    }
+
     /// Receive store events from Postgres and send them to all active
     /// subscriptions. Detect stale subscriptions in the process and
     /// close them.
@@ -121,24 +155,22 @@ impl SubscriptionManager {
     ) {
         let subscriptions = self.subscriptions.cheap_clone();
         let mut store_events = store_events.compat();
+        let logger = self.logger.cheap_clone();
 
         // This channel is constantly receiving things and there are locks involved,
         // so it's best to use a blocking task.
         graph::spawn_blocking(async move {
-            while let Some(Ok(event)) = store_events.next().await {
-                let event = Arc::new(event);
-
-                // Send to `subscriptions`.
-                {
-                    let senders = subscriptions.read().unwrap().clone();
-
-                    // Write change to all matching subscription streams; remove subscriptions
-                    // whose receiving end has been dropped
-                    for (id, sender) in senders {
-                        if sender.send(event.cheap_clone()).await.is_err() {
-                            // Receiver was dropped
-                            subscriptions.write().unwrap().remove(&id);
-                        }
+            loop {
+                match store_events.next().await {
+                    Some(Ok(event)) => {
+                        Self::broadcast_event(&logger, &subscriptions, event).await;
+                    }
+                    Some(Err(_)) => {
+                        error!(logger, "Error receiving store event");
+                    }
+                    None => {
+                        error!(logger, "Store event stream ended");
+                        break;
                     }
                 }
             }
@@ -147,6 +179,7 @@ impl SubscriptionManager {
 
     fn periodically_clean_up_stale_subscriptions(&self) {
         let subscriptions = self.subscriptions.cheap_clone();
+        let logger = self.logger.cheap_clone();
 
         // Clean up stale subscriptions every 5s
         graph::spawn(async move {
@@ -156,19 +189,20 @@ impl SubscriptionManager {
 
                 // Cleanup `subscriptions`.
                 {
-                    let mut subscriptions = subscriptions.write().unwrap();
+                    let mut subscriptions = subscriptions.write();
 
                     // Obtain IDs of subscriptions whose receiving end has gone
                     let stale_ids = subscriptions
                         .iter_mut()
                         .filter_map(|(id, sender)| match sender.is_closed() {
-                            true => Some(id.clone()),
+                            true => Some(*id),
                             false => None,
                         })
                         .collect::<Vec<_>>();
 
                     // Remove all stale subscriptions
                     for id in stale_ids {
+                        warn!(logger, "Removing stale subscription {}", id);
                         subscriptions.remove(&id);
                     }
                 }
@@ -186,9 +220,9 @@ impl SubscriptionManagerTrait for SubscriptionManager {
         let (sender, receiver) = channel(100);
 
         // Add the new subscription
-        self.subscriptions.write().unwrap().insert(id, sender);
+        self.subscriptions.write().insert(id, sender);
 
         // Return the subscription ID and entity change stream
-        StoreEventStream::new(Box::new(ReceiverStream::new(receiver).map(Ok).compat()))
+        ReceiverStream::new(receiver)
     }
 }

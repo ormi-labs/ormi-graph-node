@@ -7,6 +7,7 @@ use std::time::Duration;
 use assert_json_diff::assert_json_eq;
 use graph::blockchain::block_stream::BlockWithTriggers;
 use graph::blockchain::{Block, BlockPtr, Blockchain};
+use graph::components::subgraph::SubgraphInstanceManager as _;
 use graph::data::store::scalar::Bytes;
 use graph::data::subgraph::schema::{SubgraphError, SubgraphHealth};
 use graph::data::value::Word;
@@ -14,15 +15,13 @@ use graph::data_source::CausalityRegion;
 use graph::env::{EnvVars, TEST_WITH_NO_REORG};
 use graph::ipfs::test_utils::add_files_to_local_ipfs_node_for_testing;
 use graph::object;
-use graph::prelude::ethabi::ethereum_types::H256;
-use graph::prelude::web3::types::Address;
-use graph::prelude::{hex, CheapClone, SubgraphAssignmentProvider, SubgraphName, SubgraphStore};
+use graph::prelude::alloy::primitives::{Address, B256, U256};
+use graph::prelude::{hex, CheapClone, SubgraphName, SubgraphStore};
 use graph_tests::fixture::ethereum::{
     chain, empty_block, generate_empty_blocks_for_range, genesis, push_test_command, push_test_log,
     push_test_polling_trigger,
 };
 
-use graph_tests::fixture::substreams::chain as substreams_chain;
 use graph_tests::fixture::{
     self, test_ptr, test_ptr_reorged, MockAdapterSelector, NoopAdapterSelector, TestChainTrait,
     TestContext, TestInfo,
@@ -37,14 +36,14 @@ fn assert_eq_ignore_backtrace(err: &SubgraphError, expected: &SubgraphError) {
             || err.handler != expected.handler
             || err.deterministic != expected.deterministic
         {
-            false;
+            false
+        } else {
+            // Ignore any WASM backtrace in the error message
+            let split_err: Vec<&str> = err.message.split("\\twasm backtrace:").collect();
+            let split_expected: Vec<&str> = expected.message.split("\\twasm backtrace:").collect();
+
+            split_err.first() == split_expected.first()
         }
-
-        // Ignore any WASM backtrace in the error message
-        let split_err: Vec<&str> = err.message.split("\\twasm backtrace:").collect();
-        let split_expected: Vec<&str> = expected.message.split("\\twasm backtrace:").collect();
-
-        split_err.get(0) == split_expected.get(0)
     };
 
     if !equal {
@@ -55,7 +54,7 @@ fn assert_eq_ignore_backtrace(err: &SubgraphError, expected: &SubgraphError) {
     }
 }
 
-#[tokio::test]
+#[graph::test]
 async fn data_source_revert() -> anyhow::Result<()> {
     *TEST_WITH_NO_REORG.lock().unwrap() = true;
 
@@ -67,7 +66,7 @@ async fn data_source_revert() -> anyhow::Result<()> {
         let block1 = empty_block(block0.ptr(), test_ptr(1));
         let block1_reorged_ptr = BlockPtr {
             number: 1,
-            hash: H256::from_low_u64_be(12).into(),
+            hash: B256::from(U256::from(12)).into(),
         };
         let block1_reorged = empty_block(block0.ptr(), block1_reorged_ptr.clone());
         let block2 = empty_block(block1_reorged_ptr, test_ptr(2));
@@ -84,9 +83,8 @@ async fn data_source_revert() -> anyhow::Result<()> {
     base_ctx.start_and_sync_to(stop_block).await;
     base_ctx
         .provider
-        .stop(base_ctx.deployment.clone())
-        .await
-        .unwrap();
+        .stop_subgraph(base_ctx.deployment.clone())
+        .await;
 
     // Test loading data sources from DB.
     let stop_block = test_ptr(3);
@@ -178,7 +176,7 @@ async fn data_source_long_revert() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test]
+#[graph::test]
 async fn typename() -> anyhow::Result<()> {
     let RunnerTestRecipe { stores, test_info } =
         RunnerTestRecipe::new("typename", "typename").await;
@@ -188,7 +186,7 @@ async fn typename() -> anyhow::Result<()> {
         let block_1 = empty_block(block_0.ptr(), test_ptr(1));
         let block_1_reorged_ptr = BlockPtr {
             number: 1,
-            hash: H256::from_low_u64_be(12).into(),
+            hash: B256::from(U256::from(12)).into(),
         };
         let block_1_reorged = empty_block(block_0.ptr(), block_1_reorged_ptr);
         let block_2 = empty_block(block_1_reorged.ptr(), test_ptr(2));
@@ -206,7 +204,7 @@ async fn typename() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test]
+#[graph::test]
 async fn api_version_0_0_7() {
     let RunnerTestRecipe { stores, test_info } = RunnerTestRecipe::new_with_custom_cmd(
         "api_version_0_0_7",
@@ -234,7 +232,7 @@ async fn api_version_0_0_7() {
     ctx.start_and_sync_to(stop_block).await;
 
     let query_res = ctx
-        .query(&format!(r#"{{ testResults{{ id, message }} }}"#,))
+        .query(r#"{ testResults{ id, message } }"#)
         .await
         .unwrap();
 
@@ -248,7 +246,7 @@ async fn api_version_0_0_7() {
     );
 }
 
-#[tokio::test]
+#[graph::test]
 async fn api_version_0_0_8() {
     let RunnerTestRecipe { stores, test_info } = RunnerTestRecipe::new_with_custom_cmd(
         "api_version_0_0_8",
@@ -282,7 +280,7 @@ async fn api_version_0_0_8() {
     assert_eq_ignore_backtrace(&err, &expected_err);
 }
 
-#[tokio::test]
+#[graph::test]
 async fn derived_loaders() {
     let RunnerTestRecipe { stores, test_info } =
         RunnerTestRecipe::new("derived_loaders", "derived-loaders").await;
@@ -318,9 +316,7 @@ async fn derived_loaders() {
     // Where the test cases are documented in the code.
 
     let query_res = ctx
-    .query(&format!(
-        r#"{{ testResult(id:"1_0", block: {{ number: 1 }} ){{ id barDerived{{id value value2}} bBarDerived{{id value value2}} }} }}"#,
-    ))
+    .query(r#"{ testResult(id:"1_0", block: { number: 1 } ){ id barDerived{id value value2} bBarDerived{id value value2} } }"#)
     .await
     .unwrap();
 
@@ -368,9 +364,7 @@ async fn derived_loaders() {
     );
 
     let query_res = ctx
-    .query(&format!(
-        r#"{{ testResult(id:"1_1", block: {{ number: 1 }} ){{ id barDerived{{id value value2}} bBarDerived{{id value value2}} }} }}"#,
-    ))
+    .query(r#"{ testResult(id:"1_1", block: { number: 1 } ){ id barDerived{id value value2} bBarDerived{id value value2} } }"#)
     .await
     .unwrap();
 
@@ -408,9 +402,7 @@ async fn derived_loaders() {
     );
 
     let query_res = ctx.query(
-    &format!(
-        r#"{{ testResult(id:"2_0" ){{ id barDerived{{id value value2}} bBarDerived{{id value value2}} }} }}"#
-    )
+    r#"{ testResult(id:"2_0" ){ id barDerived{id value value2} bBarDerived{id value value2} } }"#
 )
 .await
 .unwrap();
@@ -438,38 +430,7 @@ async fn derived_loaders() {
     );
 }
 
-// This PR https://github.com/graphprotocol/graph-node/pull/4787
-// changed the way TriggerFilters were built
-// A bug was introduced in the PR which resulted in filters for substreams not being included
-// This test tests that the TriggerFilter is built correctly for substreams
-#[tokio::test]
-async fn substreams_trigger_filter_construction() -> anyhow::Result<()> {
-    let RunnerTestRecipe { stores, test_info } =
-        RunnerTestRecipe::new("substreams", "substreams").await;
-
-    let chain = substreams_chain(&test_info.test_name, &stores).await;
-    let ctx = fixture::setup(&test_info, &stores, &chain, None, None).await;
-
-    let runner = ctx.runner_substreams(test_ptr(0)).await;
-    let filter = runner.build_filter_for_test();
-
-    assert_eq!(filter.chain_filter.module_name(), "graph_out");
-    assert_eq!(
-        filter
-            .chain_filter
-            .modules()
-            .as_ref()
-            .unwrap()
-            .modules
-            .len(),
-        2
-    );
-    assert_eq!(filter.chain_filter.start_block().unwrap(), 0);
-    assert_eq!(filter.chain_filter.data_sources_len(), 1);
-    Ok(())
-}
-
-#[tokio::test]
+#[graph::test]
 async fn end_block() -> anyhow::Result<()> {
     let RunnerTestRecipe { stores, test_info } =
         RunnerTestRecipe::new("end_block", "end-block").await;
@@ -494,9 +455,9 @@ async fn end_block() -> anyhow::Result<()> {
             .collect::<Vec<_>>();
 
         if should_contain_addr {
-            assert!(addresses.contains(&addr));
+            assert!(addresses.contains(addr));
         } else {
-            assert!(!addresses.contains(&addr));
+            assert!(!addresses.contains(addr));
         };
     }
 
@@ -546,7 +507,7 @@ async fn end_block() -> anyhow::Result<()> {
 
     // Simulate a chain reorg and ensure the filter rebuilds accurately post-reorg.
     {
-        ctx.rewind(test_ptr(6));
+        ctx.rewind(test_ptr(6)).await;
 
         let mut blocks = blocks[0..8].to_vec().clone();
 
@@ -593,7 +554,7 @@ async fn end_block() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test]
+#[graph::test]
 async fn file_data_sources() {
     let RunnerTestRecipe { stores, test_info } =
         RunnerTestRecipe::new("file-data-sourcess", "file-data-sources").await;
@@ -731,7 +692,7 @@ async fn file_data_sources() {
 
     // Should not allow creating conflicting entity. ie: Entity created in offchain handler cannot be created in onchain handler
     {
-        ctx.rewind(test_ptr(4));
+        ctx.rewind(test_ptr(4)).await;
 
         let mut blocks = blocks.clone();
         blocks.retain(|block| block.block.number() <= 4);
@@ -756,7 +717,7 @@ async fn file_data_sources() {
 
     // Should not allow accessing entities created in offchain handlers in onchain handlers
     {
-        ctx.rewind(test_ptr(4));
+        ctx.rewind(test_ptr(4)).await;
 
         let mut blocks = blocks.clone();
         blocks.retain(|block| block.block.number() <= 4);
@@ -789,7 +750,7 @@ async fn file_data_sources() {
 
     // Prevent access to entities created by offchain handlers when using derived loaders in onchain handlers.
     {
-        ctx.rewind(test_ptr(4));
+        ctx.rewind(test_ptr(4)).await;
 
         let mut blocks = blocks.clone();
         blocks.retain(|block| block.block.number() <= 4);
@@ -832,7 +793,7 @@ async fn file_data_sources() {
 
     // Should not allow creating entity that is not declared in the manifest for the offchain datasource
     {
-        ctx.rewind(test_ptr(4));
+        ctx.rewind(test_ptr(4)).await;
 
         let mut blocks = blocks.clone();
         blocks.retain(|block| block.block.number() <= 4);
@@ -851,7 +812,7 @@ async fn file_data_sources() {
     }
 }
 
-#[tokio::test]
+#[graph::test]
 async fn block_handlers() {
     let RunnerTestRecipe { stores, test_info } =
         RunnerTestRecipe::new("block_handlers", "block-handlers").await;
@@ -975,7 +936,7 @@ async fn block_handlers() {
     );
 }
 
-#[tokio::test]
+#[graph::test]
 async fn template_static_filters_false_positives() {
     let RunnerTestRecipe { stores, test_info } = RunnerTestRecipe::new(
         "template_static_filters_false_positives",
@@ -1015,7 +976,7 @@ async fn template_static_filters_false_positives() {
     );
 }
 
-#[tokio::test]
+#[graph::test]
 async fn parse_data_source_context() {
     let RunnerTestRecipe { stores, test_info } =
         RunnerTestRecipe::new("parse_data_source_context", "data-sources").await;
@@ -1043,7 +1004,7 @@ async fn parse_data_source_context() {
     );
 }
 
-#[tokio::test]
+#[graph::test]
 async fn retry_create_ds() {
     let RunnerTestRecipe { stores, test_info } =
         RunnerTestRecipe::new("retry_create_ds", "data-source-revert2").await;
@@ -1053,7 +1014,7 @@ async fn retry_create_ds() {
         let block1 = empty_block(block0.ptr(), test_ptr(1));
         let block1_reorged_ptr = BlockPtr {
             number: 1,
-            hash: H256::from_low_u64_be(12).into(),
+            hash: B256::from(U256::from(12)).into(),
         };
         let block1_reorged = empty_block(block0.ptr(), block1_reorged_ptr);
         let block2 = empty_block(block1_reorged.ptr(), test_ptr(2));
@@ -1100,7 +1061,7 @@ async fn retry_create_ds() {
     assert_eq!(runner.context().hosts_len(), 2);
 }
 
-#[tokio::test]
+#[graph::test]
 async fn fatal_error() -> anyhow::Result<()> {
     let RunnerTestRecipe { stores, test_info } =
         RunnerTestRecipe::new("fatal_error", "fatal-error").await;
@@ -1157,7 +1118,7 @@ async fn fatal_error() -> anyhow::Result<()> {
     assert!(poi2 != poi100);
 
     // Test that rewind unfails the subgraph.
-    ctx.rewind(test_ptr(1));
+    ctx.rewind(test_ptr(1)).await;
     let status = ctx.indexing_status().await;
     assert!(status.health == SubgraphHealth::Healthy);
     assert!(status.fatal_error.is_none());
@@ -1165,7 +1126,7 @@ async fn fatal_error() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test]
+#[graph::test]
 async fn arweave_file_data_sources() {
     let RunnerTestRecipe { stores, test_info } =
         RunnerTestRecipe::new("arweave_file_data_sources", "arweave-file-data-sources").await;
@@ -1208,14 +1169,14 @@ async fn arweave_file_data_sources() {
     assert_eq!(datasources.len(), 1);
     let ds = datasources.first().unwrap();
     assert_ne!(ds.causality_region, CausalityRegion::ONCHAIN);
-    assert_eq!(ds.done_at.is_some(), true);
+    assert!(ds.done_at.is_some());
     assert_eq!(
         ds.param.as_ref().unwrap(),
         &Bytes::from(Word::from(id).as_bytes())
     );
 
     let content_bytes = ctx.arweave_resolver.get(&Word::from(id)).await.unwrap();
-    let content = String::from_utf8(content_bytes.into()).unwrap();
+    let content = String::from_utf8(content_bytes).unwrap();
     let query_res = ctx
         .query(&format!(r#"{{ file(id: "{id}") {{ id, content }} }}"#,))
         .await

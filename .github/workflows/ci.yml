@@ -4,6 +4,7 @@ on:
     branches: [master]
   pull_request:
     branches: [master]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -17,6 +18,7 @@ env:
   RUST_BACKTRACE: full
   RUSTFLAGS: "-C link-arg=-fuse-ld=lld -D warnings"
   THEGRAPH_STORE_POSTGRES_DIESEL_URL: "postgresql://graph:graph@localhost:5432/graph-test"
+  GRAPH_STORE_CONNECTION_TIMEOUT: "30000"
 
 jobs:
   unit-tests:
@@ -56,12 +58,6 @@ jobs:
 
       - name: Setup just
         uses: extractions/setup-just@e33e0265a09d6d736e2ee1e0eb685ef1de4669ff # v3
-
-      - name: Install cargo-nextest
-        uses: baptiste0928/cargo-install@e38323ef017552d7f7af73a3f4db467f278310ed # v3
-        with:
-          crate: cargo-nextest
-          version: ^0.9
 
       - name: Run unit tests
         run: just test-unit --verbose
@@ -103,12 +99,6 @@ jobs:
 
       - name: Setup just
         uses: extractions/setup-just@e33e0265a09d6d736e2ee1e0eb685ef1de4669ff # v3
-
-      - name: Install cargo-nextest
-        uses: baptiste0928/cargo-install@e38323ef017552d7f7af73a3f4db467f278310ed # v3
-        with:
-          crate: cargo-nextest
-          version: ^0.9
 
       - name: Install pnpm
         uses: pnpm/action-setup@a7487c7e89a18df4991f7f222e4898a00d66ddda # v4
@@ -163,16 +153,10 @@ jobs:
       - name: Setup just
         uses: extractions/setup-just@e33e0265a09d6d736e2ee1e0eb685ef1de4669ff # v3
 
-      - name: Install cargo-nextest
-        uses: baptiste0928/cargo-install@e38323ef017552d7f7af73a3f4db467f278310ed # v3
-        with:
-          crate: cargo-nextest
-          version: ^0.9
-
       - name: Install Foundry
         uses: foundry-rs/foundry-toolchain@82dee4ba654bd2146511f85f0d013af94670c4de # v1
         with:
-          version: nightly
+          version: v1.4.0
 
       - name: Install pnpm
         uses: pnpm/action-setup@a7487c7e89a18df4991f7f222e4898a00d66ddda # v4
@@ -236,7 +220,7 @@ jobs:
 
       - name: Run linting
         run: just lint
-  
+
   release-check:
     name: Build in release mode
     runs-on: ubuntu-latest

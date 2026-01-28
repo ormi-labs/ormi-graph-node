@@ -1,4 +1,4 @@
-use diesel::{self, PgConnection};
+use diesel;
 use graph::blockchain::mock::MockDataSource;
 use graph::blockchain::BlockTime;
 use graph::blockchain::ChainIdentifier;
@@ -10,6 +10,7 @@ use graph::data::subgraph::schema::{DeploymentCreate, SubgraphError};
 use graph::data::subgraph::SubgraphFeature;
 use graph::data_source::DataSource;
 use graph::log;
+use graph::prelude::alloy::primitives::B256;
 use graph::prelude::{QueryStoreManager as _, SubgraphStore as _, *};
 use graph::schema::EntityType;
 use graph::schema::InputSchema;
@@ -25,6 +26,7 @@ use graph_graphql::prelude::{
 use graph_graphql::test_support::GraphQLMetrics;
 use graph_node::config::{Config, Opt};
 use graph_node::store_builder::StoreBuilder;
+use graph_store_postgres::AsyncPgConnection;
 use graph_store_postgres::{
     layout_for_tests::FAKE_NETWORK_SHARED, BlockStore as DieselBlockStore, ConnectionPool,
     DeploymentPlacer, Shard, SubgraphStore as DieselSubgraphStore, SubscriptionManager,
@@ -36,8 +38,6 @@ use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::time::Instant;
 use std::{marker::PhantomData, sync::Mutex};
-use tokio::runtime::{Builder, Runtime};
-use web3::types::H256;
 
 pub const NETWORK_NAME: &str = "fake_network";
 pub const DATA_SOURCE_KIND: &str = "mock/kind";
@@ -53,8 +53,6 @@ lazy_static! {
         None => Logger::root(slog::Discard, o!()),
     };
     static ref SEQ_LOCK: Mutex<()> = Mutex::new(());
-    pub static ref STORE_RUNTIME: Runtime =
-        Builder::new_multi_thread().enable_all().build().unwrap();
     pub static ref METRICS_REGISTRY: Arc<MetricsRegistry> = Arc::new(MetricsRegistry::mock());
     pub static ref LOAD_MANAGER: Arc<LoadManager> = Arc::new(LoadManager::new(
         &LOGGER,
@@ -69,16 +67,16 @@ lazy_static! {
     static ref CONFIG: Config = STORE_POOL_CONFIG.2.clone();
     pub static ref NODE_ID: NodeId = NodeId::new("test").unwrap();
     pub static ref SUBGRAPH_STORE: Arc<DieselSubgraphStore> = STORE.subgraph_store();
-    static ref BLOCK_STORE: Arc<DieselBlockStore> = STORE.block_store();
+    static ref BLOCK_STORE: DieselBlockStore = STORE.block_store();
     pub static ref GENESIS_PTR: BlockPtr = (
-        H256::from(hex!(
+        B256::from(hex!(
             "bd34884280958002c51d3f7b5f853e6febeba33de0f40d15b0363006533c924f"
         )),
         0u64
     )
         .into();
     pub static ref BLOCK_ONE: BlockPtr = (
-        H256::from(hex!(
+        B256::from(hex!(
             "8511fa04b64657581e3f00e14543c1d522d5d7e771b54aa3060b662ade47da13"
         )),
         1u64
@@ -86,14 +84,15 @@ lazy_static! {
         .into();
     pub static ref BLOCKS: [BlockPtr; 4] = {
         let two: BlockPtr = (
-            H256::from(hex!(
+            B256::from(hex!(
                 "b98fb783b49de5652097a989414c767824dff7e7fd765a63b493772511db81c1"
             )),
             2u64,
         )
             .into();
+
         let three: BlockPtr = (
-            H256::from(hex!(
+            B256::from(hex!(
                 "977c084229c72a0fa377cae304eda9099b6a2cb5d83b25cdf0f0969b69874255"
             )),
             3u64,
@@ -118,16 +117,17 @@ where
         Err(err) => err.into_inner(),
     };
 
-    STORE_RUNTIME.handle().block_on(async {
+    graph::TEST_RUNTIME.handle().block_on(async {
         let store = STORE.clone();
         test(store).await
     })
 }
 
 /// Run a test with a connection into the primary database, not a full store
-pub fn run_test_with_conn<F>(test: F)
+#[allow(clippy::await_holding_lock)]
+pub async fn run_test_with_conn<F>(test: F)
 where
-    F: FnOnce(&mut PgConnection),
+    F: AsyncFnOnce(&mut AsyncPgConnection),
 {
     // Lock regardless of poisoning. This also forces sequential test execution.
     let _lock = match SEQ_LOCK.lock() {
@@ -137,14 +137,17 @@ where
 
     let mut conn = PRIMARY_POOL
         .get()
+        .await
         .expect("failed to get connection for primary database");
 
-    test(&mut conn);
+    test(&mut conn).await;
 }
 
-pub fn remove_subgraphs() {
+/// Removes test data from the database behind the store.
+pub async fn remove_subgraphs() {
     SUBGRAPH_STORE
-        .delete_all_entities_for_test_use_only()
+        .remove_all_subgraphs_for_test_use_only()
+        .await
         .expect("deleting test entities succeeds");
 }
 
@@ -187,14 +190,16 @@ pub async fn create_subgraph_with_manifest(
     let yaml = serde_yaml::to_string(&yaml).unwrap();
     let deployment = DeploymentCreate::new(yaml, &manifest, None).graft(base);
     let name = SubgraphName::new_unchecked(subgraph_id.to_string());
-    let deployment = SUBGRAPH_STORE.create_deployment_replace(
-        name,
-        &schema,
-        deployment,
-        NODE_ID.clone(),
-        NETWORK_NAME.to_string(),
-        SubgraphVersionSwitchingMode::Instant,
-    )?;
+    let deployment = SUBGRAPH_STORE
+        .create_deployment_replace(
+            name,
+            &schema,
+            deployment,
+            NODE_ID.clone(),
+            NETWORK_NAME.to_string(),
+            SubgraphVersionSwitchingMode::Instant,
+        )
+        .await?;
 
     SUBGRAPH_STORE
         .cheap_clone()
@@ -249,20 +254,21 @@ pub async fn create_test_subgraph_with_features(
 
     SUBGRAPH_STORE
         .create_subgraph_features(deployment_features)
+        .await
         .unwrap();
 
     locator
 }
 
-pub fn remove_subgraph(id: &DeploymentHash) {
+pub async fn remove_subgraph(id: &DeploymentHash) {
     let name = SubgraphName::new_unchecked(id.to_string());
-    SUBGRAPH_STORE.remove_subgraph(name).unwrap();
-    let locs = SUBGRAPH_STORE.locators(id.as_str()).unwrap();
-    let mut conn = primary_connection();
+    SUBGRAPH_STORE.remove_subgraph(name).await.unwrap();
+    let locs = SUBGRAPH_STORE.locators(id.as_str()).await.unwrap();
+    let mut conn = primary_connection().await;
     for loc in locs {
-        let site = conn.locate_site(loc.clone()).unwrap().unwrap();
-        conn.unassign_subgraph(&site).unwrap();
-        SUBGRAPH_STORE.remove_deployment(site.id).unwrap();
+        let site = conn.locate_site(loc.clone()).await.unwrap().unwrap();
+        conn.unassign_subgraph(&site).await.unwrap();
+        SUBGRAPH_STORE.remove_deployment(site.id).await.unwrap();
     }
 }
 
@@ -282,7 +288,7 @@ pub async fn transact_errors(
         deployment.hash.clone(),
         "transact",
         metrics_registry.clone(),
-        store.subgraph_store().shard(deployment)?.to_string(),
+        store.subgraph_store().shard(deployment).await?.to_string(),
     );
     let block_time = BlockTime::for_test(&block_ptr_to);
     store
@@ -360,6 +366,7 @@ pub async fn transact_entities_and_dynamic_data_sources(
     entity_cache.append(ops);
     let mods = entity_cache
         .as_modifications(block_ptr_to.number)
+        .await
         .expect("failed to convert to modifications")
         .modifications;
     let metrics_registry = Arc::new(MetricsRegistry::mock());
@@ -400,17 +407,19 @@ pub async fn revert_block(store: &Arc<Store>, deployment: &DeploymentLocator, pt
     flush(deployment).await.unwrap();
 }
 
-pub fn insert_ens_name(hash: &str, name: &str) {
+pub async fn insert_ens_name(hash: &str, name: &str) {
     use diesel::insert_into;
-    use diesel::prelude::*;
+    use diesel::ExpressionMethods;
+    use diesel_async::RunQueryDsl;
     use graph_store_postgres::command_support::catalog::ens_names;
 
-    let mut conn = PRIMARY_POOL.get().unwrap();
+    let mut conn = PRIMARY_POOL.get().await.unwrap();
 
     insert_into(ens_names::table)
         .values((ens_names::hash.eq(hash), ens_names::name.eq(name)))
         .on_conflict_do_nothing()
         .execute(&mut conn)
+        .await
         .unwrap();
 }
 
@@ -455,15 +464,15 @@ pub async fn flush(deployment: &DeploymentLocator) -> Result<(), StoreError> {
 /// requires. Of course, this does not test that events that are sent are
 /// actually received by anything, but makes ensuring that the right events
 /// get sent much more convenient than trying to receive them
-pub fn tap_store_events<F, R>(f: F) -> (R, Vec<StoreEvent>)
+pub async fn tap_store_events<F, R>(f: F) -> (R, Vec<StoreEvent>)
 where
-    F: FnOnce() -> R,
+    F: AsyncFnOnce() -> R,
 {
     use graph_store_postgres::layout_for_tests::{EVENT_TAP, EVENT_TAP_ENABLED};
 
     EVENT_TAP.lock().unwrap().clear();
     *EVENT_TAP_ENABLED.lock().unwrap() = true;
-    let res = f();
+    let res = f().await;
     *EVENT_TAP_ENABLED.lock().unwrap() = false;
     (res, EVENT_TAP.lock().unwrap().clone())
 }
@@ -508,11 +517,15 @@ async fn execute_subgraph_query_internal(
         QueryTarget::Deployment(id, version) => (id, version),
         _ => unreachable!("tests do not use this"),
     };
-    let schema = SUBGRAPH_STORE.api_schema(&id, &Default::default()).unwrap();
+    let schema = SUBGRAPH_STORE
+        .api_schema(&id, &Default::default())
+        .await
+        .unwrap();
     let status = StatusStore::status(
         STORE.as_ref(),
         status::Filter::Deployments(vec![id.to_string()]),
     )
+    .await
     .unwrap();
     let network = Some(status[0].chains[0].network.clone());
     let trace = query.trace;
@@ -557,8 +570,8 @@ async fn execute_subgraph_query_internal(
             QueryExecutionOptions {
                 resolver,
                 deadline,
-                max_first: std::u32::MAX,
-                max_skip: std::u32::MAX,
+                max_first: u32::MAX,
+                max_skip: u32::MAX,
                 trace,
             },
         )
@@ -596,8 +609,8 @@ pub fn all_shards() -> Vec<Shard> {
 
 fn build_store() -> (Arc<Store>, ConnectionPool, Config, Arc<SubscriptionManager>) {
     let mut opt = Opt::default();
-    let url = std::env::var_os("THEGRAPH_STORE_POSTGRES_DIESEL_URL").filter(|s| s.len() > 0);
-    let file = std::env::var_os("GRAPH_NODE_TEST_CONFIG").filter(|s| s.len() > 0);
+    let url = std::env::var_os("THEGRAPH_STORE_POSTGRES_DIESEL_URL").filter(|s| !s.is_empty());
+    let file = std::env::var_os("GRAPH_NODE_TEST_CONFIG").filter(|s| !s.is_empty());
     if let Some(file) = file {
         let file = file.into_string().unwrap();
         opt.config = Some(file);
@@ -616,7 +629,7 @@ fn build_store() -> (Arc<Store>, ConnectionPool, Config, Arc<SubscriptionManager
         .unwrap_or_else(|_| panic!("config is not valid (file={:?})", &opt.config));
     let registry = Arc::new(MetricsRegistry::mock());
     std::thread::spawn(move || {
-        STORE_RUNTIME.handle().block_on(async {
+        graph::TEST_RUNTIME.handle().block_on(async {
             let builder = StoreBuilder::new(&LOGGER, &NODE_ID, &config, None, registry).await;
             let subscription_manager = builder.subscription_manager();
             let primary_pool = builder.primary_pool();
@@ -626,26 +639,30 @@ fn build_store() -> (Arc<Store>, ConnectionPool, Config, Arc<SubscriptionManager
                 genesis_block_hash: GENESIS_PTR.hash.clone(),
             };
 
-            let store = builder.network_store(
-                vec![
-                    (NETWORK_NAME.to_string()),
-                    (FAKE_NETWORK_SHARED.to_string()),
-                ]
-                .into_iter()
-                .collect(),
-            );
-            match store.block_store().chain_store(NETWORK_NAME) {
+            let store = builder
+                .network_store(
+                    vec![
+                        (NETWORK_NAME.to_string()),
+                        (FAKE_NETWORK_SHARED.to_string()),
+                    ]
+                    .into_iter()
+                    .collect(),
+                )
+                .await;
+            match store.block_store().chain_store(NETWORK_NAME).await {
                 Some(cs) => {
                     cs.set_chain_identifier_for_tests(&ChainIdentifier {
                         net_version: NETWORK_VERSION.to_string(),
                         genesis_block_hash: GENESIS_PTR.hash.clone(),
                     })
+                    .await
                     .expect("unable to set identifier");
                 }
                 None => {
                     store
                         .block_store()
                         .create_chain_store(NETWORK_NAME, ident)
+                        .await
                         .expect("unable to create test network store");
                 }
             }
@@ -656,8 +673,8 @@ fn build_store() -> (Arc<Store>, ConnectionPool, Config, Arc<SubscriptionManager
     .unwrap()
 }
 
-pub fn primary_connection() -> graph_store_postgres::layout_for_tests::Connection<'static> {
-    let conn = PRIMARY_POOL.get().unwrap();
+pub async fn primary_connection() -> graph_store_postgres::layout_for_tests::Connection {
+    let conn = PRIMARY_POOL.get_permitted().await.unwrap();
     graph_store_postgres::layout_for_tests::Connection::new(conn)
 }
 

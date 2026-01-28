@@ -47,7 +47,6 @@ const MINUTE: Duration = Duration::from_secs(60);
 const SKIP_PTR_UPDATES_THRESHOLD: Duration = Duration::from_secs(60 * 5);
 const HANDLE_REVERT_SECTION_NAME: &str = "handle_revert";
 const PROCESS_BLOCK_SECTION_NAME: &str = "process_block";
-const PROCESS_WASM_BLOCK_SECTION_NAME: &str = "process_wasm_block";
 const PROCESS_TRIGGERS_SECTION_NAME: &str = "process_triggers";
 const HANDLE_CREATED_DS_SECTION_NAME: &str = "handle_new_data_sources";
 
@@ -145,7 +144,7 @@ where
         // Filter out data sources that have reached their end block
         let end_block_filter = |ds: &&C::DataSource| match current_ptr.as_ref() {
             // We filter out datasources for which the current block is at or past their end block.
-            Some(block) => ds.end_block().map_or(true, |end| block.number < end),
+            Some(block) => ds.end_block().is_none_or(|end| block.number < end),
             // If there is no current block, we keep all datasources.
             None => true,
         };
@@ -309,11 +308,10 @@ where
                 // This will require some code refactor in how the BlockStream is created
                 let block_start = Instant::now();
 
-                let action = self.handle_stream_event(event).await.map(|res| {
+                let action = self.handle_stream_event(event).await.inspect(|res| {
                     self.metrics
                         .subgraph
                         .observe_block_processed(block_start.elapsed(), res.block_finished());
-                    res
                 })?;
 
                 self.update_deployment_synced_metric();
@@ -426,7 +424,10 @@ where
             modifications: mut mods,
             entity_lfu_cache: cache,
             evict_stats,
-        } = entity_cache.as_modifications(block_ptr.number).classify()?;
+        } = entity_cache
+            .as_modifications(block_ptr.number)
+            .await
+            .classify()?;
         section.end();
 
         log_evict_stats(&self.logger, &evict_stats);
@@ -495,6 +496,9 @@ where
         // In this scenario the only entity that is stored/transacted is the PoI,
         // all of the others are discarded.
         if has_errors && self.inputs.errors_are_fatal() {
+            if let Err(e) = self.inputs.store.flush().await {
+                error!(logger, "Failed to flush store after fatal errors"; "error" => format!("{:#}", e));
+            }
             // Only the first error is reported.
             return Err(ProcessingError::Deterministic(Box::new(
                 first_error.unwrap(),
@@ -508,11 +512,11 @@ where
             .observe(elapsed);
 
         block_state_metrics
-            .flush_metrics_to_store(&logger, block_ptr, self.inputs.deployment.id)
+            .flush_metrics_to_store(logger, block_ptr, self.inputs.deployment.id)
             .non_deterministic()?;
 
         if has_errors {
-            self.maybe_cancel()?;
+            self.maybe_cancel().await?;
         }
 
         Ok(())
@@ -520,18 +524,19 @@ where
 
     /// Cancel the subgraph if `disable_fail_fast` is not set and it is not
     /// synced
-    fn maybe_cancel(&self) -> Result<(), ProcessingError> {
+    async fn maybe_cancel(&self) -> Result<(), ProcessingError> {
         // To prevent a buggy pending version from replacing a current version, if errors are
         // present the subgraph will be unassigned.
         let store = &self.inputs.store;
         if !ENV_VARS.disable_fail_fast && !store.is_deployment_synced() {
             store
                 .pause_subgraph()
+                .await
                 .map_err(|e| ProcessingError::Unknown(e.into()))?;
 
             // Use `Canceled` to avoiding setting the subgraph health to failed, an error was
             // just transacted so it will be already be set to unhealthy.
-            Err(ProcessingError::Canceled.into())
+            Err(ProcessingError::Canceled)
         } else {
             Ok(())
         }
@@ -555,8 +560,8 @@ where
         self.ctx
             .decoder
             .match_and_decode_many(
-                &logger,
-                &block,
+                logger,
+                block,
                 triggers,
                 hosts_filter,
                 &self.metrics.subgraph,
@@ -588,7 +593,7 @@ where
                 "block_hash" => format!("{}", block_ptr.hash)
         ));
 
-        debug!(logger, "Start processing block";
+        info!(logger, "Start processing block";
                "triggers" => triggers.len());
 
         let proof_of_indexing =
@@ -862,37 +867,6 @@ where
         Ok(Arc::new(block))
     }
 
-    async fn process_wasm_block(
-        &mut self,
-        proof_of_indexing: &SharedProofOfIndexing,
-        block_ptr: BlockPtr,
-        block_time: BlockTime,
-        block_data: Box<[u8]>,
-        handler: String,
-        causality_region: &str,
-    ) -> Result<BlockState, MappingError> {
-        let block_state = BlockState::new(
-            self.inputs.store.clone(),
-            std::mem::take(&mut self.state.entity_lfu_cache),
-        );
-
-        self.ctx
-            .process_block(
-                &self.logger,
-                block_ptr,
-                block_time,
-                block_data,
-                handler,
-                block_state,
-                proof_of_indexing,
-                causality_region,
-                &self.inputs.debug_fork,
-                &self.metrics.subgraph,
-                self.inputs.instrument,
-            )
-            .await
-    }
-
     fn create_dynamic_data_sources(
         &mut self,
         created_data_sources: Vec<InstanceDSTemplateInfo>,
@@ -990,7 +964,8 @@ where
                     let outcome = self
                         .inputs
                         .store
-                        .unfail_non_deterministic_error(&block_ptr)?;
+                        .unfail_non_deterministic_error(&block_ptr)
+                        .await?;
 
                     // Stop trying to unfail.
                     self.state.should_try_unfail_non_deterministic = false;
@@ -1020,11 +995,11 @@ where
                     }
                 }
 
-                return Ok(action);
+                Ok(action)
             }
             Err(ProcessingError::Canceled) => {
                 debug!(self.logger, "Subgraph block stream shut down cleanly");
-                return Ok(Action::Stop);
+                Ok(Action::Stop)
             }
 
             // Handle unexpected stream errors by marking the subgraph as failed.
@@ -1061,7 +1036,7 @@ where
                             .await
                             .context("Failed to set subgraph status to `failed`")?;
 
-                        return Err(err);
+                        Err(err)
                     }
                     false => {
                         // Shouldn't fail subgraph if it's already failed for non-deterministic
@@ -1096,7 +1071,7 @@ where
                         self.state.should_try_unfail_non_deterministic = true;
 
                         // And restart the subgraph.
-                        return Ok(Action::Restart);
+                        Ok(Action::Restart)
                     }
                 }
             }
@@ -1138,12 +1113,12 @@ where
         // it so that we are up to date when checking if synced.
         let cached_head_ptr = self.state.cached_head_ptr.cheap_clone();
         if cached_head_ptr.is_none()
-            || close_to_chain_head(&block_ptr, &cached_head_ptr, CAUGHT_UP_DISTANCE)
+            || close_to_chain_head(block_ptr, &cached_head_ptr, CAUGHT_UP_DISTANCE)
         {
             self.state.cached_head_ptr = self.inputs.chain.chain_head_ptr().await?;
         }
         let is_caught_up =
-            close_to_chain_head(&block_ptr, &self.state.cached_head_ptr, CAUGHT_UP_DISTANCE);
+            close_to_chain_head(block_ptr, &self.state.cached_head_ptr, CAUGHT_UP_DISTANCE);
         if is_caught_up {
             // Stop recording time-to-sync metrics.
             self.metrics.stream.stopwatch.disable();
@@ -1163,20 +1138,6 @@ where
     ) -> Result<Action, Error> {
         let stopwatch = &self.metrics.stream.stopwatch;
         let action = match event {
-            Some(Ok(BlockStreamEvent::ProcessWasmBlock(
-                block_ptr,
-                block_time,
-                data,
-                handler,
-                cursor,
-            ))) => {
-                let _section = stopwatch.start_section(PROCESS_WASM_BLOCK_SECTION_NAME);
-                let res = self
-                    .handle_process_wasm_block(block_ptr.clone(), block_time, data, handler, cursor)
-                    .await;
-                let start = Instant::now();
-                self.handle_action(start, block_ptr, res).await?
-            }
             Some(Ok(BlockStreamEvent::ProcessBlock(block, cursor))) => {
                 let _section = stopwatch.start_section(PROCESS_BLOCK_SECTION_NAME);
                 self.handle_process_block(block, cursor).await?
@@ -1280,13 +1241,14 @@ where
             // This propagates any deterministic error as a non-deterministic one. Which might make
             // sense considering offchain data sources are non-deterministic.
             if let Some(err) = block_state.deterministic_errors.into_iter().next() {
-                return Err(anyhow!("{}", err.to_string()));
+                return Err(anyhow!("{}", err));
             }
 
             mods.extend(
                 block_state
                     .entity_cache
-                    .as_modifications(block.number())?
+                    .as_modifications(block.number())
+                    .await?
                     .modifications,
             );
             processed_data_sources.extend(block_state.processed_data_sources);
@@ -1326,82 +1288,6 @@ where
     C: Blockchain,
     T: RuntimeHostBuilder<C>,
 {
-    async fn handle_process_wasm_block(
-        &mut self,
-        block_ptr: BlockPtr,
-        block_time: BlockTime,
-        block_data: Box<[u8]>,
-        handler: String,
-        cursor: FirehoseCursor,
-    ) -> Result<Action, ProcessingError> {
-        let logger = self.logger.new(o!(
-                "block_number" => format!("{:?}", block_ptr.number),
-                "block_hash" => format!("{}", block_ptr.hash)
-        ));
-
-        debug!(logger, "Start processing wasm block";);
-
-        self.metrics
-            .stream
-            .deployment_head
-            .set(block_ptr.number as f64);
-
-        let proof_of_indexing =
-            SharedProofOfIndexing::new(block_ptr.number, self.inputs.poi_version);
-
-        // Causality region for onchain triggers.
-        let causality_region = PoICausalityRegion::from_network(&self.inputs.network);
-
-        let block_state = {
-            match self
-                .process_wasm_block(
-                    &proof_of_indexing,
-                    block_ptr.clone(),
-                    block_time,
-                    block_data,
-                    handler,
-                    &causality_region,
-                )
-                .await
-            {
-                // Triggers processed with no errors or with only deterministic errors.
-                Ok(block_state) => block_state,
-
-                // Some form of unknown or non-deterministic error ocurred.
-                Err(MappingError::Unknown(e)) => return Err(ProcessingError::Unknown(e).into()),
-                Err(MappingError::PossibleReorg(e)) => {
-                    info!(logger,
-                        "Possible reorg detected, retrying";
-                        "error" => format!("{:#}", e),
-                    );
-
-                    // In case of a possible reorg, we want this function to do nothing and restart the
-                    // block stream so it has a chance to detect the reorg.
-                    //
-                    // The state is unchanged at this point, except for having cleared the entity cache.
-                    // Losing the cache is a bit annoying but not an issue for correctness.
-                    //
-                    // See also b21fa73b-6453-4340-99fb-1a78ec62efb1.
-                    return Ok(Action::Restart);
-                }
-            }
-        };
-
-        self.transact_block_state(
-            &logger,
-            block_ptr.clone(),
-            cursor.clone(),
-            block_time,
-            block_state,
-            proof_of_indexing,
-            vec![],
-            vec![],
-        )
-        .await?;
-
-        Ok(Action::Continue)
-    }
-
     async fn handle_process_block(
         &mut self,
         block: BlockWithTriggers<C>,
@@ -1566,7 +1452,7 @@ async fn update_proof_of_indexing(
     entity_cache: &mut EntityCache,
 ) -> Result<(), Error> {
     // Helper to store the digest as a PoI entity in the cache
-    fn store_poi_entity(
+    async fn store_poi_entity(
         entity_cache: &mut EntityCache,
         key: EntityKey,
         digest: Bytes,
@@ -1582,11 +1468,11 @@ async fn update_proof_of_indexing(
             (digest_name, Value::from(digest)),
         ];
         if entity_cache.schema.has_aggregations() {
-            let block_time = Value::Int8(block_time.as_secs_since_epoch() as i64);
+            let block_time = Value::Int8(block_time.as_secs_since_epoch());
             data.push((entity_cache.schema.poi_block_time(), block_time));
         }
         let poi = entity_cache.make_entity(data)?;
-        entity_cache.set(key, poi, block, None)
+        entity_cache.set(key, poi, block, None).await
     }
 
     let _section_guard = stopwatch.start_section("update_proof_of_indexing");
@@ -1610,6 +1496,7 @@ async fn update_proof_of_indexing(
         let poi_digest = entity_cache.schema.poi_digest().clone();
         let prev_poi = entity_cache
             .get(&entity_key, GetScope::Store)
+            .await
             .map_err(Error::from)?
             .map(|entity| match entity.get(poi_digest.as_str()) {
                 Some(Value::Bytes(b)) => b.clone(),
@@ -1628,7 +1515,8 @@ async fn update_proof_of_indexing(
             updated_proof_of_indexing,
             block_time,
             block_number,
-        )?;
+        )
+        .await?;
     }
 
     Ok(())

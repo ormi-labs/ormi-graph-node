@@ -3,14 +3,12 @@
 //! trait which is the centerpiece of this module.
 
 pub mod block_stream;
-mod builder;
 pub mod client;
 mod empty_node_capabilities;
 pub mod firehose_block_ingestor;
 pub mod firehose_block_stream;
 pub mod mock;
 mod noop_runtime_adapter;
-pub mod substreams_block_stream;
 mod types;
 
 // Try to reexport most of the necessary types
@@ -33,12 +31,14 @@ use crate::{
     components::store::BlockNumber,
     prelude::{thiserror::Error, LinkResolver},
 };
+use alloy::primitives::B256;
 use anyhow::{anyhow, Context, Error};
 use async_trait::async_trait;
+use futures03::future::BoxFuture;
 use graph_derive::CheapClone;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use slog::{error, Logger};
+use slog::Logger;
 use std::{
     any::Any,
     collections::{HashMap, HashSet},
@@ -46,10 +46,8 @@ use std::{
     str::FromStr,
     sync::Arc,
 };
-use web3::types::H256;
 
 pub use block_stream::{ChainHeadUpdateListener, ChainHeadUpdateStream, TriggersAdapter};
-pub use builder::{BasicBlockchainBuilder, BlockchainBuilder};
 pub use empty_node_capabilities::EmptyNodeCapabilities;
 pub use noop_runtime_adapter::NoopRuntimeAdapter;
 pub use types::{BlockHash, BlockPtr, BlockTime, ChainIdentifier, ExtendedBlockPtr};
@@ -212,7 +210,7 @@ pub trait Blockchain: Debug + Sized + Send + Sync + Unpin + 'static {
 
     fn is_refetch_block_required(&self) -> bool;
 
-    fn runtime(&self) -> anyhow::Result<(Arc<dyn RuntimeAdapter<Self>>, Self::DecoderHook)>;
+    async fn runtime(&self) -> anyhow::Result<(Arc<dyn RuntimeAdapter<Self>>, Self::DecoderHook)>;
 
     fn chain_client(&self) -> Arc<ChainClient<Self>>;
 
@@ -224,30 +222,24 @@ pub enum IngestorError {
     /// The Ethereum node does not know about this block for some reason, probably because it
     /// disappeared in a chain reorg.
     #[error("Block data unavailable, block was likely uncled (block hash = {0:?})")]
-    BlockUnavailable(H256),
+    BlockUnavailable(B256),
 
     /// The Ethereum node does not know about this block for some reason, probably because it
     /// disappeared in a chain reorg.
     #[error("Receipt for tx {1:?} unavailable, block was likely uncled (block hash = {0:?})")]
-    ReceiptUnavailable(H256, H256),
+    ReceiptUnavailable(B256, B256),
 
     /// The Ethereum node does not know about this block for some reason
     #[error("Transaction receipts for block (block hash = {0:?}) is unavailable")]
-    BlockReceiptsUnavailable(H256),
+    BlockReceiptsUnavailable(B256),
 
     /// The Ethereum node does not know about this block for some reason
     #[error("Received confliciting block receipts for block (block hash = {0:?})")]
-    BlockReceiptsMismatched(H256),
+    BlockReceiptsMismatched(B256),
 
     /// An unexpected error occurred.
     #[error("Ingestor error: {0:#}")]
     Unknown(#[from] Error),
-}
-
-impl From<web3::Error> for IngestorError {
-    fn from(e: web3::Error) -> Self {
-        IngestorError::Unknown(anyhow::anyhow!(e))
-    }
 }
 
 /// The `TriggerFilterWrapper` is a higher-level wrapper around the chain-specific `TriggerFilter`,
@@ -360,8 +352,7 @@ pub trait DataSource<C: Blockchain>: 'static + Sized + Send + Sync + Clone {
     fn validate(&self, spec_version: &semver::Version) -> Vec<Error>;
 
     fn has_expired(&self, block: BlockNumber) -> bool {
-        self.end_block()
-            .map_or(false, |end_block| block > end_block)
+        self.end_block().is_some_and(|end_block| block > end_block)
     }
 
     fn has_declared_calls(&self) -> bool {
@@ -375,6 +366,7 @@ pub trait UnresolvedDataSourceTemplate<C: Blockchain>:
 {
     async fn resolve(
         self,
+        deployment_hash: &DeploymentHash,
         resolver: &Arc<dyn LinkResolver>,
         logger: &Logger,
         manifest_idx: u32,
@@ -405,6 +397,7 @@ pub trait UnresolvedDataSource<C: Blockchain>:
 {
     async fn resolve(
         self,
+        deployment_hash: &DeploymentHash,
         resolver: &Arc<dyn LinkResolver>,
         logger: &Logger,
         manifest_idx: u32,
@@ -543,9 +536,14 @@ pub struct HostFnCtx<'a> {
 #[derive(Clone, CheapClone)]
 pub struct HostFn {
     pub name: &'static str,
-    pub func: Arc<dyn Send + Sync + Fn(HostFnCtx, u32) -> Result<u32, HostExportError>>,
+    pub func: Arc<
+        dyn Send
+            + Sync
+            + for<'a> Fn(HostFnCtx<'a>, u32) -> BoxFuture<'a, Result<u32, HostExportError>>,
+    >,
 }
 
+#[async_trait]
 pub trait RuntimeAdapter<C: Blockchain>: Send + Sync {
     fn host_fns(&self, ds: &data_source::DataSource<C>) -> Result<Vec<HostFn>, Error>;
 }
@@ -563,8 +561,6 @@ pub enum BlockchainKind {
 
     /// NEAR chains (Mainnet, Testnet) or chains that are compatible
     Near,
-
-    Substreams,
 }
 
 impl fmt::Display for BlockchainKind {
@@ -572,7 +568,6 @@ impl fmt::Display for BlockchainKind {
         let value = match self {
             BlockchainKind::Ethereum => "ethereum",
             BlockchainKind::Near => "near",
-            BlockchainKind::Substreams => "substreams",
         };
         write!(f, "{}", value)
     }
@@ -585,8 +580,8 @@ impl FromStr for BlockchainKind {
         match s {
             "ethereum" => Ok(BlockchainKind::Ethereum),
             "near" => Ok(BlockchainKind::Near),
-            "substreams" => Ok(BlockchainKind::Substreams),
             "subgraph" => Ok(BlockchainKind::Ethereum), // TODO(krishna): We should detect the blockchain kind from the source subgraph
+            "amp" => Ok(BlockchainKind::Ethereum),      // TODO: Maybe get this from the Amp server
             _ => Err(anyhow!("unknown blockchain kind {}", s)),
         }
     }
@@ -600,11 +595,11 @@ impl BlockchainKind {
         //
         // Split by `/` to, for example, read 'ethereum' in 'ethereum/contracts'.
         manifest
-            .get(&Value::String("dataSources".to_owned()))
+            .get(Value::String("dataSources".to_owned()))
             .and_then(|ds| ds.as_sequence())
             .and_then(|ds| ds.first())
             .and_then(|ds| ds.as_mapping())
-            .and_then(|ds| ds.get(&Value::String("kind".to_owned())))
+            .and_then(|ds| ds.get(Value::String("kind".to_owned())))
             .and_then(|kind| kind.as_str())
             .and_then(|kind| kind.split('/').next())
             .context("invalid manifest")

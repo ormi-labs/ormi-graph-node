@@ -12,7 +12,7 @@ use graph_runtime_derive::AscType;
 use crate::asc_abi::class;
 
 /// Module related to AssemblyScript version v0.6.
-
+///
 /// Asc std ArrayBuffer: "a generic, fixed-length raw binary data buffer".
 /// See https://github.com/AssemblyScript/assemblyscript/wiki/Memory-Layout-&-Management/86447e88be5aa8ec633eaf5fe364651136d136ab#arrays
 pub struct ArrayBuffer {
@@ -35,7 +35,7 @@ impl ArrayBuffer {
             content.extend(&asc_bytes);
         }
 
-        if content.len() > u32::max_value() as usize {
+        if content.len() > u32::MAX as usize {
             return Err(DeterministicHostError::from(anyhow::anyhow!(
                 "slice cannot fit in WASM memory"
             )));
@@ -54,7 +54,7 @@ impl ArrayBuffer {
         &self,
         byte_offset: u32,
         length: u32,
-        api_version: Version,
+        api_version: &Version,
     ) -> Result<Vec<T>, DeterministicHostError> {
         let length = length as usize;
         let byte_offset = byte_offset as usize;
@@ -62,7 +62,7 @@ impl ArrayBuffer {
         self.content[byte_offset..]
             .chunks(size_of::<T>())
             .take(length)
-            .map(|asc_obj| T::from_asc_bytes(asc_obj, &api_version))
+            .map(|asc_obj| T::from_asc_bytes(asc_obj, api_version))
             .collect()
 
         // TODO: This code is preferred as it validates the length of the array.
@@ -96,7 +96,7 @@ impl AscType for ArrayBuffer {
         let total_size = self.byte_length as usize + header_size;
         let total_capacity = total_size.next_power_of_two();
         let extra_capacity = total_capacity - total_size;
-        asc_layout.extend(std::iter::repeat(0).take(extra_capacity));
+        asc_layout.extend(std::iter::repeat_n(0, extra_capacity));
         assert_eq!(asc_layout.len(), total_capacity);
 
         Ok(asc_layout)
@@ -149,7 +149,7 @@ pub struct TypedArray<T> {
 }
 
 impl<T: AscValue> TypedArray<T> {
-    pub(crate) fn new<H: AscHeap + ?Sized>(
+    pub(crate) async fn new<H: AscHeap + ?Sized>(
         content: &[T],
         heap: &mut H,
         gas: &GasCounter,
@@ -160,7 +160,7 @@ impl<T: AscValue> TypedArray<T> {
         } else {
             unreachable!("Only the correct ArrayBuffer will be constructed")
         };
-        let ptr = AscPtr::alloc_obj(buffer, heap, gas)?;
+        let ptr = AscPtr::alloc_obj(buffer, heap, gas).await?;
         Ok(TypedArray {
             byte_length: buffer_byte_length,
             buffer: AscPtr::new(ptr.wasm_ptr()),
@@ -194,7 +194,7 @@ pub struct AscString {
 
 impl AscString {
     pub fn new(content: &[u16]) -> Result<Self, DeterministicHostError> {
-        if size_of_val(content) > u32::max_value() as usize {
+        if size_of_val(content) > u32::MAX as usize {
             return Err(DeterministicHostError::from(anyhow!(
                 "string cannot fit in WASM memory"
             )));
@@ -249,7 +249,7 @@ impl AscType for AscString {
         }
 
         // Prevents panic when accessing offset + 1 in the loop
-        if asc_obj.len() % 2 != 0 {
+        if !asc_obj.len().is_multiple_of(2) {
             return Err(DeterministicHostError::from(anyhow::anyhow!(
                 "Invalid string length"
             )));
@@ -303,13 +303,13 @@ pub struct Array<T> {
 }
 
 impl<T: AscValue> Array<T> {
-    pub fn new<H: AscHeap + ?Sized>(
+    pub async fn new<H: AscHeap + ?Sized>(
         content: &[T],
         heap: &mut H,
         gas: &GasCounter,
     ) -> Result<Self, HostExportError> {
         let arr_buffer = class::ArrayBuffer::new(content, heap.api_version())?;
-        let arr_buffer_ptr = AscPtr::alloc_obj(arr_buffer, heap, gas)?;
+        let arr_buffer_ptr = AscPtr::alloc_obj(arr_buffer, heap, gas).await?;
         Ok(Array {
             buffer: AscPtr::new(arr_buffer_ptr.wasm_ptr()),
             // If this cast would overflow, the above line has already panicked.

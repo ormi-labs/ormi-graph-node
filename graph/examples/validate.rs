@@ -36,7 +36,6 @@ use graph::data::subgraph::SPEC_VERSION_1_1_0;
 use graph::prelude::s;
 use graph::prelude::DeploymentHash;
 use graph::schema::InputSchema;
-use graphql_parser::parse_schema;
 use serde::Deserialize;
 use std::alloc::GlobalAlloc;
 use std::alloc::Layout;
@@ -147,7 +146,7 @@ struct Opts {
     #[clap(long)]
     api: bool,
     #[clap(
-        short, long, default_value = "validate", 
+        short, long, default_value = "validate",
         value_parser = clap::builder::PossibleValuesParser::new(&["validate", "size"])
     )]
     mode: RunMode,
@@ -157,7 +156,7 @@ struct Opts {
 }
 
 fn parse(raw: &str, name: &str, api: bool) -> Result<DeploymentHash> {
-    let schema = parse_schema(raw)
+    let schema = s::parse_schema(raw)
         .map(|v| v.into_static())
         .map_err(|e| anyhow!("Failed to parse schema sgd{name}: {e}"))?;
     let id = subgraph_id(&schema);
@@ -233,13 +232,13 @@ impl Sizer {
         let elapsed = start.elapsed();
         let txt_size = raw.len();
         let (gql_size, _) = self.size(|| {
-            parse_schema(raw)
+            s::parse_schema(raw)
                 .map(|v| v.into_static())
                 .map_err(Into::into)
         })?;
         let (input_size, input_schema) =
-            self.size(|| InputSchema::parse_latest(raw, id.clone()).map_err(Into::into))?;
-        let (api_size, api) = self.size(|| input_schema.api_schema().map_err(Into::into))?;
+            self.size(|| InputSchema::parse_latest(raw, id.clone()))?;
+        let (api_size, api) = self.size(|| input_schema.api_schema())?;
         let api_text = api.document().to_string().len();
         Ok(Sizes {
             gql: gql_size,

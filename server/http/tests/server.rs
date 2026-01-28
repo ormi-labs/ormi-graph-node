@@ -1,4 +1,8 @@
-use graph::http::StatusCode;
+use async_trait::async_trait;
+use graph::{
+    data::{query::SqlQueryReq, store::SqlQueryObject},
+    http::StatusCode,
+};
 use std::time::Duration;
 
 use graph::data::{
@@ -65,6 +69,13 @@ impl GraphQlRunner for TestGraphQlRunner {
 
     fn metrics(&self) -> Arc<dyn GraphQLMetrics> {
         Arc::new(TestGraphQLMetrics)
+    }
+
+    async fn run_sql_query(
+        self: Arc<Self>,
+        _req: SqlQueryReq,
+    ) -> Result<Vec<SqlQueryObject>, QueryExecutionError> {
+        unimplemented!();
     }
 }
 
@@ -157,7 +168,7 @@ mod test {
         }
     }
 
-    #[tokio::test]
+    #[graph::test]
     async fn rejects_empty_json() {
         let logger = Logger::root(slog::Discard, o!());
         let logger_factory = LoggerFactory::new(logger, None, Arc::new(MetricsRegistry::mock()));
@@ -189,7 +200,7 @@ mod test {
         assert_eq!(message, "{\"error\":\"GraphQL server error (client error): The \\\"query\\\" field is missing in request data\"}");
     }
 
-    #[tokio::test]
+    #[graph::test]
     async fn rejects_invalid_queries() {
         let logger = Logger::root(slog::Discard, o!());
         let logger_factory = LoggerFactory::new(logger, None, Arc::new(MetricsRegistry::mock()));
@@ -227,9 +238,7 @@ mod test {
 
         assert_eq!(
             message,
-            "Unexpected `unexpected character \
-                         \'<\'`\nExpected `{`, `query`, `mutation`, \
-                         `subscription` or `fragment`"
+            "Unexpected unexpected character '<'\nUnexpected end of input\nExpected {, query, mutation, subscription or fragment"
         );
 
         let locations = errors[0]
@@ -261,7 +270,7 @@ mod test {
         assert_eq!(column, 1);
     }
 
-    #[tokio::test]
+    #[graph::test]
     async fn accepts_valid_queries() {
         let logger = Logger::root(slog::Discard, o!());
         let logger_factory = LoggerFactory::new(logger, None, Arc::new(MetricsRegistry::mock()));
@@ -298,7 +307,7 @@ mod test {
         assert_eq!(name, "Jordi".to_string());
     }
 
-    #[tokio::test]
+    #[graph::test]
     async fn accepts_valid_queries_with_variables() {
         let logger = Logger::root(slog::Discard, o!());
         let logger_factory = LoggerFactory::new(logger, None, Arc::new(MetricsRegistry::mock()));

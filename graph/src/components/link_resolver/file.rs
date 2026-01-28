@@ -4,8 +4,8 @@ use std::time::Duration;
 
 use anyhow::anyhow;
 use async_trait::async_trait;
-use slog::Logger;
 
+use crate::components::link_resolver::LinkResolverContext;
 use crate::data::subgraph::Link;
 use crate::prelude::{Error, JsonValueStream, LinkResolver as LinkResolverTrait};
 
@@ -33,7 +33,7 @@ impl FileLinkResolver {
     /// All paths are treated as absolute paths.
     pub fn new(base_dir: Option<PathBuf>, aliases: HashMap<String, PathBuf>) -> Self {
         Self {
-            base_dir: base_dir,
+            base_dir,
             timeout: Duration::from_secs(30),
             aliases,
         }
@@ -76,25 +76,24 @@ impl FileLinkResolver {
         // Create a path to the manifest based on the current resolver's
         // base directory or default to using the deployment string as path
         // If the deployment string is an alias, use the aliased path
-        let manifest_path = if let Some(aliased) = self.aliases.get(&manifest_path_str.to_string())
-        {
+        let manifest_path = if let Some(aliased) = self.aliases.get(manifest_path_str) {
             aliased.clone()
         } else {
             match &resolver.base_dir {
-                Some(dir) => dir.join(&manifest_path_str),
+                Some(dir) => dir.join(manifest_path_str),
                 None => PathBuf::from(manifest_path_str),
             }
         };
 
         let canonical_manifest_path = manifest_path
             .canonicalize()
-            .map_err(|e| Error::from(anyhow!("Failed to canonicalize manifest path: {}", e)))?;
+            .map_err(|e| anyhow!("Failed to canonicalize manifest path: {}", e))?;
 
         // The manifest path is the path of the subgraph manifest file in the build directory
         // We use the parent directory as the base directory for the new resolver
         let base_dir = canonical_manifest_path
             .parent()
-            .ok_or_else(|| Error::from(anyhow!("Manifest path has no parent directory")))?
+            .ok_or_else(|| anyhow!("Manifest path has no parent directory"))?
             .to_path_buf();
 
         resolver.base_dir = Some(base_dir);
@@ -104,11 +103,7 @@ impl FileLinkResolver {
 
 pub fn remove_prefix(link: &str) -> &str {
     const IPFS: &str = "/ipfs/";
-    if link.starts_with(IPFS) {
-        &link[IPFS.len()..]
-    } else {
-        link
-    }
+    link.strip_prefix(IPFS).unwrap_or(link)
 }
 
 #[async_trait]
@@ -123,20 +118,20 @@ impl LinkResolverTrait for FileLinkResolver {
         Box::new(self.clone())
     }
 
-    async fn cat(&self, logger: &Logger, link: &Link) -> Result<Vec<u8>, Error> {
+    async fn cat(&self, ctx: &LinkResolverContext, link: &Link) -> Result<Vec<u8>, Error> {
         let link = remove_prefix(&link.link);
-        let path = self.resolve_path(&link);
+        let path = self.resolve_path(link);
 
-        slog::debug!(logger, "File resolver: reading file"; 
+        slog::debug!(ctx.logger, "File resolver: reading file";
             "path" => path.to_string_lossy().to_string());
 
         match tokio::fs::read(&path).await {
             Ok(data) => Ok(data),
             Err(e) => {
-                slog::error!(logger, "Failed to read file"; 
+                slog::error!(ctx.logger, "Failed to read file";
                     "path" => path.to_string_lossy().to_string(),
                     "error" => e.to_string());
-                Err(anyhow!("Failed to read file {}: {}", path.display(), e).into())
+                Err(anyhow!("Failed to read file {}: {}", path.display(), e))
             }
         }
     }
@@ -145,12 +140,18 @@ impl LinkResolverTrait for FileLinkResolver {
         Ok(Box::new(self.clone_for_manifest(manifest_path)?))
     }
 
-    async fn get_block(&self, _logger: &Logger, _link: &Link) -> Result<Vec<u8>, Error> {
-        Err(anyhow!("get_block is not implemented for FileLinkResolver").into())
+    async fn get_block(&self, _ctx: &LinkResolverContext, _link: &Link) -> Result<Vec<u8>, Error> {
+        Err(anyhow!("get_block is not implemented for FileLinkResolver"))
     }
 
-    async fn json_stream(&self, _logger: &Logger, _link: &Link) -> Result<JsonValueStream, Error> {
-        Err(anyhow!("json_stream is not implemented for FileLinkResolver").into())
+    async fn json_stream(
+        &self,
+        _ctx: &LinkResolverContext,
+        _link: &Link,
+    ) -> Result<JsonValueStream, Error> {
+        Err(anyhow!(
+            "json_stream is not implemented for FileLinkResolver"
+        ))
     }
 }
 
@@ -161,7 +162,7 @@ mod tests {
     use std::fs;
     use std::io::Write;
 
-    #[tokio::test]
+    #[crate::test]
     async fn test_file_resolver_absolute() {
         // Test the resolver without a base directory (absolute paths only)
 
@@ -177,20 +178,22 @@ mod tests {
 
         // Create a resolver without a base directory
         let resolver = FileLinkResolver::default();
-        let logger = slog::Logger::root(slog::Discard, slog::o!());
 
         // Test valid path resolution
         let link = Link {
             link: test_file_path.to_string_lossy().to_string(),
         };
-        let result = resolver.cat(&logger, &link).await.unwrap();
+        let result = resolver
+            .cat(&LinkResolverContext::test(), &link)
+            .await
+            .unwrap();
         assert_eq!(result, test_content);
 
         // Test path with leading slash that likely doesn't exist
         let link = Link {
             link: "/test.txt".to_string(),
         };
-        let result = resolver.cat(&logger, &link).await;
+        let result = resolver.cat(&LinkResolverContext::test(), &link).await;
         assert!(
             result.is_err(),
             "Reading /test.txt should fail as it doesn't exist"
@@ -201,7 +204,7 @@ mod tests {
         let _ = fs::remove_dir(temp_dir);
     }
 
-    #[tokio::test]
+    #[crate::test]
     async fn test_file_resolver_with_base_dir() {
         // Test the resolver with a base directory
 
@@ -217,27 +220,32 @@ mod tests {
 
         // Create a resolver with a base directory
         let resolver = FileLinkResolver::with_base_dir(&temp_dir);
-        let logger = slog::Logger::root(slog::Discard, slog::o!());
 
         // Test relative path (no leading slash)
         let link = Link {
             link: "test.txt".to_string(),
         };
-        let result = resolver.cat(&logger, &link).await.unwrap();
+        let result = resolver
+            .cat(&LinkResolverContext::test(), &link)
+            .await
+            .unwrap();
         assert_eq!(result, test_content);
 
         // Test absolute path
         let link = Link {
             link: test_file_path.to_string_lossy().to_string(),
         };
-        let result = resolver.cat(&logger, &link).await.unwrap();
+        let result = resolver
+            .cat(&LinkResolverContext::test(), &link)
+            .await
+            .unwrap();
         assert_eq!(result, test_content);
 
         // Test missing file
         let link = Link {
             link: "missing.txt".to_string(),
         };
-        let result = resolver.cat(&logger, &link).await;
+        let result = resolver.cat(&LinkResolverContext::test(), &link).await;
         assert!(result.is_err());
 
         // Clean up
@@ -245,7 +253,7 @@ mod tests {
         let _ = fs::remove_dir(temp_dir);
     }
 
-    #[tokio::test]
+    #[crate::test]
     async fn test_file_resolver_with_aliases() {
         // Create a temporary directory for test files
         let temp_dir = env::temp_dir().join("file_resolver_test_aliases");
@@ -270,19 +278,24 @@ mod tests {
 
         // Create resolver with aliases
         let resolver = FileLinkResolver::new(Some(temp_dir.clone()), aliases);
-        let logger = slog::Logger::root(slog::Discard, slog::o!());
 
         // Test resolving by aliases
         let link1 = Link {
             link: "alias1".to_string(),
         };
-        let result1 = resolver.cat(&logger, &link1).await.unwrap();
+        let result1 = resolver
+            .cat(&LinkResolverContext::test(), &link1)
+            .await
+            .unwrap();
         assert_eq!(result1, test_content1);
 
         let link2 = Link {
             link: "alias2".to_string(),
         };
-        let result2 = resolver.cat(&logger, &link2).await.unwrap();
+        let result2 = resolver
+            .cat(&LinkResolverContext::test(), &link2)
+            .await
+            .unwrap();
         assert_eq!(result2, test_content2);
 
         // Test that the alias works in for_deployment as well

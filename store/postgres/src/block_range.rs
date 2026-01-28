@@ -1,8 +1,8 @@
+//! Utilities to deal with block numbers and block ranges
 use derive_more::Constructor;
 use diesel::pg::Pg;
 use diesel::query_builder::{AstPass, QueryFragment};
 use diesel::result::QueryResult;
-///! Utilities to deal with block numbers and block ranges
 use diesel::serialize::{Output, ToSql};
 use diesel::sql_types::{Integer, Range};
 use graph::env::ENV_VARS;
@@ -31,6 +31,7 @@ pub(crate) const BLOCK_RANGE_CURRENT: &str = "block_range @> 2147483647";
 ///   - any CRUD operation modifies such an entity in place
 ///   - queries by a block number consider such an entity as present for
 ///     any block number
+///
 /// We therefore mark such entities with a block range `[-1,\infinity)`; we
 /// use `-1` as the lower bound to make it easier to identify such entities
 /// for troubleshooting/debugging

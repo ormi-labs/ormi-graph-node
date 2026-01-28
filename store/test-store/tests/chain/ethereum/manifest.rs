@@ -4,6 +4,8 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
+use graph::amp;
 use graph::blockchain::DataSource;
 use graph::components::store::BLOCK_NUMBER_MAX;
 use graph::data::store::scalar::Bytes;
@@ -17,15 +19,15 @@ use graph::data_source::offchain::OffchainDataSourceKind;
 use graph::data_source::{DataSourceEnum, DataSourceTemplate};
 use graph::entity;
 use graph::env::ENV_VARS;
-use graph::prelude::web3::types::H256;
+use graph::prelude::alloy::primitives::B256;
 use graph::prelude::{
-    anyhow, async_trait, serde_yaml, tokio, BigDecimal, BigInt, DeploymentHash, Link, Logger,
-    SubgraphManifest, SubgraphManifestResolveError, SubgraphManifestValidationError, SubgraphStore,
+    anyhow, serde_yaml, BigDecimal, BigInt, DeploymentHash, Link, SubgraphManifest,
+    SubgraphManifestResolveError, SubgraphManifestValidationError, SubgraphStore,
     UnvalidatedSubgraphManifest,
 };
 use graph::{
     blockchain::NodeCapabilities as _,
-    components::link_resolver::{JsonValueStream, LinkResolver as LinkResolverTrait},
+    components::link_resolver::{JsonValueStream, LinkResolver, LinkResolverContext},
     data::subgraph::SubgraphFeature,
 };
 
@@ -82,36 +84,37 @@ impl TextResolver {
 }
 
 #[async_trait]
-impl LinkResolverTrait for TextResolver {
-    fn with_timeout(&self, _timeout: Duration) -> Box<dyn LinkResolverTrait> {
+impl LinkResolver for TextResolver {
+    fn with_timeout(&self, _timeout: Duration) -> Box<dyn LinkResolver> {
         Box::new(self.clone())
     }
 
-    fn with_retries(&self) -> Box<dyn LinkResolverTrait> {
+    fn with_retries(&self) -> Box<dyn LinkResolver> {
         Box::new(self.clone())
     }
 
-    fn for_manifest(
-        &self,
-        _manifest_path: &str,
-    ) -> Result<Box<dyn LinkResolverTrait>, anyhow::Error> {
+    fn for_manifest(&self, _manifest_path: &str) -> Result<Box<dyn LinkResolver>, anyhow::Error> {
         Ok(Box::new(self.clone()))
     }
 
-    async fn cat(&self, _logger: &Logger, link: &Link) -> Result<Vec<u8>, anyhow::Error> {
+    async fn cat(&self, _ctx: &LinkResolverContext, link: &Link) -> Result<Vec<u8>, anyhow::Error> {
         self.texts
             .get(&link.link)
             .ok_or(anyhow!("No text for {}", &link.link))
-            .map(Clone::clone)
+            .cloned()
     }
 
-    async fn get_block(&self, _logger: &Logger, _link: &Link) -> Result<Vec<u8>, anyhow::Error> {
+    async fn get_block(
+        &self,
+        _ctx: &LinkResolverContext,
+        _link: &Link,
+    ) -> Result<Vec<u8>, anyhow::Error> {
         unimplemented!()
     }
 
     async fn json_stream(
         &self,
-        _logger: &Logger,
+        _ctx: &LinkResolverContext,
         _link: &Link,
     ) -> Result<JsonValueStream, anyhow::Error> {
         unimplemented!()
@@ -134,10 +137,18 @@ async fn try_resolve_manifest(
     resolver.add("/ipfs/QmSourceSchema", &SOURCE_SUBGRAPH_SCHEMA);
     resolver.add(FILE_CID, &FILE);
 
-    let resolver: Arc<dyn LinkResolverTrait> = Arc::new(resolver);
+    let resolver: Arc<dyn LinkResolver> = Arc::new(resolver);
 
     let raw = serde_yaml::from_str(text)?;
-    Ok(SubgraphManifest::resolve_from_raw(id, raw, &resolver, &LOGGER, max_spec_version).await?)
+    Ok(SubgraphManifest::resolve_from_raw(
+        id,
+        raw,
+        &resolver,
+        Option::<Arc<amp::FlightClient>>::None,
+        &LOGGER,
+        max_spec_version,
+    )
+    .await?)
 }
 
 async fn resolve_manifest(
@@ -156,18 +167,25 @@ async fn resolve_unvalidated(text: &str) -> UnvalidatedSubgraphManifest<Chain> {
     resolver.add(id.as_str(), &text);
     resolver.add("/ipfs/Qmschema", &GQL_SCHEMA);
 
-    let resolver: Arc<dyn LinkResolverTrait> = Arc::new(resolver);
+    let resolver: Arc<dyn LinkResolver> = Arc::new(resolver);
 
     let raw = serde_yaml::from_str(text).unwrap();
-    UnvalidatedSubgraphManifest::resolve(id, raw, &resolver, &LOGGER, SPEC_VERSION_0_0_4.clone())
-        .await
-        .expect("Parsing simple manifest works")
+    UnvalidatedSubgraphManifest::resolve(
+        id,
+        raw,
+        &resolver,
+        Option::<Arc<amp::FlightClient>>::None,
+        &LOGGER,
+        SPEC_VERSION_0_0_4.clone(),
+    )
+    .await
+    .expect("Parsing simple manifest works")
 }
 
 // Some of these manifest tests should be made chain-independent, but for
 // now we just run them for the ethereum `Chain`
 
-#[tokio::test]
+#[graph::test]
 async fn simple_manifest() {
     const YAML: &str = "
 dataSources: []
@@ -183,7 +201,7 @@ specVersion: 0.0.2
     assert!(manifest.graft.is_none());
 }
 
-#[tokio::test]
+#[graph::test]
 async fn ipfs_manifest() {
     let yaml = "
 schema:
@@ -216,7 +234,7 @@ specVersion: 0.0.7
     assert_eq!(data_source.kind, OffchainDataSourceKind::Ipfs);
 }
 
-#[tokio::test]
+#[graph::test]
 async fn subgraph_ds_manifest() {
     let yaml = "
 schema:
@@ -228,7 +246,7 @@ dataSources:
     entities:
         - Gravatar
     network: mainnet
-    source: 
+    source:
       address: 'QmSource'
       startBlock: 9562480
     mapping:
@@ -259,7 +277,7 @@ specVersion: 1.3.0
     }
 }
 
-#[tokio::test]
+#[graph::test]
 async fn subgraph_ds_manifest_aggregations_should_fail() {
     let yaml = "
 schema:
@@ -271,7 +289,7 @@ dataSources:
     entities:
         - Gravatar
     network: mainnet
-    source: 
+    source:
       address: 'QmSource'
       startBlock: 9562480
     mapping:
@@ -295,7 +313,7 @@ specVersion: 1.3.0
         .contains("Entity TokenStats is an aggregation and cannot be used as a mapping entity"));
 }
 
-#[tokio::test]
+#[graph::test]
 async fn multiple_subgraph_ds_manifest() {
     let yaml = "
 schema:
@@ -307,7 +325,7 @@ dataSources:
     entities:
         - Gravatar
     network: mainnet
-    source: 
+    source:
       address: 'QmSource'
       startBlock: 9562480
     mapping:
@@ -367,7 +385,7 @@ specVersion: 1.3.0
     }
 }
 
-#[tokio::test]
+#[graph::test]
 async fn graft_manifest() {
     const YAML: &str = "
 dataSources: []
@@ -388,7 +406,7 @@ specVersion: 0.0.2
     assert_eq!(12345, graft.block);
 }
 
-#[tokio::test]
+#[graph::test]
 async fn parse_indexer_hints() {
     const YAML: &str = "
 dataSources: []
@@ -466,6 +484,7 @@ specVersion: 0.0.2
         let schema = store
             .subgraph_store()
             .input_schema(&deployment.hash)
+            .await
             .unwrap();
 
         // Adds an example entity.
@@ -550,6 +569,7 @@ specVersion: 0.0.2
         let schema = store
             .subgraph_store()
             .input_schema(&deployment.hash)
+            .await
             .unwrap();
         // This check is awkward since the test manifest has other problems
         // that the validation complains about as setting up a valid manifest
@@ -638,7 +658,7 @@ specVersion: 0.0.2
     })
 }
 
-#[tokio::test]
+#[graph::test]
 async fn parse_data_source_context() {
     const YAML: &str = "
 dataSources:
@@ -748,7 +768,7 @@ specVersion: 0.0.8
     );
 }
 
-#[tokio::test]
+#[graph::test]
 async fn parse_event_handlers_with_topics() {
     const YAML: &str = "
 dataSources:
@@ -792,18 +812,18 @@ specVersion: 1.2.0
 
     assert_eq!(
         Some(vec![
-            H256::from_str("0000000000000000000000000000000000000000000000000000000000000000")
+            B256::from_str("0000000000000000000000000000000000000000000000000000000000000000")
                 .unwrap(),
-            H256::from_str("0000000000000000000000000000000000000000000000000000000000000001")
+            B256::from_str("0000000000000000000000000000000000000000000000000000000000000001")
                 .unwrap(),
-            H256::from_str("0000000000000000000000000000000000000000000000000000000000000002")
+            B256::from_str("0000000000000000000000000000000000000000000000000000000000000002")
                 .unwrap()
         ]),
         topic1.clone()
     );
 
     assert_eq!(
-        Some(vec![H256::from_str(
+        Some(vec![B256::from_str(
             "0000000000000000000000000000000000000000000000000000000000000001"
         )
         .unwrap()]),
@@ -811,7 +831,7 @@ specVersion: 1.2.0
     );
 
     assert_eq!(
-        Some(vec![H256::from_str(
+        Some(vec![B256::from_str(
             "0000000000000000000000000000000000000000000000000000000000000002"
         )
         .unwrap()]),
@@ -819,7 +839,7 @@ specVersion: 1.2.0
     );
 }
 
-#[tokio::test]
+#[graph::test]
 async fn parse_block_handlers_with_polling_filter() {
     const YAML: &str = "
 dataSources:
@@ -860,8 +880,8 @@ specVersion: 0.0.8
         .filter_map(|ds| ds.as_onchain().cloned())
         .collect::<Vec<_>>();
 
-    let data_source = onchain_data_sources.get(0).unwrap();
-    let validation_errors = data_source.validate(&LATEST_VERSION);
+    let data_source = onchain_data_sources.first().unwrap();
+    let validation_errors = data_source.validate(LATEST_VERSION);
     let filter = data_source.mapping.block_handlers[0].filter.clone();
 
     assert_eq!(0, validation_errors.len());
@@ -875,7 +895,7 @@ specVersion: 0.0.8
     assert_eq!("Qmmanifest", manifest.id.as_str());
 }
 
-#[tokio::test]
+#[graph::test]
 async fn parse_data_source_with_end_block() {
     const YAML: &str = "
 dataSources:
@@ -912,7 +932,7 @@ specVersion: 0.0.9
     assert_eq!(Some(9562481), end_block);
 }
 
-#[tokio::test]
+#[graph::test]
 async fn parse_block_handlers_with_both_polling_and_once_filter() {
     const YAML: &str = "
 dataSources:
@@ -956,7 +976,7 @@ specVersion: 0.0.8
         .filter_map(|ds| ds.as_onchain().cloned())
         .collect::<Vec<_>>();
 
-    let data_source = onchain_data_sources.get(0).unwrap();
+    let data_source = onchain_data_sources.first().unwrap();
     let validation_errors = data_source.validate(LATEST_VERSION);
     let filters = data_source
         .mapping
@@ -979,7 +999,7 @@ specVersion: 0.0.8
     assert_eq!("Qmmanifest", manifest.id.as_str());
 }
 
-#[tokio::test]
+#[graph::test]
 async fn should_not_parse_block_handlers_with_both_filtered_and_non_filtered_handlers() {
     const YAML: &str = "
 dataSources:
@@ -1021,7 +1041,7 @@ specVersion: 0.0.8
         .filter_map(|ds| ds.as_onchain().cloned())
         .collect::<Vec<_>>();
 
-    let data_source = onchain_data_sources.get(0).unwrap();
+    let data_source = onchain_data_sources.first().unwrap();
     let validation_errors = data_source.validate(LATEST_VERSION);
     let filters = data_source
         .mapping
@@ -1044,7 +1064,7 @@ specVersion: 0.0.8
     assert_eq!("Qmmanifest", manifest.id.as_str());
 }
 
-#[tokio::test]
+#[graph::test]
 async fn parse_block_handlers_with_call_filter() {
     const YAML: &str = "
 dataSources:
@@ -1083,16 +1103,16 @@ specVersion: 0.0.2
         .filter_map(|ds| ds.as_onchain().cloned())
         .collect::<Vec<_>>();
 
-    let data_source = onchain_data_sources.get(0).unwrap();
+    let data_source = onchain_data_sources.first().unwrap();
     let filter = data_source.mapping.block_handlers[0].filter.clone();
     let required_capabilities = NodeCapabilities::from_data_sources(&onchain_data_sources);
 
     assert_eq!(BlockHandlerFilter::Call, filter.unwrap());
-    assert_eq!(true, required_capabilities.traces);
+    assert!(required_capabilities.traces);
     assert_eq!("Qmmanifest", manifest.id.as_str());
 }
 
-#[tokio::test]
+#[graph::test]
 async fn parse_block_handlers_with_once_filter() {
     const YAML: &str = "
 dataSources:
@@ -1131,16 +1151,16 @@ specVersion: 0.0.8
         .filter_map(|ds| ds.as_onchain().cloned())
         .collect::<Vec<_>>();
 
-    let data_source = onchain_data_sources.get(0).unwrap();
+    let data_source = onchain_data_sources.first().unwrap();
     let filter = data_source.mapping.block_handlers[0].filter.clone();
     let required_capabilities = NodeCapabilities::from_data_sources(&onchain_data_sources);
 
     assert_eq!(BlockHandlerFilter::Once, filter.unwrap());
-    assert_eq!(false, required_capabilities.traces);
+    assert!(!required_capabilities.traces);
     assert_eq!("Qmmanifest", manifest.id.as_str());
 }
 
-#[tokio::test]
+#[graph::test]
 async fn parse_call_handlers() {
     const YAML: &str = "
 dataSources:
@@ -1180,7 +1200,7 @@ specVersion: 0.0.2
     let required_capabilities = NodeCapabilities::from_data_sources(&onchain_data_sources);
 
     assert_eq!("Qmmanifest", manifest.id.as_str());
-    assert_eq!(true, required_capabilities.traces);
+    assert!(required_capabilities.traces);
 }
 
 #[test]
@@ -1218,6 +1238,23 @@ graft:
     })
 }
 
+async fn has_feature_validation_error(
+    unvalidated: UnvalidatedSubgraphManifest<Chain>,
+    store: Arc<graph_store_postgres::SubgraphStore>,
+) -> bool {
+    unvalidated
+        .validate(store, true)
+        .await
+        .expect_err("Validation must fail")
+        .into_iter()
+        .any(|e| {
+            matches!(
+                e,
+                SubgraphManifestValidationError::FeatureValidationError(_)
+            )
+        })
+}
+
 #[test]
 fn declared_grafting_feature_causes_no_feature_validation_errors() {
     const YAML: &str = "
@@ -1235,18 +1272,8 @@ graft:
     test_store::run_test_sequentially(|store| async move {
         let store = store.subgraph_store();
         let unvalidated = resolve_unvalidated(YAML).await;
-        assert!(unvalidated
-            .validate(store.clone(), true)
-            .await
-            .expect_err("Validation must fail")
-            .into_iter()
-            .find(|e| {
-                matches!(
-                    e,
-                    SubgraphManifestValidationError::FeatureValidationError(_)
-                )
-            })
-            .is_none());
+        let has_error = has_feature_validation_error(unvalidated, store).await;
+        assert!(!has_error, "There must be no FeatureValidationError");
         let manifest = resolve_manifest(YAML, SPEC_VERSION_0_0_4).await;
         assert!(manifest.features.contains(&SubgraphFeature::Grafting))
     })
@@ -1266,18 +1293,8 @@ schema:
     test_store::run_test_sequentially(|store| async move {
         let store = store.subgraph_store();
         let unvalidated = resolve_unvalidated(YAML).await;
-        assert!(unvalidated
-            .validate(store.clone(), true)
-            .await
-            .expect_err("Validation must fail")
-            .into_iter()
-            .find(|e| {
-                matches!(
-                    e,
-                    SubgraphManifestValidationError::FeatureValidationError(_)
-                )
-            })
-            .is_none());
+        let has_error = has_feature_validation_error(unvalidated, store).await;
+        assert!(!has_error, "There must be no FeatureValidationError");
 
         let manifest = resolve_manifest(YAML, SPEC_VERSION_0_0_4).await;
         assert!(manifest.features.contains(&SubgraphFeature::NonFatalErrors))
@@ -1305,13 +1322,14 @@ schema:
             resolver.add("/ipfs/Qmabi", &ABI);
             resolver.add("/ipfs/Qmschema", &GQL_SCHEMA_FULLTEXT);
 
-            let resolver: Arc<dyn LinkResolverTrait> = Arc::new(resolver);
+            let resolver: Arc<dyn LinkResolver> = Arc::new(resolver);
 
             let raw = serde_yaml::from_str(YAML).unwrap();
             UnvalidatedSubgraphManifest::resolve(
                 id,
                 raw,
                 &resolver,
+                Option::<Arc<amp::FlightClient>>::None,
                 &LOGGER,
                 SPEC_VERSION_0_0_4.clone(),
             )
@@ -1319,18 +1337,8 @@ schema:
             .expect("Parsing simple manifest works")
         };
 
-        assert!(unvalidated
-            .validate(store.clone(), true)
-            .await
-            .expect_err("Validation must fail")
-            .into_iter()
-            .find(|e| {
-                matches!(
-                    e,
-                    SubgraphManifestValidationError::FeatureValidationError(_)
-                )
-            })
-            .is_none());
+        let has_error = has_feature_validation_error(unvalidated, store).await;
+        assert!(!has_error, "There must be no FeatureValidationError");
 
         let manifest = resolve_manifest(YAML, SPEC_VERSION_0_0_4).await;
         assert!(manifest.features.contains(&SubgraphFeature::FullTextSearch))
@@ -1357,13 +1365,14 @@ schema:
             resolver.add("/ipfs/Qmabi", &ABI);
             resolver.add("/ipfs/Qmschema", &GQL_SCHEMA_FULLTEXT);
 
-            let resolver: Arc<dyn LinkResolverTrait> = Arc::new(resolver);
+            let resolver: Arc<dyn LinkResolver> = Arc::new(resolver);
 
             let raw = serde_yaml::from_str(YAML).unwrap();
             UnvalidatedSubgraphManifest::resolve(
                 id,
                 raw,
                 &resolver,
+                Option::<Arc<amp::FlightClient>>::None,
                 &LOGGER,
                 SPEC_VERSION_0_0_4.clone(),
             )
@@ -1433,13 +1442,14 @@ dataSources:
             resolver.add("/ipfs/Qmschema", &GQL_SCHEMA);
             resolver.add("/ipfs/Qmmapping", &MAPPING_WITH_IPFS_FUNC_WASM);
 
-            let resolver: Arc<dyn LinkResolverTrait> = Arc::new(resolver);
+            let resolver: Arc<dyn LinkResolver> = Arc::new(resolver);
 
             let raw = serde_yaml::from_str(YAML).unwrap();
             UnvalidatedSubgraphManifest::resolve(
                 id,
                 raw,
                 &resolver,
+                Option::<Arc<amp::FlightClient>>::None,
                 &LOGGER,
                 SPEC_VERSION_0_0_4.clone(),
             )
@@ -1511,13 +1521,14 @@ dataSources:
             resolver.add("/ipfs/Qmschema", &GQL_SCHEMA);
             resolver.add("/ipfs/Qmmapping", &MAPPING_WITH_IPFS_FUNC_WASM);
 
-            let resolver: Arc<dyn LinkResolverTrait> = Arc::new(resolver);
+            let resolver: Arc<dyn LinkResolver> = Arc::new(resolver);
 
             let raw = serde_yaml::from_str(YAML).unwrap();
             UnvalidatedSubgraphManifest::resolve(
                 id,
                 raw,
                 &resolver,
+                Option::<Arc<amp::FlightClient>>::None,
                 &LOGGER,
                 SPEC_VERSION_0_0_4.clone(),
             )
@@ -1525,18 +1536,8 @@ dataSources:
             .expect("Parsing simple manifest works")
         };
 
-        assert!(unvalidated
-            .validate(store.clone(), true)
-            .await
-            .expect_err("Validation must fail")
-            .into_iter()
-            .find(|e| {
-                matches!(
-                    e,
-                    SubgraphManifestValidationError::FeatureValidationError(_)
-                )
-            })
-            .is_none());
+        let has_error = has_feature_validation_error(unvalidated, store).await;
+        assert!(!has_error, "There must be no FeatureValidationError");
     });
 }
 
@@ -1554,18 +1555,8 @@ schema:
     test_store::run_test_sequentially(|store| async move {
         let store = store.subgraph_store();
         let unvalidated = resolve_unvalidated(YAML).await;
-        assert!(unvalidated
-            .validate(store.clone(), true)
-            .await
-            .expect_err("Validation must fail")
-            .into_iter()
-            .find(|e| {
-                matches!(
-                    e,
-                    SubgraphManifestValidationError::FeatureValidationError(_)
-                )
-            })
-            .is_none());
+        let has_error = has_feature_validation_error(unvalidated, store).await;
+        assert!(!has_error, "There must be no FeatureValidationError");
 
         let manifest = resolve_manifest(YAML, SPEC_VERSION_0_0_4).await;
         assert!(manifest.features.contains(&SubgraphFeature::NonFatalErrors))
@@ -1620,13 +1611,14 @@ dataSources:
             resolver.add("/ipfs/Qmschema", &GQL_SCHEMA);
             resolver.add("/ipfs/Qmmapping", &MAPPING_WITH_IPFS_FUNC_WASM);
 
-            let resolver: Arc<dyn LinkResolverTrait> = Arc::new(resolver);
+            let resolver: Arc<dyn LinkResolver> = Arc::new(resolver);
 
             let raw = serde_yaml::from_str(YAML).unwrap();
             UnvalidatedSubgraphManifest::resolve(
                 id,
                 raw,
                 &resolver,
+                Option::<Arc<amp::FlightClient>>::None,
                 &LOGGER,
                 SPEC_VERSION_1_2_0.clone(),
             )
@@ -1658,7 +1650,7 @@ dataSources:
     entities:
         - Gravatar
     network: mainnet
-    source: 
+    source:
       address: 'QmSource'
       startBlock: 9562480
     mapping:
@@ -1693,13 +1685,14 @@ dataSources:
             resolver.add("/ipfs/QmSource", &SOURCE_SUBGRAPH_MANIFEST);
             resolver.add("/ipfs/QmSourceSchema", &SOURCE_SUBGRAPH_SCHEMA);
 
-            let resolver: Arc<dyn LinkResolverTrait> = Arc::new(resolver);
+            let resolver: Arc<dyn LinkResolver> = Arc::new(resolver);
 
             let raw = serde_yaml::from_str(YAML).unwrap();
             UnvalidatedSubgraphManifest::resolve(
                 id,
                 raw,
                 &resolver,
+                Option::<Arc<amp::FlightClient>>::None,
                 &LOGGER,
                 SPEC_VERSION_1_3_0.clone(),
             )
@@ -1716,7 +1709,7 @@ dataSources:
     });
 }
 
-#[tokio::test]
+#[graph::test]
 async fn mixed_subgraph_and_onchain_ds_manifest_should_fail() {
     let yaml = "
 schema:
@@ -1728,7 +1721,7 @@ dataSources:
     entities:
         - User
     network: mainnet
-    source: 
+    source:
       address: 'QmSource'
       startBlock: 9562480
     mapping:
@@ -1787,7 +1780,7 @@ dataSources:
   entities:
       - User
   network: mainnet
-  source: 
+  source:
     address: 'QmNestedSource'
     startBlock: 9562480
   mapping:
@@ -1841,7 +1834,7 @@ specVersion: 1.3.0
     resolver.add("/ipfs/QmSource", &SOURCE_SUBGRAPH_MANIFEST);
     resolver.add("/ipfs/QmSourceSchema", &SOURCE_SUBGRAPH_SCHEMA);
 
-    let resolver: Arc<dyn LinkResolverTrait> = Arc::new(resolver);
+    let resolver: Arc<dyn LinkResolver> = Arc::new(resolver);
 
     let raw = serde_yaml::from_str(yaml).unwrap();
     test_store::run_test_sequentially(|_| async move {
@@ -1850,6 +1843,7 @@ specVersion: 1.3.0
                 id,
                 raw,
                 &resolver,
+                Option::<Arc<amp::FlightClient>>::None,
                 &LOGGER,
                 SPEC_VERSION_1_3_0.clone(),
             )
@@ -1868,7 +1862,7 @@ specVersion: 1.3.0
     })
 }
 
-#[tokio::test]
+#[graph::test]
 async fn subgraph_ds_manifest_mutable_entities_should_fail() {
     let yaml = "
 schema:
@@ -1880,7 +1874,7 @@ dataSources:
     entities:
         - Gravatar
     network: mainnet
-    source: 
+    source:
       address: 'QmSource'
       startBlock: 9562480
     mapping:
@@ -1904,7 +1898,7 @@ specVersion: 1.3.0
         .contains("Entity MutableEntity is not immutable and cannot be used as a mapping entity"));
 }
 
-#[tokio::test]
+#[graph::test]
 async fn subgraph_ds_manifest_immutable_entities_should_succeed() {
     let yaml = "
 schema:
@@ -1916,7 +1910,7 @@ dataSources:
     entities:
         - Gravatar
     network: mainnet
-    source: 
+    source:
       address: 'QmSource'
       startBlock: 9562480
     mapping:

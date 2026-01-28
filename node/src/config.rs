@@ -181,7 +181,7 @@ impl Config {
 
     pub fn from_str(config: &str, node: &str) -> Result<Config> {
         let mut config: Config = toml::from_str(config)?;
-        config.node = NodeId::new(node).map_err(|()| anyhow!("invalid node id {}", node))?;
+        config.node = NodeId::new(node).map_err(|node| anyhow!("invalid node id {}", node))?;
         config.validate()?;
         Ok(config)
     }
@@ -191,7 +191,7 @@ impl Config {
         let mut stores = BTreeMap::new();
         let chains = ChainSection::from_opt(opt)?;
         let node = NodeId::new(opt.node_id.to_string())
-            .map_err(|()| anyhow!("invalid node id {}", opt.node_id))?;
+            .map_err(|node| anyhow!("invalid node id {}", node))?;
         stores.insert(PRIMARY_SHARD.to_string(), Shard::from_opt(true, opt)?);
         Ok(Config {
             node,
@@ -252,7 +252,7 @@ impl Shard {
     fn validate(&mut self, name: &str) -> Result<()> {
         ShardName::new(name.to_string()).map_err(|e| anyhow!(e))?;
 
-        self.connection = shellexpand::env(&self.connection)?.into_owned();
+        self.expand_connection()?;
 
         if matches!(self.pool_size, PoolSize::None) {
             return Err(anyhow!("missing pool size definition for shard `{}`", name));
@@ -301,20 +301,34 @@ impl Shard {
             replicas,
         })
     }
+
+    fn expand_connection(&mut self) -> Result<()> {
+        let mut url = Url::parse(shellexpand::env(&self.connection)?.as_ref())?;
+        // Put the PGAPPNAME into the URL since tokio-postgres ignores this
+        // environment variable
+        if let Ok(app_name) = std::env::var("PGAPPNAME") {
+            let query = match url.query() {
+                Some(query) => {
+                    format!("{query}&application_name={app_name}")
+                }
+                None => {
+                    format!("application_name={app_name}")
+                }
+            };
+            url.set_query(Some(&query));
+        }
+        self.connection = url.to_string();
+        Ok(())
+    }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, Default)]
 #[serde(untagged)]
 pub enum PoolSize {
+    #[default]
     None,
     Fixed(u32),
     Rule(Vec<PoolSizeRule>),
-}
-
-impl Default for PoolSize {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 impl PoolSize {
@@ -412,7 +426,7 @@ pub struct ChainSection {
 impl ChainSection {
     fn validate(&mut self) -> Result<()> {
         NodeId::new(&self.ingestor)
-            .map_err(|()| anyhow!("invalid node id for ingestor {}", &self.ingestor))?;
+            .map_err(|node| anyhow!("invalid node id for ingestor {}", node))?;
         for (_, chain) in self.chains.iter_mut() {
             chain.validate()?
         }
@@ -450,7 +464,7 @@ impl ChainSection {
     fn parse_networks(
         chains: &mut BTreeMap<String, Chain>,
         transport: Transport,
-        args: &Vec<String>,
+        args: &[String],
     ) -> Result<()> {
         for (nr, arg) in args.iter().enumerate() {
             if arg.starts_with("wss://")
@@ -488,7 +502,7 @@ impl ChainSection {
                 })?;
 
                 let (features, url_str) = rest.split_at(colon);
-                let (url, features) = if vec!["http", "https", "ws", "wss"].contains(&features) {
+                let (url, features) = if ["http", "https", "ws", "wss"].contains(&features) {
                     (rest, DEFAULT_PROVIDER_FEATURES.to_vec())
                 } else {
                     (&url_str[1..], features.split(',').collect())
@@ -549,30 +563,6 @@ impl Chain {
             provider.validate()?
         }
 
-        if !matches!(self.protocol, BlockchainKind::Substreams) {
-            let has_only_substreams_providers = self
-                .providers
-                .iter()
-                .all(|provider| matches!(provider.details, ProviderDetails::Substreams(_)));
-            if has_only_substreams_providers {
-                bail!(
-                    "{} protocol requires an rpc or firehose endpoint defined",
-                    self.protocol
-                );
-            }
-        }
-
-        // When using substreams protocol, only substreams endpoints are allowed
-        if matches!(self.protocol, BlockchainKind::Substreams) {
-            let has_non_substreams_providers = self
-                .providers
-                .iter()
-                .any(|provider| !matches!(provider.details, ProviderDetails::Substreams(_)));
-            if has_non_substreams_providers {
-                bail!("Substreams protocol only supports substreams providers");
-            }
-        }
-
         Ok(())
     }
 }
@@ -609,7 +599,6 @@ pub struct Provider {
 pub enum ProviderDetails {
     Firehose(FirehoseProvider),
     Web3(Web3Provider),
-    Substreams(FirehoseProvider),
     Web3Call(Web3Provider),
 }
 
@@ -728,8 +717,7 @@ impl Provider {
         validate_name(&self.label).context("illegal provider name")?;
 
         match self.details {
-            ProviderDetails::Firehose(ref mut firehose)
-            | ProviderDetails::Substreams(ref mut firehose) => {
+            ProviderDetails::Firehose(ref mut firehose) => {
                 firehose.url = shellexpand::env(&firehose.url)?.into_owned();
 
                 // A Firehose url must be a valid Uri since gRPC library we use (Tonic)
@@ -884,12 +872,8 @@ impl<'de> Deserialize<'de> for Provider {
                             return Err(serde::de::Error::custom("when `details` field is provided, deprecated `url`, `transport`, `features` and `headers` cannot be specified"));
                         }
 
-                        match v {
-                            ProviderDetails::Firehose(ref mut firehose)
-                            | ProviderDetails::Substreams(ref mut firehose) => {
-                                firehose.rules = nodes
-                            }
-                            _ => {}
+                        if let ProviderDetails::Firehose(ref mut firehose) = v {
+                            firehose.rules = nodes
                         }
 
                         v
@@ -934,20 +918,15 @@ enum ProviderField {
     Headers,
 }
 
-#[derive(Copy, Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[derive(Copy, Clone, Debug, Deserialize, Serialize, PartialEq, Default)]
 pub enum Transport {
     #[serde(rename = "rpc")]
+    #[default]
     Rpc,
     #[serde(rename = "ws")]
     Ws,
     #[serde(rename = "ipc")]
     Ipc,
-}
-
-impl Default for Transport {
-    fn default() -> Self {
-        Self::Rpc
-    }
 }
 
 impl std::fmt::Display for Transport {
@@ -1013,8 +992,7 @@ impl DeploymentPlacer for Deployment {
                     .indexers
                     .iter()
                     .map(|idx| {
-                        NodeId::new(idx.clone())
-                            .map_err(|()| format!("{} is not a valid node name", idx))
+                        NodeId::new(idx).map_err(|idx| format!("{} is not a valid node name", idx))
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 Some((shards, indexers))
@@ -1061,7 +1039,7 @@ impl Rule {
             return Err(anyhow!("useless rule without indexers"));
         }
         for indexer in &self.indexers {
-            NodeId::new(indexer).map_err(|()| anyhow!("invalid node id {}", &indexer))?;
+            NodeId::new(indexer).map_err(|indexer| anyhow!("invalid node id {}", indexer))?;
         }
         self.shard_names().map_err(Error::from)?;
         Ok(())
@@ -1349,9 +1327,9 @@ mod tests {
         "#,
         );
 
-        assert_eq!(true, actual.is_err());
+        assert!(actual.is_err());
         let err_str = actual.unwrap_err().to_string();
-        assert_eq!(err_str.contains("missing field `url`"), true, "{}", err_str);
+        assert!(err_str.contains("missing field `url`"), "{}", err_str);
     }
 
     #[test]
@@ -1364,55 +1342,9 @@ mod tests {
         "#,
         );
 
-        assert_eq!(true, actual.is_err());
+        assert!(actual.is_err());
         let err_str = actual.unwrap_err().to_string();
-        assert_eq!(
-            err_str.contains("missing field `features`"),
-            true,
-            "{}",
-            err_str
-        );
-    }
-
-    #[test]
-    fn fails_if_non_substreams_provider_for_substreams_protocol() {
-        let mut actual = toml::from_str::<ChainSection>(
-            r#"
-            ingestor = "block_ingestor_node"
-            [mainnet]
-            shard = "primary"
-            protocol = "substreams"
-            provider = [
-              { label = "firehose", details = { type = "firehose", url = "http://127.0.0.1:8888", token = "TOKEN", features = ["filters"] }},
-            ]
-        "#,
-        )
-        .unwrap();
-        let err = actual.validate().unwrap_err().to_string();
-
-        assert!(err.contains("only supports substreams providers"), "{err}");
-    }
-
-    #[test]
-    fn fails_if_only_substreams_provider_for_non_substreams_protocol() {
-        let mut actual = toml::from_str::<ChainSection>(
-            r#"
-            ingestor = "block_ingestor_node"
-            [mainnet]
-            shard = "primary"
-            protocol = "ethereum"
-            provider = [
-              { label = "firehose", details = { type = "substreams", url = "http://127.0.0.1:8888", token = "TOKEN", features = ["filters"] }},
-            ]
-        "#,
-        )
-        .unwrap();
-        let err = actual.validate().unwrap_err().to_string();
-
-        assert!(
-            err.contains("ethereum protocol requires an rpc or firehose endpoint defined"),
-            "{err}"
-        );
+        assert!(err_str.contains("missing field `features`"), "{}", err_str);
     }
 
     #[test]
@@ -1481,9 +1413,9 @@ mod tests {
         "#,
         );
 
-        assert_eq!(true, actual.is_err());
+        assert!(actual.is_err());
         let err_str = actual.unwrap_err().to_string();
-        assert_eq!(err_str.contains("when `details` field is provided, deprecated `url`, `transport`, `features` and `headers` cannot be specified"),true, "{}", err_str);
+        assert!(err_str.contains("when `details` field is provided, deprecated `url`, `transport`, `features` and `headers` cannot be specified"), "{}", err_str);
     }
 
     #[test]
@@ -1513,55 +1445,16 @@ mod tests {
     }
 
     #[test]
-    fn it_works_on_substreams_provider_from_toml() {
-        let actual = toml::from_str(
+    fn it_fails_for_substreams() {
+        let actual: Result<Provider, _> = toml::from_str(
             r#"
                 label = "bananas"
                 details = { type = "substreams", url = "http://localhost:9000", features = [] }
             "#,
-        )
-        .unwrap();
-
-        assert_eq!(
-            Provider {
-                label: "bananas".to_owned(),
-                details: ProviderDetails::Substreams(FirehoseProvider {
-                    url: "http://localhost:9000".to_owned(),
-                    token: None,
-                    key: None,
-                    features: BTreeSet::new(),
-                    conn_pool_size: 20,
-                    rules: vec![],
-                }),
-            },
-            actual
         );
-    }
-
-    #[test]
-    fn it_works_on_substreams_provider_from_toml_with_api_key() {
-        let actual = toml::from_str(
-            r#"
-                label = "authed"
-                details = { type = "substreams", url = "http://localhost:9000", key = "KEY", features = [] }
-            "#,
-        )
-        .unwrap();
-
-        assert_eq!(
-            Provider {
-                label: "authed".to_owned(),
-                details: ProviderDetails::Substreams(FirehoseProvider {
-                    url: "http://localhost:9000".to_owned(),
-                    token: None,
-                    key: Some("KEY".to_owned()),
-                    features: BTreeSet::new(),
-                    conn_pool_size: 20,
-                    rules: vec![],
-                }),
-            },
-            actual
-        );
+        assert!(actual.is_err());
+        let err = actual.unwrap_err().to_string();
+        assert!(err.contains("unknown variant `substreams`"));
     }
 
     #[test]
@@ -1631,123 +1524,6 @@ mod tests {
     }
 
     #[test]
-    fn it_errors_on_firehose_provider_with_high_limit() {
-        let mut actual = toml::from_str(
-            r#"
-                label = "substreams"
-                details = { type = "substreams", url = "http://localhost:9000" }
-                match = [
-                  { name = "some_node_.*", limit = 101 },
-                  { name = "other_node_.*", limit = 0 } ]
-            "#,
-        )
-        .unwrap();
-
-        assert_eq!(
-            Provider {
-                label: "substreams".to_owned(),
-                details: ProviderDetails::Substreams(FirehoseProvider {
-                    url: "http://localhost:9000".to_owned(),
-                    token: None,
-                    key: None,
-                    features: BTreeSet::new(),
-                    conn_pool_size: 20,
-                    rules: vec![
-                        Web3Rule {
-                            name: Regex::new("some_node_.*").unwrap(),
-                            limit: 101,
-                        },
-                        Web3Rule {
-                            name: Regex::new("other_node_.*").unwrap(),
-                            limit: 0,
-                        }
-                    ],
-                }),
-            },
-            actual
-        );
-        assert! { actual.validate().is_err()};
-    }
-
-    #[test]
-    fn it_works_on_new_substreams_provider_with_doc_example_match() {
-        let mut actual = toml::from_str(
-            r#"
-                label = "substreams"
-                details = { type = "substreams", url = "http://localhost:9000" }
-                match = [
-                  { name = "some_node_.*", limit = 10 },
-                  { name = "other_node_.*", limit = 0 } ]
-            "#,
-        )
-        .unwrap();
-
-        assert_eq!(
-            Provider {
-                label: "substreams".to_owned(),
-                details: ProviderDetails::Substreams(FirehoseProvider {
-                    url: "http://localhost:9000".to_owned(),
-                    token: None,
-                    key: None,
-                    features: BTreeSet::new(),
-                    conn_pool_size: 20,
-                    rules: vec![
-                        Web3Rule {
-                            name: Regex::new("some_node_.*").unwrap(),
-                            limit: 10,
-                        },
-                        Web3Rule {
-                            name: Regex::new("other_node_.*").unwrap(),
-                            limit: 0,
-                        }
-                    ],
-                }),
-            },
-            actual
-        );
-        assert! { actual.validate().is_ok()};
-    }
-
-    #[test]
-    fn it_errors_on_substreams_provider_with_high_limit() {
-        let mut actual = toml::from_str(
-            r#"
-                label = "substreams"
-                details = { type = "substreams", url = "http://localhost:9000" }
-                match = [
-                  { name = "some_node_.*", limit = 101 },
-                  { name = "other_node_.*", limit = 0 } ]
-            "#,
-        )
-        .unwrap();
-
-        assert_eq!(
-            Provider {
-                label: "substreams".to_owned(),
-                details: ProviderDetails::Substreams(FirehoseProvider {
-                    url: "http://localhost:9000".to_owned(),
-                    token: None,
-                    key: None,
-                    features: BTreeSet::new(),
-                    conn_pool_size: 20,
-                    rules: vec![
-                        Web3Rule {
-                            name: Regex::new("some_node_.*").unwrap(),
-                            limit: 101,
-                        },
-                        Web3Rule {
-                            name: Regex::new("other_node_.*").unwrap(),
-                            limit: 0,
-                        }
-                    ],
-                }),
-            },
-            actual
-        );
-        assert! { actual.validate().is_err()};
-    }
-
-    #[test]
     fn it_works_on_new_firehose_provider_from_toml_unsupported_features() {
         let actual = toml::from_str::<Provider>(
             r#"
@@ -1755,15 +1531,12 @@ mod tests {
                 details = { type = "firehose", url = "http://localhost:9000", features = ["bananas"]}
             "#,
         ).unwrap().validate();
-        assert_eq!(true, actual.is_err(), "{:?}", actual);
+        assert!(actual.is_err(), "{:?}", actual);
 
         if let Err(error) = actual {
-            assert_eq!(
-                true,
-                error
-                    .to_string()
-                    .starts_with("supported firehose endpoint filters are:")
-            )
+            assert!(error
+                .to_string()
+                .starts_with("supported firehose endpoint filters are:"))
         }
     }
 
@@ -1862,14 +1635,9 @@ mod tests {
         .unwrap();
 
         let err = actual.validate();
-        assert_eq!(true, err.is_err());
+        assert!(err.is_err());
         let err = err.unwrap_err();
-        assert_eq!(
-            true,
-            err.to_string().contains("unique"),
-            "result: {:?}",
-            err
-        );
+        assert!(err.to_string().contains("unique"), "result: {:?}", err);
     }
 
     #[test]
@@ -1894,7 +1662,7 @@ mod tests {
         .unwrap();
 
         let result = actual.validate();
-        assert_eq!(true, result.is_ok(), "error: {:?}", result.unwrap_err());
+        assert!(result.is_ok(), "error: {:?}", result.unwrap_err());
     }
 
     #[test]
@@ -1944,6 +1712,10 @@ mod tests {
         let query = NodeId::new("query_node_1").unwrap();
         let other = NodeId::new("other_node_1").unwrap();
 
+        let appname = std::env::var("PGAPPNAME").ok();
+        unsafe {
+            std::env::set_var("PGAPPNAME", "config-test");
+        }
         let shard = {
             let mut shard = toml::from_str::<Shard>(
                 r#"
@@ -1961,10 +1733,15 @@ fdw_pool_size = [
             shard.validate("index_node_1").unwrap();
             shard
         };
+        if let Some(appname) = appname {
+            unsafe {
+                std::env::set_var("PGAPPNAME", appname);
+            }
+        }
 
         assert_eq!(
             shard.connection,
-            "postgresql://postgres:postgres@postgres/graph"
+            "postgresql://postgres:postgres@postgres/graph?application_name=config-test"
         );
 
         assert_eq!(shard.pool_size.size_for(&index, "ashard").unwrap(), 20);

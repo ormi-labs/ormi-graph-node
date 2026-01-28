@@ -12,10 +12,6 @@ path = "src/main.rs"
 name = "graphman"
 path = "src/bin/manager.rs"
 
-[[bin]]
-name = "gnd"
-path = "src/bin/dev.rs"
-
 [dependencies]
 anyhow = { workspace = true }
 env_logger = "0.11.8"
@@ -23,12 +19,11 @@ clap.workspace = true
 git-testament = "0.2"
 itertools = { workspace = true }
 lazy_static = "1.5.0"
-url = "2.5.7"
+url = "2.5.8"
 graph = { path = "../graph" }
 graph-core = { path = "../core" }
 graph-chain-ethereum = { path = "../chain/ethereum" }
 graph-chain-near = { path = "../chain/near" }
-graph-chain-substreams = { path = "../chain/substreams" }
 graph-graphql = { path = "../graphql" }
 graph-server-http = { path = "../server/http" }
 graph-server-index-node = { path = "../server/index-node" }
@@ -40,11 +35,14 @@ graphman = { workspace = true }
 serde = { workspace = true }
 shellexpand = "3.1.1"
 termcolor = "1.4.1"
+tokio = { workspace = true }
 diesel = { workspace = true }
+diesel-async = { workspace = true }
 prometheus = { version = "0.14.0", features = ["push"] }
 json-structural-diff = { version = "0.2", features = ["colorize"] }
-globset = "0.4.16"
-notify = "8.2.0"
 
-[target.'cfg(unix)'.dependencies]
-pgtemp = { git = "https://github.com/graphprotocol/pgtemp", branch = "initdb-args" }
+# Dependencies related to Amp subgraphs
+tokio-util.workspace = true
+
+[lints]
+workspace = true

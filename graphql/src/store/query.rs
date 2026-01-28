@@ -219,7 +219,7 @@ fn build_list_filter_from_value(
 }
 
 /// build a filter which has list of nested filters
-fn build_list_filter_from_object<'a>(
+fn build_list_filter_from_object(
     entity: &ObjectOrInterface,
     object: &Object,
     schema: &InputSchema,
@@ -235,13 +235,13 @@ fn build_list_filter_from_object<'a>(
 }
 
 /// Parses a GraphQL input object into an EntityFilter, if present.
-fn build_filter_from_object<'a>(
+fn build_filter_from_object(
     entity: &ObjectOrInterface,
     object: &Object,
     schema: &InputSchema,
 ) -> Result<Vec<EntityFilter>, QueryExecutionError> {
     // Check if we have both column filters and 'or' operator at the same level
-    if let Some(_) = object.get("or") {
+    if object.get("or").is_some() {
         let column_filters: Vec<String> = object
             .iter()
             .filter_map(|(key, _)| {
@@ -738,9 +738,9 @@ mod tests {
             &object,
             BLOCK_NUMBER_MAX,
             field,
-            std::u32::MAX,
-            std::u32::MAX,
-            &*&INPUT_SCHEMA,
+            u32::MAX,
+            u32::MAX,
+            &INPUT_SCHEMA,
         )
         .unwrap()
     }
@@ -1042,9 +1042,9 @@ mod tests {
             &object,
             BLOCK_NUMBER_MAX,
             &query_field,
-            std::u32::MAX,
-            std::u32::MAX,
-            &*INPUT_SCHEMA,
+            u32::MAX,
+            u32::MAX,
+            &INPUT_SCHEMA,
         );
 
         assert!(result.is_err());
@@ -1100,9 +1100,9 @@ mod tests {
             &object,
             BLOCK_NUMBER_MAX,
             &query_field,
-            std::u32::MAX,
-            std::u32::MAX,
-            &*INPUT_SCHEMA,
+            u32::MAX,
+            u32::MAX,
+            &INPUT_SCHEMA,
         );
 
         assert!(result.is_err());
@@ -1194,9 +1194,9 @@ mod tests {
             &object,
             BLOCK_NUMBER_MAX,
             &query_field,
-            std::u32::MAX,
-            std::u32::MAX,
-            &*INPUT_SCHEMA,
+            u32::MAX,
+            u32::MAX,
+            &INPUT_SCHEMA,
         );
 
         assert!(result.is_err());

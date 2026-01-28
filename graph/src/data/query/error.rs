@@ -1,4 +1,3 @@
-use graphql_parser::Pos;
 use hex::FromHexError;
 use serde::ser::*;
 use std::collections::HashMap;
@@ -26,20 +25,20 @@ pub enum QueryExecutionError {
     OperationNameRequired,
     OperationNotFound(String),
     NotSupported(String),
-    NonNullError(Pos, String),
-    ListValueError(Pos, String),
+    NonNullError(q::Pos, String),
+    ListValueError(q::Pos, String),
     NamedTypeError(String),
     AbstractTypeError(String),
-    InvalidArgumentError(Pos, String, q::Value),
-    MissingArgumentError(Pos, String),
-    ValidationError(Option<Pos>, String),
-    InvalidVariableTypeError(Pos, String),
-    MissingVariableError(Pos, String),
+    InvalidArgumentError(q::Pos, String, q::Value),
+    MissingArgumentError(q::Pos, String),
+    ValidationError(Option<q::Pos>, String),
+    InvalidVariableTypeError(q::Pos, String),
+    MissingVariableError(q::Pos, String),
     ResolveEntitiesError(String),
     OrderByNotSupportedError(String, String),
     OrderByNotSupportedForType(String),
     FilterNotSupportedError(String, String),
-    UnknownField(Pos, String, String),
+    UnknownField(q::Pos, String, String),
     EmptyQuery,
     InvalidOrFilterStructure(Vec<String>, String),
     SubgraphDeploymentIdError(String),
@@ -55,10 +54,10 @@ pub enum QueryExecutionError {
     StoreError(CloneableAnyhowError),
     Timeout,
     EmptySelectionSet(String),
-    AmbiguousDerivedFromResult(Pos, String, String, String),
+    AmbiguousDerivedFromResult(q::Pos, String, String, String),
     Unimplemented(String),
-    EnumCoercionError(Pos, String, q::Value, String, Vec<String>),
-    ScalarCoercionError(Pos, String, q::Value, String),
+    EnumCoercionError(q::Pos, String, q::Value, String, Vec<String>),
+    ScalarCoercionError(q::Pos, String, q::Value, String),
     TooComplex(u64, u64), // (complexity, max_complexity)
     TooDeep(u8),          // max_depth
     CyclicalFragment(String),
@@ -73,6 +72,7 @@ pub enum QueryExecutionError {
     InvalidSubgraphManifest,
     ResultTooBig(usize, usize),
     DeploymentNotFound(String),
+    SqlError(String),
     IdMissing,
     IdNotString,
     InternalError(String),
@@ -135,6 +135,7 @@ impl QueryExecutionError {
             | IdMissing
             | IdNotString
             | InternalError(_) => false,
+            SqlError(_) => false,
         }
     }
 }
@@ -213,7 +214,7 @@ impl fmt::Display for QueryExecutionError {
             }
             InvalidFilterError => write!(f, "Filter must by an object"),
             InvalidOrFilterStructure(fields, example) => {
-                write!(f, "Cannot mix column filters with 'or' operator at the same level. Found column filter(s) {} alongside 'or' operator.\n\n{}", 
+                write!(f, "Cannot mix column filters with 'or' operator at the same level. Found column filter(s) {} alongside 'or' operator.\n\n{}",
                     fields.join(", "), example)
             }
             EntityFieldError(e, a) => {
@@ -281,6 +282,7 @@ impl fmt::Display for QueryExecutionError {
             IdMissing => write!(f, "entity is missing an `id` attribute"),
             IdNotString => write!(f, "entity `id` attribute is not a string"),
             InternalError(msg) => write!(f, "internal error: {}", msg),
+            SqlError(e) => write!(f, "sql error: {}", e),
         }
     }
 }

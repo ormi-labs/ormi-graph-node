@@ -258,8 +258,8 @@ where
             resolver: introspection_resolver,
             query: self.query.cheap_clone(),
             deadline: self.deadline,
-            max_first: std::u32::MAX,
-            max_skip: std::u32::MAX,
+            max_first: u32::MAX,
+            max_skip: u32::MAX,
 
             // `cache_status` is a dead value for the introspection context.
             cache_status: AtomicCell::new(CacheStatus::Miss),
@@ -296,7 +296,7 @@ pub(crate) async fn execute_root_selection_set_uncached(
     let (mut values, trace) = if data_set.is_empty() && meta_items.is_empty() {
         (Object::default(), Trace::None)
     } else {
-        let (initial_data, trace) = ctx.resolver.prefetch(ctx, &data_set)?;
+        let (initial_data, trace) = ctx.resolver.prefetch(ctx, &data_set).await?;
         data_set.push_fields(meta_items)?;
         (
             execute_selection_set_to_map(ctx, &data_set, root_type, initial_data).await?,
@@ -309,7 +309,7 @@ pub(crate) async fn execute_root_selection_set_uncached(
         let ictx = ctx.as_introspection_context();
 
         values.append(
-            execute_selection_set_to_map(&ictx, &intro_set, &*INTROSPECTION_QUERY_TYPE, None)
+            execute_selection_set_to_map(&ictx, &intro_set, &INTROSPECTION_QUERY_TYPE, None)
                 .await?,
         );
     }
@@ -629,7 +629,6 @@ async fn resolve_field_value(
         s::Type::ListType(inner_type) => {
             resolve_field_value_for_list_type(
                 ctx,
-                object_type,
                 field_value,
                 field,
                 field_definition,
@@ -692,7 +691,6 @@ async fn resolve_field_value_for_named_type(
 #[async_recursion]
 async fn resolve_field_value_for_list_type(
     ctx: &ExecutionContext<impl Resolver>,
-    object_type: &s::ObjectType,
     field_value: Option<r::Value>,
     field: &a::Field,
     field_definition: &s::Field,
@@ -700,15 +698,8 @@ async fn resolve_field_value_for_list_type(
 ) -> Result<r::Value, Vec<QueryExecutionError>> {
     match inner_type {
         s::Type::NonNullType(inner_type) => {
-            resolve_field_value_for_list_type(
-                ctx,
-                object_type,
-                field_value,
-                field,
-                field_definition,
-                inner_type,
-            )
-            .await
+            resolve_field_value_for_list_type(ctx, field_value, field, field_definition, inner_type)
+                .await
         }
 
         s::Type::NamedType(ref type_name) => {
@@ -898,8 +889,8 @@ async fn complete_value(
 }
 
 /// Resolves an abstract type (interface, union) into an object type based on the given value.
-fn resolve_abstract_type<'a>(
-    ctx: &'a ExecutionContext<impl Resolver>,
+fn resolve_abstract_type(
+    ctx: &ExecutionContext<impl Resolver>,
     abstract_type: &s::TypeDefinition,
     object_value: &r::Value,
 ) -> Result<sast::ObjectType, Vec<QueryExecutionError>> {

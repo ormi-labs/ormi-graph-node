@@ -216,6 +216,11 @@ those.
   decisions. Set to `true` to turn simulation on, defaults to `false`
 - `GRAPH_STORE_CONNECTION_TIMEOUT`: How long to wait to connect to a
   database before assuming the database is down in ms. Defaults to 5000ms.
+- `GRAPH_STORE_CONNECTION_UNAVAILABLE_RETRY`: When a database shard is marked
+  unavailable due to connection timeouts, this controls how often to allow a
+  single probe request through to check if the database has recovered. Only one
+  request per interval will attempt a connection; all others fail instantly.
+  Value is in seconds and defaults to 2s.
 - `EXPERIMENTAL_SUBGRAPH_VERSION_SWITCHING_MODE`: default is `instant`, set
   to `synced` to only switch a named subgraph to a new deployment once it
   has synced, making the new deployment the "Pending" version.
@@ -284,3 +289,21 @@ those.
   graph-node bugs, but since it is hard to work around them, setting this
   variable to something like 10 makes it possible to work around such a bug
   while it is being fixed (default: 0)
+- `GRAPH_ENABLE_SQL_QUERIES`: Enable the experimental [SQL query
+  interface](implementation/sql-interface.md).
+  (default: false)
+- `GRAPH_STORE_ACCOUNT_LIKE_SCAN_INTERVAL_HOURS`: If set, enables an experimental job that
+  periodically scans for entity tables that may benefit from an [account-like optimization](https://thegraph.com/docs/en/indexing/tooling/graph-node/#account-like-optimisation) and marks them with an
+  account-like flag. The value is the interval in hours at which the job
+  should run. The job reads data from the `info.table_stats` materialized view, which refreshes every six hours.
+  Expects an integer value, e.g., 24. Requires also setting
+  `GRAPH_STORE_ACCOUNT_LIKE_MIN_VERSIONS_COUNT` and `GRAPH_STORE_ACCOUNT_LIKE_MAX_UNIQUE_RATIO`.
+- `GRAPH_STORE_ACCOUNT_LIKE_MIN_VERSIONS_COUNT`: Sets the minimum total number of versions a table must have
+  to be considered for account-like flagging. Expects a positive integer value. No default value.
+- `GRAPH_STORE_ACCOUNT_LIKE_MAX_UNIQUE_RATIO`: Sets the maximum unique entities to version ratio
+  (e.g., 0.01 ≈ 1:100 entity-to-version ratio).
+- `GRAPH_STORE_DISABLE_CALL_CACHE`: Disables storing or reading `eth_call` results from the store call cache.
+  This option may be useful for indexers who are running their own RPC nodes.
+  Disabling the store call cache may significantly impact performance; the actual impact depends on
+  the average execution time of an `eth_call` compared to the cost of a database lookup for a cached result.
+  (default: false)

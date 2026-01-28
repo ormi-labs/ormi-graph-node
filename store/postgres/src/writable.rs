@@ -1,11 +1,14 @@
 use std::collections::BTreeSet;
 use std::ops::{Deref, Range};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, RwLock, TryLockError as RwLockError};
+use std::sync::Mutex;
+
+use graph::parking_lot::RwLock;
 use std::time::Instant;
 use std::{collections::BTreeMap, sync::Arc};
 
 use async_trait::async_trait;
+use diesel_async::scoped_futures::ScopedFutureExt;
 use graph::blockchain::block_stream::{EntitySourceOperation, FirehoseCursor};
 use graph::blockchain::BlockTime;
 use graph::components::store::{Batch, DeploymentCursorTracker, DerivedEntityQuery, ReadStore};
@@ -19,27 +22,27 @@ use graph::prelude::{
 };
 use graph::schema::{EntityKey, EntityType, InputSchema};
 use graph::slog::{debug, info, warn};
-use graph::tokio::select;
-use graph::tokio::sync::Notify;
-use graph::tokio::task::JoinHandle;
 use graph::util::bounded_queue::BoundedQueue;
 use graph::{
     cheap_clone::CheapClone,
     components::store::{self, write::EntityOp, WritableStore as WritableStoreTrait},
     data::subgraph::schema::SubgraphError,
     prelude::{
-        BlockPtr, DeploymentHash, EntityModification, Error, Logger, StopwatchMetrics, StoreError,
+        BlockPtr, DeploymentHash, EntityModification, Logger, StopwatchMetrics, StoreError,
         StoreEvent, UnfailOutcome, ENV_VARS,
     },
     slog::error,
 };
 use store::StoredDynamicDataSource;
+use tokio::select;
+use tokio::sync::Notify;
+use tokio::task::JoinHandle;
 
 use crate::deployment_store::DeploymentStore;
 use crate::primary::DeploymentId;
 use crate::relational::index::IndexList;
-use crate::retry;
 use crate::{primary, primary::Site, relational::Layout, SubgraphStore};
+use crate::{retry, NotificationSender};
 
 /// A wrapper around `SubgraphStore` that only exposes functions that are
 /// safe to call from `WritableStore`, i.e., functions that either do not
@@ -49,28 +52,31 @@ use crate::{primary, primary::Site, relational::Layout, SubgraphStore};
 struct WritableSubgraphStore(SubgraphStore);
 
 impl WritableSubgraphStore {
-    fn primary_conn(&self) -> Result<primary::Connection<'_>, StoreError> {
-        self.0.primary_conn()
+    async fn primary_conn(&self) -> Result<primary::Connection, StoreError> {
+        self.0.primary_conn().await
     }
 
-    pub(crate) fn send_store_event(&self, event: &StoreEvent) -> Result<(), StoreError> {
-        self.0.send_store_event(event)
+    fn notification_sender(&self) -> Arc<NotificationSender> {
+        self.0.notification_sender()
     }
 
-    fn layout(&self, id: &DeploymentHash) -> Result<Arc<Layout>, StoreError> {
-        self.0.layout(id)
+    async fn layout(&self, id: &DeploymentHash) -> Result<Arc<Layout>, StoreError> {
+        self.0.layout(id).await
     }
 
-    fn load_deployment(&self, site: Arc<Site>) -> Result<SubgraphDeploymentEntity, StoreError> {
-        self.0.load_deployment(site)
+    async fn load_deployment(
+        &self,
+        site: Arc<Site>,
+    ) -> Result<SubgraphDeploymentEntity, StoreError> {
+        self.0.load_deployment(site).await
     }
 
-    fn find_site(&self, id: DeploymentId) -> Result<Arc<Site>, StoreError> {
-        self.0.find_site(id)
+    async fn find_site(&self, id: DeploymentId) -> Result<Arc<Site>, StoreError> {
+        self.0.find_site(id).await
     }
 
-    fn load_indexes(&self, site: Arc<Site>) -> Result<IndexList, StoreError> {
-        self.0.load_indexes(site)
+    async fn load_indexes(&self, site: Arc<Site>) -> Result<IndexList, StoreError> {
+        self.0.load_indexes(site).await
     }
 }
 
@@ -86,7 +92,7 @@ pub enum LastRollup {
 }
 
 impl LastRollup {
-    fn new(
+    async fn new(
         store: Arc<DeploymentStore>,
         site: Arc<Site>,
         has_aggregations: bool,
@@ -96,9 +102,9 @@ impl LastRollup {
             (false, _) => LastRollup::NotNeeded,
             (true, None) => LastRollup::Unknown,
             (true, Some(_)) => {
-                let block_time = store.block_time(site)?;
+                let block_time = store.block_time(site).await?;
                 block_time
-                    .map(|b| LastRollup::Some(b))
+                    .map(LastRollup::Some)
                     .unwrap_or(LastRollup::Unknown)
             }
         };
@@ -109,7 +115,7 @@ impl LastRollup {
 pub struct LastRollupTracker(Mutex<LastRollup>);
 
 impl LastRollupTracker {
-    fn new(
+    async fn new(
         store: Arc<DeploymentStore>,
         site: Arc<Site>,
         has_aggregations: bool,
@@ -121,7 +127,8 @@ impl LastRollupTracker {
             has_aggregations,
             block,
         )
-        .map(|kind| Mutex::new(kind))?;
+        .await
+        .map(Mutex::new)?;
         Ok(Self(rollup))
     }
 
@@ -172,13 +179,14 @@ impl SyncStore {
     ) -> Result<Self, StoreError> {
         let store = WritableSubgraphStore(subgraph_store.clone());
         let writable = subgraph_store.for_site(site.as_ref())?.clone();
-        let input_schema = subgraph_store.input_schema(&site.deployment)?;
+        let input_schema = subgraph_store.input_schema(&site.deployment).await?;
         let last_rollup = LastRollupTracker::new(
             writable.cheap_clone(),
             site.cheap_clone(),
             input_schema.has_aggregations(),
             block,
-        )?;
+        )
+        .await?;
 
         Ok(Self {
             logger,
@@ -195,7 +203,7 @@ impl SyncStore {
 // Methods that mirror `WritableStoreTrait`
 impl SyncStore {
     async fn block_ptr(&self) -> Result<Option<BlockPtr>, StoreError> {
-        retry::forever_async(&self.logger, "block_ptr", || {
+        retry::forever(&self.logger, "block_ptr", || {
             let site = self.site.clone();
             async move { self.writable.block_ptr(site).await }
         })
@@ -203,71 +211,75 @@ impl SyncStore {
     }
 
     async fn block_cursor(&self) -> Result<FirehoseCursor, StoreError> {
-        self.writable
-            .block_cursor(self.site.cheap_clone())
-            .await
-            .map(FirehoseCursor::from)
+        self.writable.block_cursor(self.site.cheap_clone()).await
     }
 
-    fn start_subgraph_deployment(&self, logger: &Logger) -> Result<(), StoreError> {
-        retry::forever(&self.logger, "start_subgraph_deployment", || {
-            let graft_base = match self.writable.graft_pending(&self.site.deployment)? {
+    async fn start_subgraph_deployment(&self, logger: &Logger) -> Result<(), StoreError> {
+        retry::forever(&self.logger, "start_subgraph_deployment", || async {
+            let graft_base = match self.writable.graft_pending(&self.site.deployment).await? {
                 Some((base_id, base_ptr)) => {
-                    let src = self.store.layout(&base_id)?;
-                    let deployment_entity = self.store.load_deployment(src.site.clone())?;
-                    let indexes = self.store.load_indexes(src.site.clone())?;
+                    let src = self.store.layout(&base_id).await?;
+                    let deployment_entity = self.store.load_deployment(src.site.clone()).await?;
+                    let indexes = self.store.load_indexes(src.site.clone()).await?;
                     Some((src, base_ptr, deployment_entity, indexes))
                 }
                 None => None,
             };
-            graph::block_on(
-                self.writable
-                    .start_subgraph(logger, self.site.clone(), graft_base),
-            )?;
-            self.store.primary_conn()?.copy_finished(self.site.as_ref())
+            self.writable
+                .start_subgraph(logger, self.site.clone(), graft_base)
+                .await?;
+            self.store
+                .primary_conn()
+                .await?
+                .copy_finished(self.site.as_ref())
+                .await
         })
+        .await
     }
 
-    fn revert_block_operations(
+    async fn revert_block_operations(
         &self,
         block_ptr_to: BlockPtr,
         firehose_cursor: &FirehoseCursor,
     ) -> Result<(), StoreError> {
-        retry::forever(&self.logger, "revert_block_operations", || {
-            self.writable.revert_block_operations(
-                self.site.clone(),
-                block_ptr_to.clone(),
-                firehose_cursor,
-            )?;
+        retry::forever(&self.logger, "revert_block_operations", || async {
+            self.writable
+                .revert_block_operations(self.site.clone(), block_ptr_to.clone(), firehose_cursor)
+                .await?;
 
-            let block_time = self.writable.block_time(self.site.cheap_clone())?;
+            let block_time = self.writable.block_time(self.site.cheap_clone()).await?;
             self.last_rollup.set(block_time)
         })
+        .await
     }
 
-    fn unfail_deterministic_error(
+    async fn unfail_deterministic_error(
         &self,
         current_ptr: &BlockPtr,
         parent_ptr: &BlockPtr,
     ) -> Result<UnfailOutcome, StoreError> {
-        retry::forever(&self.logger, "unfail_deterministic_error", || {
+        retry::forever(&self.logger, "unfail_deterministic_error", || async {
             self.writable
                 .unfail_deterministic_error(self.site.clone(), current_ptr, parent_ptr)
+                .await
         })
+        .await
     }
 
-    fn unfail_non_deterministic_error(
+    async fn unfail_non_deterministic_error(
         &self,
         current_ptr: &BlockPtr,
     ) -> Result<UnfailOutcome, StoreError> {
-        retry::forever(&self.logger, "unfail_non_deterministic_error", || {
+        retry::forever(&self.logger, "unfail_non_deterministic_error", || async {
             self.writable
                 .unfail_non_deterministic_error(self.site.clone(), current_ptr)
+                .await
         })
+        .await
     }
 
     async fn fail_subgraph(&self, error: SubgraphError) -> Result<(), StoreError> {
-        retry::forever_async(&self.logger, "fail_subgraph", || {
+        retry::forever(&self.logger, "fail_subgraph", || {
             let error = error.clone();
             async {
                 self.writable
@@ -279,34 +291,40 @@ impl SyncStore {
         .await
     }
 
-    fn get(&self, key: &EntityKey, block: BlockNumber) -> Result<Option<Entity>, StoreError> {
-        retry::forever(&self.logger, "get", || {
-            self.writable.get(self.site.cheap_clone(), key, block)
+    async fn get(&self, key: &EntityKey, block: BlockNumber) -> Result<Option<Entity>, StoreError> {
+        retry::forever(&self.logger, "get", || async {
+            self.writable.get(self.site.cheap_clone(), key, block).await
         })
+        .await
     }
 
-    fn transact_block_operations(
+    async fn transact_block_operations(
         &self,
         batch: &Batch,
         stopwatch: &StopwatchMetrics,
     ) -> Result<(), StoreError> {
         retry::forever(&self.logger, "transact_block_operations", move || {
-            self.writable.transact_block_operations(
-                &self.logger,
-                self.site.clone(),
-                batch,
-                self.last_rollup.get(),
-                stopwatch,
-                &self.manifest_idx_and_name,
-            )?;
-            // unwrap: batch.block_times is never empty
-            let last_block_time = batch.block_times.last().unwrap().1;
-            self.last_rollup.set(Some(last_block_time))?;
-            Ok(())
+            async move {
+                self.writable
+                    .transact_block_operations(
+                        &self.logger,
+                        self.site.clone(),
+                        batch,
+                        self.last_rollup.get(),
+                        stopwatch,
+                        &self.manifest_idx_and_name,
+                    )
+                    .await?;
+                // unwrap: batch.block_times is never empty
+                let last_block_time = batch.block_times.last().unwrap().1;
+                self.last_rollup.set(Some(last_block_time))?;
+                Ok(())
+            }
         })
+        .await
     }
 
-    fn get_many(
+    async fn get_many(
         &self,
         keys: BTreeSet<EntityKey>,
         block: BlockNumber,
@@ -320,26 +338,30 @@ impl SyncStore {
                 .push(key.entity_id)?;
         }
 
-        retry::forever(&self.logger, "get_many", || {
+        retry::forever(&self.logger, "get_many", || async {
             self.writable
                 .get_many(self.site.cheap_clone(), &by_type, block)
+                .await
         })
+        .await
     }
 
-    fn get_derived(
+    async fn get_derived(
         &self,
         key: &DerivedEntityQuery,
         block: BlockNumber,
         excluded_keys: Vec<EntityKey>,
     ) -> Result<BTreeMap<EntityKey, Entity>, StoreError> {
-        retry::forever(&self.logger, "get_derived", || {
+        retry::forever(&self.logger, "get_derived", || async {
             self.writable
                 .get_derived(self.site.cheap_clone(), key, block, &excluded_keys)
+                .await
         })
+        .await
     }
 
     async fn is_deployment_synced(&self) -> Result<bool, StoreError> {
-        retry::forever_async(&self.logger, "is_deployment_synced", || async {
+        retry::forever(&self.logger, "is_deployment_synced", || async {
             self.writable
                 .exists_and_synced(self.site.deployment.cheap_clone())
                 .await
@@ -347,26 +369,42 @@ impl SyncStore {
         .await
     }
 
-    fn unassign_subgraph(&self, site: &Site) -> Result<(), StoreError> {
-        retry::forever(&self.logger, "unassign_subgraph", || {
-            let mut pconn = self.store.primary_conn()?;
-            pconn.transaction(|conn| -> Result<_, StoreError> {
-                let mut pconn = primary::Connection::new(conn);
-                let changes = pconn.unassign_subgraph(site)?;
-                self.store.send_store_event(&StoreEvent::new(changes))
-            })
+    async fn unassign_subgraph(&self, site: &Site) -> Result<(), StoreError> {
+        retry::forever(&self.logger, "unassign_subgraph", || async {
+            let mut pconn = self.store.primary_conn().await?;
+            let sender = self.store.notification_sender();
+            pconn
+                .transaction(|pconn| {
+                    async {
+                        let changes = pconn.unassign_subgraph(site).await?;
+                        pconn
+                            .send_store_event(&sender, &StoreEvent::new(changes))
+                            .await
+                    }
+                    .scope_boxed()
+                })
+                .await
         })
+        .await
     }
 
-    fn pause_subgraph(&self, site: &Site) -> Result<(), StoreError> {
-        retry::forever(&self.logger, "unassign_subgraph", || {
-            let mut pconn = self.store.primary_conn()?;
-            pconn.transaction(|conn| -> Result<_, StoreError> {
-                let mut pconn = primary::Connection::new(conn);
-                let changes = pconn.pause_subgraph(site)?;
-                self.store.send_store_event(&StoreEvent::new(changes))
-            })
+    async fn pause_subgraph(&self, site: &Site) -> Result<(), StoreError> {
+        retry::forever(&self.logger, "pause_subgraph", || async {
+            let mut pconn = self.store.primary_conn().await?;
+            let sender = self.store.notification_sender();
+            pconn
+                .transaction(|pconn| {
+                    async {
+                        let changes = pconn.pause_subgraph(site).await?;
+                        pconn
+                            .send_store_event(&sender, &StoreEvent::new(changes))
+                            .await
+                    }
+                    .scope_boxed()
+                })
+                .await
         })
+        .await
     }
 
     async fn load_dynamic_data_sources(
@@ -374,7 +412,7 @@ impl SyncStore {
         block: BlockNumber,
         manifest_idx_and_name: Vec<(u32, String)>,
     ) -> Result<Vec<StoredDynamicDataSource>, StoreError> {
-        retry::forever_async(&self.logger, "load_dynamic_data_sources", || async {
+        retry::forever(&self.logger, "load_dynamic_data_sources", || async {
             self.writable
                 .load_dynamic_data_sources(
                     self.site.cheap_clone(),
@@ -389,7 +427,7 @@ impl SyncStore {
     pub(crate) async fn causality_region_curr_val(
         &self,
     ) -> Result<Option<CausalityRegion>, StoreError> {
-        retry::forever_async(&self.logger, "causality_region_curr_val", || async {
+        retry::forever(&self.logger, "causality_region_curr_val", || async {
             self.writable
                 .causality_region_curr_val(self.site.cheap_clone())
                 .await
@@ -397,51 +435,61 @@ impl SyncStore {
         .await
     }
 
-    fn maybe_find_site(&self, src: DeploymentId) -> Result<Option<Arc<Site>>, StoreError> {
-        match self.store.find_site(src) {
+    async fn maybe_find_site(&self, src: DeploymentId) -> Result<Option<Arc<Site>>, StoreError> {
+        match self.store.find_site(src).await {
             Ok(site) => Ok(Some(site)),
             Err(StoreError::DeploymentNotFound(_)) => Ok(None),
             Err(e) => Err(e),
         }
     }
 
-    fn deployment_synced(&self, block_ptr: BlockPtr) -> Result<(), StoreError> {
-        retry::forever(&self.logger, "deployment_synced", || {
+    async fn deployment_synced(&self, block_ptr: BlockPtr) -> Result<(), StoreError> {
+        retry::forever(&self.logger, "deployment_synced", || async {
             let event = {
                 // Make sure we drop `pconn` before we call into the deployment
                 // store so that we do not hold two database connections which
                 // might come from the same pool and could therefore deadlock
-                let mut pconn = self.store.primary_conn()?;
-                pconn.transaction(|conn| -> Result<_, Error> {
-                    let mut pconn = primary::Connection::new(conn);
-                    let changes = pconn.promote_deployment(&self.site.deployment)?;
-                    Ok(StoreEvent::new(changes))
-                })?
+                let mut pconn = self.store.primary_conn().await?;
+                pconn
+                    .transaction(|pconn| {
+                        async {
+                            let changes = pconn.promote_deployment(&self.site.deployment).await?;
+                            Ok(StoreEvent::new(changes))
+                        }
+                        .scope_boxed()
+                    })
+                    .await?
             };
 
             // Handle on_sync actions. They only apply to copies (not
             // grafts) so we make sure that the source, if it exists, has
             // the same hash as `self.site`
-            if let Some(src) = self.writable.source_of_copy(&self.site)? {
-                if let Some(src) = self.maybe_find_site(src)? {
+            if let Some(src) = self.writable.source_of_copy(&self.site).await? {
+                if let Some(src) = self.maybe_find_site(src).await? {
                     if src.deployment == self.site.deployment {
-                        let on_sync = self.writable.on_sync(&self.site)?;
+                        let on_sync = self.writable.on_sync(&self.site).await?;
                         if on_sync.activate() {
-                            let mut pconn = self.store.primary_conn()?;
-                            pconn.activate(&self.site.as_ref().into())?;
+                            let mut pconn = self.store.primary_conn().await?;
+                            pconn.activate(&self.site.as_ref().into()).await?;
                         }
                         if on_sync.replace() {
-                            self.unassign_subgraph(&src)?;
+                            self.unassign_subgraph(&src).await?;
                         }
                     }
                 }
             }
 
             self.writable
-                .deployment_synced(&self.site.deployment, block_ptr.clone())?;
+                .deployment_synced(&self.site.deployment, block_ptr.clone())
+                .await?;
 
-            self.store.send_store_event(&event)
+            let mut pconn = self.store.primary_conn().await?;
+            let sender = self.store.notification_sender();
+            pconn
+                .transaction(|pconn| pconn.send_store_event(&sender, &event).scope_boxed())
+                .await
         })
+        .await
     }
 
     fn shard(&self) -> &str {
@@ -449,7 +497,7 @@ impl SyncStore {
     }
 
     async fn health(&self) -> Result<schema::SubgraphHealth, StoreError> {
-        retry::forever_async(&self.logger, "health", || async {
+        retry::forever(&self.logger, "health", || async {
             self.writable.health(&self.site).await.map(Into::into)
         })
         .await
@@ -528,7 +576,7 @@ impl BlockTracker {
         // processed.
         let res = queue.find_map(|req| match req.as_ref() {
             Request::Write { batch, .. } => {
-                let batch = batch.read().unwrap();
+                let batch = batch.read();
                 tracker.write(&batch.block_ptr);
                 if batch.first_block <= tracker.revert {
                     let res = f(batch.deref(), tracker.revert);
@@ -567,7 +615,7 @@ impl BlockTracker {
         let accum = queue.fold(init, |accum, req| {
             match req.as_ref() {
                 Request::Write { batch, .. } => {
-                    let batch = batch.read().unwrap();
+                    let batch = batch.read();
                     let mut accum = accum;
                     tracker.write(&batch.block_ptr);
                     if batch.first_block <= tracker.revert {
@@ -589,12 +637,79 @@ impl BlockTracker {
     }
 }
 
+/// A batch that is queued for writing. The read methods on the `Queue` like
+/// `get` and `get_many` need to be able to read from a batch until the
+/// database changes that the batch contains have been committed. At the
+/// same time, once the background writer starts processing a batch, it must
+/// not be modified. This enum makes it possible to do this without cloning
+/// the batch or holding a lock across an await point.
+///
+/// When a batch is first added to the queue, it can still be appended to
+/// (`Open`). Once the background writer starts processing the batch, it is
+/// closed (`Closed`) and can no longer be modified.
+///
+/// The `processed` flag in the `Request` is a shortcut to determine whether
+/// a batch can still be appended to
+enum QueuedBatch {
+    /// An open batch that can still be appended to
+    Open(Box<Batch>),
+    /// A closed batch that can no longer be modified
+    Closed(Arc<Batch>),
+    /// Temporary placeholder during state transitions. Must never be
+    /// observed outside of `QueuedBatch::close`.
+    Invalid,
+}
+
+impl Deref for QueuedBatch {
+    type Target = Batch;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            QueuedBatch::Open(batch) => batch,
+            QueuedBatch::Closed(batch) => batch.as_ref(),
+            QueuedBatch::Invalid => unreachable!("deref is never called on a QueuedBatch::Invalid"),
+        }
+    }
+}
+
+impl QueuedBatch {
+    /// Append another batch to this one. Returns an error if this batch is
+    /// closed
+    fn append(&mut self, other: Batch) -> Result<(), StoreError> {
+        match self {
+            QueuedBatch::Open(batch) => batch.append(other),
+            QueuedBatch::Closed(_) => Err(internal_error!("attempt to append to closed batch")),
+            QueuedBatch::Invalid => {
+                unreachable!("append is never called on a QueuedBatch::Invalid")
+            }
+        }
+    }
+
+    /// Close the current batch, i.e., replace it by a `Closed` batch and
+    /// return a clone of the `Arc<Batch>` that the closed batch now holds
+    fn close(&mut self) -> Arc<Batch> {
+        let old = std::mem::replace(self, QueuedBatch::Invalid);
+        *self = match old {
+            QueuedBatch::Open(batch) => QueuedBatch::Closed(Arc::new(*batch)),
+            closed @ QueuedBatch::Closed(_) => closed,
+            QueuedBatch::Invalid => unreachable!("close is never called on a QueuedBatch::Invalid"),
+        };
+        match self {
+            QueuedBatch::Closed(batch) => batch.cheap_clone(),
+            QueuedBatch::Open(_) | QueuedBatch::Invalid => {
+                unreachable!("close must have set self to Closed")
+            }
+        }
+    }
+}
+
 /// A write request received from the `WritableStore` frontend that gets
 /// queued
 ///
 /// The `processed` flag is set to true as soon as the background writer is
 /// working on that request. Once it has been set, no changes can be made to
 /// the request
+#[allow(clippy::large_enum_variant)]
 enum Request {
     Write {
         queued: Instant,
@@ -605,7 +720,12 @@ enum Request {
         // will try to read the batch. The batch only becomes truly readonly
         // when we decide to process it at which point we set `processed` to
         // `true`
-        batch: RwLock<Batch>,
+        batch: RwLock<QueuedBatch>,
+        /// True if the background writer has started processing this
+        /// request. It is guaranteed that once the batch is a
+        /// `QueuedBatch::Closed`, this flag is true. This flag serves as a
+        /// shortcut to check that without having to acquire the lock around
+        /// the batch.
         processed: AtomicBool,
     },
     RevertTo {
@@ -622,7 +742,7 @@ impl std::fmt::Debug for Request {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Write { batch, store, .. } => {
-                let batch = batch.read().unwrap();
+                let batch = batch.read();
                 write!(
                     f,
                     "write[{}, {:p}, {} entities]",
@@ -650,7 +770,7 @@ impl Request {
             queued: Instant::now(),
             store,
             stopwatch,
-            batch: RwLock::new(batch),
+            batch: RwLock::new(QueuedBatch::Open(Box::new(batch))),
             processed: AtomicBool::new(false),
         }
     }
@@ -682,7 +802,7 @@ impl Request {
         }
     }
 
-    fn execute(&self) -> Result<ExecResult, StoreError> {
+    async fn execute(&self) -> Result<ExecResult, StoreError> {
         match self {
             Request::Write {
                 batch,
@@ -692,7 +812,9 @@ impl Request {
                 processed: _,
             } => {
                 let start = Instant::now();
-                let batch = batch.read().unwrap();
+
+                let batch = batch.write().close();
+
                 if let Some(err) = &batch.error {
                     // This can happen when appending to the batch failed
                     // because of an internal error. Returning an `Err` here
@@ -700,7 +822,8 @@ impl Request {
                     return Err(err.clone());
                 }
                 let res = store
-                    .transact_block_operations(batch.deref(), stopwatch)
+                    .transact_block_operations(&batch, stopwatch)
+                    .await
                     .map(|()| ExecResult::Continue);
                 info!(store.logger, "Committed write batch";
                         "block_number" => batch.block_ptr.number,
@@ -717,6 +840,7 @@ impl Request {
                 processed: _,
             } => store
                 .revert_block_operations(block_ptr.clone(), firehose_cursor)
+                .await
                 .map(|()| ExecResult::Continue),
             Request::Stop => Ok(ExecResult::Stop),
         }
@@ -728,7 +852,7 @@ impl Request {
     fn should_process(&self) -> bool {
         match self {
             Request::Write { queued, batch, .. } => {
-                batch.read().unwrap().weight() >= ENV_VARS.store.write_batch_size
+                batch.read().weight() >= ENV_VARS.store.write_batch_size
                     || queued.elapsed() >= ENV_VARS.store.write_batch_duration
             }
             Request::RevertTo { .. } | Request::Stop => true,
@@ -882,7 +1006,7 @@ impl Queue {
                         // batch should be processed or after some time
                         // passed. The latter is just for safety in case
                         // there is a mistake with notifications.
-                        let sleep = graph::tokio::time::sleep(ENV_VARS.store.write_batch_duration);
+                        let sleep = tokio::time::sleep(ENV_VARS.store.write_batch_duration);
                         let notify = batch_stop_notify.notified();
                         select!(
                             () = sleep => (),
@@ -906,7 +1030,7 @@ impl Queue {
                 };
                 let res = {
                     let _section = queue.stopwatch.start_section("queue_execute");
-                    graph::spawn_blocking_allow_panic(move || req.execute()).await
+                    graph::spawn_blocking_allow_panic(move || graph::block_on(req.execute())).await
                 };
 
                 let _section = queue.stopwatch.start_section("queue_pop");
@@ -1047,7 +1171,7 @@ impl Queue {
                             // duration of the write, and we do not want to
                             // slow down queueing requests unnecessarily
                             match existing.try_write() {
-                                Ok(mut existing) => {
+                                Some(mut existing) => {
                                     if existing.weight() < ENV_VARS.store.write_batch_size {
                                         let res = existing.append(batch).map(|()| None);
                                         if existing.weight() >= ENV_VARS.store.write_batch_size {
@@ -1058,15 +1182,12 @@ impl Queue {
                                         Ok(Some(batch))
                                     }
                                 }
-                                Err(RwLockError::WouldBlock) => {
+                                None => {
                                     // This branch can cause batches that
                                     // are not 'full' at the head of the
                                     // queue, something that start_writer
                                     // has to take into account
-                                    return Ok(Some(batch));
-                                }
-                                Err(RwLockError::Poisoned(e)) => {
-                                    panic!("rwlock on batch was poisoned {:?}", e);
+                                    Ok(Some(batch))
                                 }
                             }
                         } else {
@@ -1132,7 +1253,7 @@ impl Queue {
 
     /// Get the entity for `key` if it exists by looking at both the queue
     /// and the store
-    fn get(&self, key: &EntityKey) -> Result<Option<Entity>, StoreError> {
+    async fn get(&self, key: &EntityKey) -> Result<Option<Entity>, StoreError> {
         enum Op {
             Write(Entity),
             Remove,
@@ -1154,12 +1275,12 @@ impl Queue {
         match op {
             Some(Op::Write(entity)) => Ok(Some(entity)),
             Some(Op::Remove) => Ok(None),
-            None => self.store.get(key, query_block),
+            None => self.store.get(key, query_block).await,
         }
     }
 
     /// Get many entities at once by looking at both the queue and the store
-    fn get_many(
+    async fn get_many(
         &self,
         mut keys: BTreeSet<EntityKey>,
     ) -> Result<BTreeMap<EntityKey, Entity>, StoreError> {
@@ -1191,7 +1312,7 @@ impl Queue {
 
         // Look entities for the remaining keys up in the store
         keys.retain(|key| !entities_in_queue.contains_key(key));
-        let mut map = self.store.get_many(keys, query_block)?;
+        let mut map = self.store.get_many(keys, query_block).await?;
 
         // Extend the store results with the entities from the queue.
         for (key, entity) in entities_in_queue {
@@ -1204,7 +1325,7 @@ impl Queue {
         Ok(map)
     }
 
-    fn get_derived(
+    async fn get_derived(
         &self,
         derived_query: &DerivedEntityQuery,
     ) -> Result<BTreeMap<EntityKey, Entity>, StoreError> {
@@ -1240,9 +1361,7 @@ impl Queue {
                 // already existing entries in map as that would make us
                 // produce stale values
                 for (k, v) in effective_ops(batch, derived_query, at) {
-                    if !map.contains_key(&k) {
-                        map.insert(k, v);
-                    }
+                    map.entry(k).or_insert(v);
                 }
                 map
             },
@@ -1251,9 +1370,10 @@ impl Queue {
         let excluded_keys: Vec<EntityKey> = entities_in_queue.keys().cloned().collect();
 
         // We filter to exclude the entities ids that we already have from the queue
-        let mut items_from_database =
-            self.store
-                .get_derived(derived_query, query_block, excluded_keys)?;
+        let mut items_from_database = self
+            .store
+            .get_derived(derived_query, query_block, excluded_keys)
+            .await?;
 
         // Extend the store results with the entities from the queue.
         // This overwrites any entitiy from the database with the same key from queue
@@ -1366,7 +1486,7 @@ impl Writer {
 
     async fn write(&self, batch: Batch, stopwatch: &StopwatchMetrics) -> Result<(), StoreError> {
         match self {
-            Writer::Sync(store) => store.transact_block_operations(&batch, stopwatch),
+            Writer::Sync(store) => store.transact_block_operations(&batch, stopwatch).await,
             Writer::Async { queue, .. } => {
                 self.check_queue_running()?;
                 queue.push_write(batch).await
@@ -1380,7 +1500,11 @@ impl Writer {
         firehose_cursor: FirehoseCursor,
     ) -> Result<(), StoreError> {
         match self {
-            Writer::Sync(store) => store.revert_block_operations(block_ptr_to, &firehose_cursor),
+            Writer::Sync(store) => {
+                store
+                    .revert_block_operations(block_ptr_to, &firehose_cursor)
+                    .await
+            }
             Writer::Async { queue, .. } => {
                 self.check_queue_running()?;
                 let req = Request::revert(queue.store.cheap_clone(), block_ptr_to, firehose_cursor);
@@ -1399,30 +1523,30 @@ impl Writer {
         }
     }
 
-    fn get(&self, key: &EntityKey) -> Result<Option<Entity>, StoreError> {
+    async fn get(&self, key: &EntityKey) -> Result<Option<Entity>, StoreError> {
         match self {
-            Writer::Sync(store) => store.get(key, BLOCK_NUMBER_MAX),
-            Writer::Async { queue, .. } => queue.get(key),
+            Writer::Sync(store) => store.get(key, BLOCK_NUMBER_MAX).await,
+            Writer::Async { queue, .. } => queue.get(key).await,
         }
     }
 
-    fn get_many(
+    async fn get_many(
         &self,
         keys: BTreeSet<EntityKey>,
     ) -> Result<BTreeMap<EntityKey, Entity>, StoreError> {
         match self {
-            Writer::Sync(store) => store.get_many(keys, BLOCK_NUMBER_MAX),
-            Writer::Async { queue, .. } => queue.get_many(keys),
+            Writer::Sync(store) => store.get_many(keys, BLOCK_NUMBER_MAX).await,
+            Writer::Async { queue, .. } => queue.get_many(keys).await,
         }
     }
 
-    fn get_derived(
+    async fn get_derived(
         &self,
         key: &DerivedEntityQuery,
     ) -> Result<BTreeMap<EntityKey, Entity>, StoreError> {
         match self {
-            Writer::Sync(store) => store.get_derived(key, BLOCK_NUMBER_MAX, vec![]),
-            Writer::Async { queue, .. } => queue.get_derived(key),
+            Writer::Sync(store) => store.get_derived(key, BLOCK_NUMBER_MAX, vec![]).await,
+            Writer::Async { queue, .. } => queue.get_derived(key).await,
         }
     }
 
@@ -1532,23 +1656,24 @@ impl WritableStore {
     }
 }
 
+#[async_trait]
 impl ReadStore for WritableStore {
-    fn get(&self, key: &EntityKey) -> Result<Option<Entity>, StoreError> {
-        self.writer.get(key)
+    async fn get(&self, key: &EntityKey) -> Result<Option<Entity>, StoreError> {
+        self.writer.get(key).await
     }
 
-    fn get_many(
+    async fn get_many(
         &self,
         keys: BTreeSet<EntityKey>,
     ) -> Result<BTreeMap<EntityKey, Entity>, StoreError> {
-        self.writer.get_many(keys)
+        self.writer.get_many(keys).await
     }
 
-    fn get_derived(
+    async fn get_derived(
         &self,
         key: &DerivedEntityQuery,
     ) -> Result<BTreeMap<EntityKey, Entity>, StoreError> {
-        self.writer.get_derived(key)
+        self.writer.get_derived(key).await
     }
 
     fn input_schema(&self) -> InputSchema {
@@ -1574,18 +1699,20 @@ impl SourceableStore {
 
 #[async_trait]
 impl store::SourceableStore for SourceableStore {
-    fn get_range(
+    async fn get_range(
         &self,
         entity_types: Vec<EntityType>,
         causality_region: CausalityRegion,
         block_range: Range<BlockNumber>,
     ) -> Result<BTreeMap<BlockNumber, Vec<EntitySourceOperation>>, StoreError> {
-        self.store.get_range(
-            self.site.clone(),
-            entity_types,
-            causality_region,
-            block_range,
-        )
+        self.store
+            .get_range(
+                self.site.clone(),
+                entity_types,
+                causality_region,
+                block_range,
+            )
+            .await
     }
 
     fn input_schema(&self) -> InputSchema {
@@ -1616,9 +1743,8 @@ impl WritableStoreTrait for WritableStore {
     async fn start_subgraph_deployment(&self, logger: &Logger) -> Result<(), StoreError> {
         let store = self.store.cheap_clone();
         let logger = logger.cheap_clone();
-        graph::spawn_blocking_allow_panic(move || store.start_subgraph_deployment(&logger))
-            .await
-            .map_err(Error::from)??;
+
+        store.start_subgraph_deployment(&logger).await?;
 
         // Refresh all in memory state in case this instance was used before
         *self.block_ptr.lock().unwrap() = self.store.block_ptr().await?;
@@ -1645,7 +1771,8 @@ impl WritableStoreTrait for WritableStore {
     ) -> Result<UnfailOutcome, StoreError> {
         let outcome = self
             .store
-            .unfail_deterministic_error(current_ptr, parent_ptr)?;
+            .unfail_deterministic_error(current_ptr, parent_ptr)
+            .await?;
 
         if let UnfailOutcome::Unfailed = outcome {
             *self.block_ptr.lock().unwrap() = self.store.block_ptr().await?;
@@ -1655,14 +1782,14 @@ impl WritableStoreTrait for WritableStore {
         Ok(outcome)
     }
 
-    fn unfail_non_deterministic_error(
+    async fn unfail_non_deterministic_error(
         &self,
         current_ptr: &BlockPtr,
     ) -> Result<UnfailOutcome, StoreError> {
         // We don't have to update in memory self.block_ptr
         // because the method call below doesn't rewind/revert
         // any block.
-        self.store.unfail_non_deterministic_error(current_ptr)
+        self.store.unfail_non_deterministic_error(current_ptr).await
     }
 
     async fn fail_subgraph(&self, error: SubgraphError) -> Result<(), StoreError> {
@@ -1683,7 +1810,7 @@ impl WritableStoreTrait for WritableStore {
         is_caught_up_with_chain_head: bool,
     ) -> Result<(), StoreError> {
         if is_caught_up_with_chain_head {
-            self.deployment_synced(block_ptr_to.clone())?;
+            self.deployment_synced(block_ptr_to.clone()).await?;
         } else {
             self.writer.start_batching();
         }
@@ -1720,10 +1847,10 @@ impl WritableStoreTrait for WritableStore {
     /// - Disable the time-to-sync metrics gathering.
     /// - Stop batching writes.
     /// - Promote it to 'synced' status in the DB, if that hasn't been done already.
-    fn deployment_synced(&self, block_ptr: BlockPtr) -> Result<(), StoreError> {
+    async fn deployment_synced(&self, block_ptr: BlockPtr) -> Result<(), StoreError> {
         self.writer.deployment_synced();
         if !self.is_deployment_synced.load(Ordering::SeqCst) {
-            self.store.deployment_synced(block_ptr)?;
+            self.store.deployment_synced(block_ptr).await?;
             self.is_deployment_synced.store(true, Ordering::SeqCst);
         }
         Ok(())
@@ -1733,8 +1860,8 @@ impl WritableStoreTrait for WritableStore {
         self.is_deployment_synced.load(Ordering::SeqCst)
     }
 
-    fn pause_subgraph(&self) -> Result<(), StoreError> {
-        self.store.pause_subgraph(&self.store.site)
+    async fn pause_subgraph(&self) -> Result<(), StoreError> {
+        self.store.pause_subgraph(&self.store.site).await
     }
 
     async fn load_dynamic_data_sources(
@@ -1788,7 +1915,7 @@ impl WritableStoreTrait for WritableStore {
             store
                 .writable(logger, self.store.site.id.into(), manifest_idx_and_name)
                 .await
-                .map(|store| Some(store))
+                .map(Some)
         } else {
             Ok(None)
         }

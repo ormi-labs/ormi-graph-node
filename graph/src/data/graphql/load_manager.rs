@@ -4,8 +4,10 @@ use prometheus::core::GenericCounter;
 use rand::{prelude::Rng, rng};
 use std::collections::{HashMap, HashSet};
 use std::iter::FromIterator;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use crate::parking_lot::RwLock;
 
 use crate::components::metrics::{Counter, GaugeVec, MetricsRegistry};
 use crate::components::store::{DeploymentId, PoolWaitStats};
@@ -57,7 +59,7 @@ impl ShardEffort {
     }
 
     pub fn add(&self, shard: &str, qref: QueryRef, duration: Duration, gauge: &GaugeVec) {
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.write();
         inner.add(qref, duration);
         gauge
             .with_label_values(&[shard])
@@ -70,7 +72,7 @@ impl ShardEffort {
     /// data for the particular query, return `None` as the effort
     /// for the query
     pub fn current_effort(&self, qref: &QueryRef) -> (Option<Duration>, Duration) {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read();
         let total_effort = inner.total.duration();
         let query_effort = inner.effort.get(qref).map(|stats| stats.duration());
         (query_effort, total_effort)
@@ -310,9 +312,9 @@ impl LoadManager {
             .map(GenericCounter::inc);
         if !ENV_VARS.load_management_is_disabled() {
             let qref = QueryRef::new(deployment, shape_hash);
-            self.effort
-                .get(shard)
-                .map(|effort| effort.add(shard, qref, duration, &self.effort_gauge));
+            if let Some(effort) = self.effort.get(shard) {
+                effort.add(shard, qref, duration, &self.effort_gauge)
+            }
         }
     }
 
@@ -381,7 +383,7 @@ impl LoadManager {
 
         let qref = QueryRef::new(deployment, shape_hash);
 
-        if self.jailed_queries.read().unwrap().contains(&qref) {
+        if self.jailed_queries.read().contains(&qref) {
             return if ENV_VARS.load_simulate {
                 Proceed
             } else {
@@ -426,7 +428,7 @@ impl LoadManager {
                 "query_effort_ms" => query_effort,
                 "total_effort_ms" => total_effort,
                 "ratio" => format!("{:.4}", query_effort/total_effort));
-                self.jailed_queries.write().unwrap().insert(qref);
+                self.jailed_queries.write().insert(qref);
                 return if ENV_VARS.load_simulate {
                     Proceed
                 } else {
@@ -438,8 +440,7 @@ impl LoadManager {
         // Kill random queries in case we have no queries, or not enough queries
         // that cause at least 20% of the effort
         let kill_rate = self.update_kill_rate(shard, kill_rate, last_update, overloaded, wait_ms);
-        let decline =
-            rng().random_bool((kill_rate * query_effort / total_effort).min(1.0).max(0.0));
+        let decline = rng().random_bool((kill_rate * query_effort / total_effort).clamp(0.0, 1.0));
         if decline {
             if ENV_VARS.load_simulate {
                 debug!(self.logger, "Declining query";
@@ -458,7 +459,7 @@ impl LoadManager {
     }
 
     fn overloaded(&self, wait_stats: &PoolWaitStats) -> (bool, Duration) {
-        let store_avg = wait_stats.read().unwrap().average();
+        let store_avg = wait_stats.average();
         let overloaded = store_avg
             .map(|average| average > ENV_VARS.load_threshold)
             .unwrap_or(false);
@@ -466,7 +467,7 @@ impl LoadManager {
     }
 
     fn kill_state(&self, shard: &str) -> (f64, Instant) {
-        let state = self.kill_state.get(shard).unwrap().read().unwrap();
+        let state = self.kill_state.get(shard).unwrap().read();
         (state.kill_rate, state.last_update)
     }
 
@@ -506,7 +507,7 @@ impl LoadManager {
                 kill_rate = (kill_rate - KILL_RATE_STEP_DOWN).max(0.0);
             }
             let event = {
-                let mut state = self.kill_state.get(shard).unwrap().write().unwrap();
+                let mut state = self.kill_state.get(shard).unwrap().write();
                 state.kill_rate = kill_rate;
                 state.last_update = now;
                 state.log_event(now, kill_rate, overloaded)

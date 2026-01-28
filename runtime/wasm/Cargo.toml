@@ -4,13 +4,12 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-async-trait = "0.1.50"
-ethabi = "17.2"
+async-trait = { workspace = true }
 hex = "0.4.3"
 graph = { path = "../../graph" }
 bs58 = "0.4.0"
 graph-runtime-derive = { path = "../derive" }
-semver = "1.0.26"
+semver = "1.0.27"
 anyhow = "1.0"
 never = "0.1"
 
@@ -21,3 +20,6 @@ wasm-instrument = { version = "0.2.0", features = ["std", "sign_ext"] }
 parity-wasm = { version = "0.45", features = ["std", "sign_ext"] }
 
 serde_yaml = { workspace = true }
+
+[lints]
+workspace = true

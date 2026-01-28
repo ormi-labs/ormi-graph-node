@@ -7,7 +7,7 @@ members = [
     "chain/common",
     "chain/ethereum",
     "chain/near",
-    "chain/substreams",
+    "gnd",
     "graphql",
     "node",
     "runtime/derive",
@@ -20,9 +20,6 @@ members = [
     "server/metrics",
     "store/postgres",
     "store/test-store",
-    "substreams/substreams-head-tracker",
-    "substreams/substreams-trigger-filter",
-    "substreams/trigger-filters",
     "graph",
     "tests",
     "graph/derive",
@@ -38,11 +35,14 @@ repository = "https://github.com/graphprotocol/graph-node"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
+alloy = { version = "1.0.33", features = ["dyn-abi", "json-abi", "full", "arbitrary", "json-rpc", "serde"] }
+alloy-rpc-types = "1.0.33"
 anyhow = "1.0"
-async-graphql = { version = "7.0.17", features = ["chrono"] }
+async-graphql = { version = "7.2.1", features = ["chrono"] }
 async-graphql-axum = "7.0.17"
-axum = "0.8.4"
-chrono = "0.4.42"
+async-trait = "0.1.74"
+axum = "0.8.8"
+chrono = "0.4.43"
 bs58 = "0.5.1"
 clap = { version = "4.5.4", features = ["derive", "env", "wrap_help"] }
 derivative = "2.2.0"
@@ -54,21 +54,24 @@ diesel = { version = "2.2.7", features = [
     "chrono",
     "i-implement-a-third-party-backend-and-opt-into-breaking-changes",
 ] }
+diesel-async = { version = "0.7.4", features = ["deadpool", "async-connection-wrapper", "tokio", "postgres"] }
 diesel-derive-enum = { version = "2.1.0", features = ["postgres"] }
 diesel-dynamic-schema = { version = "0.2.3", features = ["postgres"] }
-diesel_derives = "2.2.7"
-diesel_migrations = "2.1.0"
+diesel_derives = "2.3.6"
+diesel_migrations = "2.3.1"
+envconfig = "0.11.1"
 graph = { path = "./graph" }
 graph-core = { path = "./core" }
 graph-store-postgres = { path = "./store/postgres" }
 graphman-server = { path = "./server/graphman" }
 graphman = { path = "./core/graphman" }
 graphman-store = { path = "./core/graphman_store" }
+graphql-tools = "0.5.0"
 itertools = "0.14.0"
 lazy_static = "1.5.0"
 prost = "0.13"
 prost-types = "0.13"
-redis = { version = "0.31.0", features = [
+redis = { version = "1.0.2", features = [
     "aio",
     "connection-manager",
     "tokio-comp",
@@ -80,25 +83,41 @@ serde_derive = "1.0.125"
 serde_json = { version = "1.0", features = ["arbitrary_precision"] }
 serde_regex = "1.1.0"
 serde_yaml = "0.9.21"
-slog = { version = "2.7.0", features = [
-    "release_max_level_trace",
-    "max_level_trace",
-] }
-sqlparser = "0.46.0"
-strum = { version = "0.26", features = ["derive"] }
-syn = { version = "2.0.106", features = ["full"] }
+slog = { version = "2.8.2", features = ["release_max_level_trace", "max_level_trace"] }
+sqlparser = { version = "0.60.0", features = ["visitor"] }
+strum = { version = "0.27", features = ["derive"] }
+syn = { version = "2.0.114", features = ["full"] }
 test-store = { path = "./store/test-store" }
-thiserror = "2.0.16"
-tokio = { version = "1.45.1", features = ["full"] }
+thiserror = "2.0.18"
+deadpool = { version = "0.12", features = ["rt_tokio_1", "managed"] }
+tokio = { version = "1.49.0", features = ["full"] }
+tokio-stream = { version = "0.1.18", features = ["sync"] }
+tokio-retry = "0.3.0"
+
 tonic = { version = "0.12.3", features = ["tls-roots", "gzip"] }
 tonic-build = { version = "0.12.3", features = ["prost"] }
-tower-http = { version = "0.6.6", features = ["cors"] }
+tower-http = { version = "0.6.8", features = ["cors"] }
+tower = { version = "0.5.1", features = ["full"] }
 wasmparser = "0.118.1"
-wasmtime = "33.0.2"
-substreams = "=0.6.0"
-substreams-entity-change = "2"
-substreams-near-core = "=0.10.2"
+wasmtime = { version = "36.0.5", features = ["async"] }
 rand = { version = "0.9.2", features = ["os_rng"] }
+prometheus = "0.14.0"
+
+# Dependencies related to Amp subgraphs
+ahash = "0.8.11"
+arrow = { version = "=55.0.0" }
+arrow-flight = { version = "=55.0.0", features = ["flight-sql-experimental"] }
+futures = "0.3.31"
+half = "2.7.1"
+indoc = "2.0.7"
+lazy-regex = "3.4.1"
+parking_lot = "0.12.4"
+sqlparser-latest = { version = "0.57.0", package = "sqlparser", features = ["visitor"] }
+tokio-util = "0.7.15"
+
+[workspace.lints.clippy]
+too_many_arguments = "allow"
+type_complexity = "allow"
 
 # Incremental compilation on Rust 1.58 causes an ICE on build. As soon as graph node builds again, these can be removed.
 [profile.test]

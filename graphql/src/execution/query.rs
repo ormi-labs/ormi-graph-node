@@ -602,9 +602,7 @@ impl<'s> RawQuery<'s> {
             Ok(complexity) => Ok(complexity),
             Err(ComplexityError::Invalid) => Ok(0),
             Err(ComplexityError::TooDeep) => Err(QueryExecutionError::TooDeep(max_depth)),
-            Err(ComplexityError::Overflow) => {
-                Err(QueryExecutionError::TooComplex(u64::max_value(), 0))
-            }
+            Err(ComplexityError::Overflow) => Err(QueryExecutionError::TooComplex(u64::MAX, 0)),
             Err(ComplexityError::CyclicalFragment(name)) => {
                 Err(QueryExecutionError::CyclicalFragment(name))
             }
@@ -730,21 +728,17 @@ impl Transform {
     }
 
     /// Interpolate variable references in the arguments `args`
-    fn interpolate_arguments(
-        &self,
-        args: Vec<(String, q::Value)>,
-        pos: &q::Pos,
-    ) -> Vec<(String, r::Value)> {
+    fn interpolate_arguments(&self, args: Vec<(String, q::Value)>) -> Vec<(String, r::Value)> {
         args.into_iter()
             .map(|(name, val)| {
-                let val = self.interpolate_value(val, pos);
+                let val = self.interpolate_value(val);
                 (name, val)
             })
             .collect()
     }
 
     /// Turn `value` into an `r::Value` by resolving variable references
-    fn interpolate_value(&self, value: q::Value, pos: &q::Pos) -> r::Value {
+    fn interpolate_value(&self, value: q::Value) -> r::Value {
         match value {
             q::Value::Variable(var) => self.variable(&var),
             q::Value::Int(ref num) => {
@@ -758,14 +752,14 @@ impl Transform {
             q::Value::List(vals) => {
                 let vals = vals
                     .into_iter()
-                    .map(|val| self.interpolate_value(val, pos))
+                    .map(|val| self.interpolate_value(val))
                     .collect();
                 r::Value::List(vals)
             }
             q::Value::Object(map) => {
                 let mut rmap = BTreeMap::new();
                 for (key, value) in map.into_iter() {
-                    let value = self.interpolate_value(value, pos);
+                    let value = self.interpolate_value(value);
                     rmap.insert(key.into(), value);
                 }
                 r::Value::object(rmap)
@@ -788,7 +782,7 @@ impl Transform {
                     position,
                     arguments,
                 } = dir;
-                let arguments = self.interpolate_arguments(arguments, &position);
+                let arguments = self.interpolate_arguments(arguments);
                 a::Directive {
                     name,
                     position,
@@ -905,7 +899,7 @@ impl Transform {
             return Ok(None);
         }
 
-        let mut arguments = self.interpolate_arguments(arguments, &position);
+        let mut arguments = self.interpolate_arguments(arguments);
         self.coerce_argument_values(&mut arguments, parent_type, &name)?;
 
         let is_leaf_type = self.schema.document().is_leaf_type(&field_type.field_type);

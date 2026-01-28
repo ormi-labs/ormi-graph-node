@@ -106,7 +106,7 @@ impl<'a> TryFrom<&'a EntityModification> for EntityWrite<'a> {
                 end,
             } => Ok(EntityWrite {
                 id: &key.entity_id,
-                entity: &data,
+                entity: data,
                 causality_region: key.causality_region,
                 block: *block,
                 end: *end,
@@ -207,7 +207,7 @@ impl EntityModification {
     }
 
     /// Turn an `Overwrite` into an `Insert`, return an error if this is a `Remove`
-    fn as_insert(self, entity_type: &EntityType) -> Result<Self, StoreError> {
+    fn into_insert(self, entity_type: &EntityType) -> Result<Self, StoreError> {
         use EntityModification::*;
 
         match self {
@@ -223,13 +223,11 @@ impl EntityModification {
                 block,
                 end,
             }),
-            Remove { key, .. } => {
-                return Err(internal_error!(
-                    "a remove for {}[{}] can not be converted into an insert",
-                    entity_type,
-                    key.entity_id
-                ))
-            }
+            Remove { key, .. } => Err(internal_error!(
+                "a remove for {}[{}] can not be converted into an insert",
+                entity_type,
+                key.entity_id
+            )),
         }
     }
 
@@ -512,7 +510,7 @@ impl RowGroup {
                     Overwrite { block, .. },
                 ) => {
                     prev_row.clamp(*block)?;
-                    let row = row.as_insert(&self.entity_type)?;
+                    let row = row.into_insert(&self.entity_type)?;
                     self.push_row(row);
                 }
                 (Insert { end: None, .. } | Overwrite { end: None, .. }, Remove { block, .. }) => {
@@ -839,8 +837,7 @@ impl Batch {
             .entries
             .iter()
             .filter(move |(ptr, _)| ptr.number <= at)
-            .map(|(_, ds)| ds)
-            .flatten()
+            .flat_map(|(_, ds)| ds)
             .filter(|ds| {
                 !self
                     .offchain_to_remove
@@ -850,7 +847,7 @@ impl Batch {
             })
     }
 
-    pub fn groups<'a>(&'a self) -> impl Iterator<Item = &'a RowGroup> {
+    pub fn groups(&self) -> impl Iterator<Item = &RowGroup> {
         self.mods.groups.iter()
     }
 
@@ -933,6 +930,17 @@ impl<'a> WriteChunk<'a> {
             count: 0,
         }
     }
+
+    /// Return a vector of `WriteChunk`s each containing a single write
+    pub fn as_single_writes(&self) -> Vec<Self> {
+        (0..self.len())
+            .map(|position| WriteChunk {
+                group: self.group,
+                chunk_size: 1,
+                position: self.position + position,
+            })
+            .collect()
+    }
 }
 
 impl<'a> IntoIterator for &WriteChunk<'a> {
@@ -969,7 +977,7 @@ impl<'a> Iterator for WriteChunkIter<'a> {
                 return insert;
             }
         }
-        return None;
+        None
     }
 }
 
@@ -1034,7 +1042,7 @@ mod test {
             })
             .collect::<Vec<_>>();
         let exp = Vec::from_iter(
-            exp.into_iter()
+            exp.iter()
                 .map(|(block, values)| (*block, Vec::from_iter(values.iter().map(as_id)))),
         );
         assert_eq!(exp, act);
@@ -1146,7 +1154,7 @@ mod test {
 
     impl PartialEq<&[Mod]> for Group {
         fn eq(&self, mods: &&[Mod]) -> bool {
-            let mods: Vec<_> = mods.iter().map(|m| EntityModification::from(m)).collect();
+            let mods: Vec<_> = mods.iter().map(EntityModification::from).collect();
             self.group.rows == mods
         }
     }

@@ -38,7 +38,7 @@ impl ShapeHash for q::Document {
 
 impl ShapeHash for q::OperationDefinition {
     fn shape_hash(&self, hasher: &mut ShapeHasher) {
-        use graphql_parser::query::OperationDefinition::*;
+        use graphql_tools::parser::query::OperationDefinition::*;
         // We want `[query|subscription|mutation] things { BODY }` to hash
         // to the same thing as just `things { BODY }`
         match self {
@@ -69,7 +69,7 @@ impl ShapeHash for q::SelectionSet {
 
 impl ShapeHash for q::Selection {
     fn shape_hash(&self, hasher: &mut ShapeHasher) {
-        use graphql_parser::query::Selection::*;
+        use graphql_tools::parser::query::Selection::*;
         match self {
             Field(field) => field.shape_hash(hasher),
             FragmentSpread(spread) => spread.shape_hash(hasher),
@@ -92,7 +92,7 @@ impl ShapeHash for q::Field {
 
 impl ShapeHash for s::Value {
     fn shape_hash(&self, hasher: &mut ShapeHasher) {
-        use graphql_parser::schema::Value::*;
+        use graphql_tools::parser::schema::Value::*;
 
         match self {
             Variable(_) | Int(_) | Float(_) | String(_) | Boolean(_) | Null | Enum(_) => {
@@ -151,7 +151,6 @@ impl ShapeHash for q::TypeCondition {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use graphql_parser::parse_query;
 
     #[test]
     fn identical_and_different() {
@@ -159,16 +158,16 @@ mod tests {
         const Q2: &str = "{ things(where: { stuff_gt: 42 }) { id } }";
         const Q3: &str = "{ things(where: { stuff_lte: 42 }) { id } }";
         const Q4: &str = "{ things(where: { stuff_gt: 42 }) { id name } }";
-        let q1 = parse_query(Q1)
+        let q1 = q::parse_query(Q1)
             .expect("q1 is syntactically valid")
             .into_static();
-        let q2 = parse_query(Q2)
+        let q2 = q::parse_query(Q2)
             .expect("q2 is syntactically valid")
             .into_static();
-        let q3 = parse_query(Q3)
+        let q3 = q::parse_query(Q3)
             .expect("q3 is syntactically valid")
             .into_static();
-        let q4 = parse_query(Q4)
+        let q4 = q::parse_query(Q4)
             .expect("q4 is syntactically valid")
             .into_static();
 

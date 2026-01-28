@@ -24,10 +24,10 @@ use diesel::deserialize::FromSql;
 use diesel::pg::Pg;
 use diesel::serialize::{Output, ToSql};
 use diesel::sql_types::Text;
-use diesel::{connection::SimpleConnection, Connection};
-use diesel::{
-    debug_query, sql_query, OptionalExtension, PgConnection, QueryDsl, QueryResult, RunQueryDsl,
-};
+use diesel::{debug_query, sql_query, OptionalExtension, QueryDsl, QueryResult};
+use diesel_async::scoped_futures::ScopedFutureExt;
+use diesel_async::{AsyncConnection, RunQueryDsl, SimpleAsyncConnection};
+
 use graph::blockchain::block_stream::{EntityOperationKind, EntitySourceOperation};
 use graph::blockchain::BlockTime;
 use graph::cheap_clone::CheapClone;
@@ -39,7 +39,8 @@ use graph::data_source::CausalityRegion;
 use graph::internal_error;
 use graph::prelude::{q, EntityQuery, StopwatchMetrics, ENV_VARS};
 use graph::schema::{
-    EntityKey, EntityType, Field, FulltextConfig, FulltextDefinition, InputSchema,
+    AggregationInterval, EntityKey, EntityType, Field, FulltextConfig, FulltextDefinition,
+    InputSchema,
 };
 use graph::slog::warn;
 use index::IndexList;
@@ -78,7 +79,7 @@ use graph::prelude::{
 use crate::block_range::{BoundSide, BLOCK_COLUMN, BLOCK_RANGE_COLUMN};
 pub use crate::catalog::Catalog;
 use crate::ForeignServer;
-use crate::{catalog, deployment};
+use crate::{catalog, deployment, AsyncPgConnection};
 
 use self::rollup::Rollup;
 
@@ -94,7 +95,7 @@ pub const STRING_PREFIX_SIZE: usize = 256;
 pub const BYTE_ARRAY_PREFIX_SIZE: usize = 64;
 
 lazy_static! {
-    static ref STATEMENT_TIMEOUT: Option<String> = ENV_VARS
+    pub(crate) static ref STATEMENT_TIMEOUT: Option<String> = ENV_VARS
         .graphql
         .sql_statement_timeout
         .map(|duration| format!("set local statement_timeout={}", duration.as_millis()));
@@ -204,7 +205,7 @@ impl PartialEq<str> for SqlName {
 
 impl FromSql<Text, Pg> for SqlName {
     fn from_sql(bytes: diesel::pg::PgValue) -> diesel::deserialize::Result<Self> {
-        <String as FromSql<Text, Pg>>::from_sql(bytes).map(|s| SqlName::verbatim(s))
+        <String as FromSql<Text, Pg>>::from_sql(bytes).map(SqlName::verbatim)
     }
 }
 
@@ -280,7 +281,7 @@ impl Layout {
 
         if catalog.use_poi {
             tables.push(Self::make_poi_table(
-                &schema,
+                schema,
                 &catalog,
                 has_ts_tables,
                 tables.len(),
@@ -294,7 +295,7 @@ impl Layout {
                 tables
             });
 
-        let rollups = Self::rollups(&tables, &schema)?;
+        let rollups = Self::rollups(&tables, schema)?;
 
         Ok(Layout {
             site,
@@ -374,20 +375,20 @@ impl Layout {
         }
     }
 
-    pub fn create_relational_schema(
-        conn: &mut PgConnection,
+    pub async fn create_relational_schema(
+        conn: &mut AsyncPgConnection,
         site: Arc<Site>,
         schema: &InputSchema,
         entities_with_causality_region: BTreeSet<EntityType>,
         index_def: Option<IndexList>,
     ) -> Result<Layout, StoreError> {
         let catalog =
-            Catalog::for_creation(conn, site.cheap_clone(), entities_with_causality_region)?;
+            Catalog::for_creation(conn, site.cheap_clone(), entities_with_causality_region).await?;
         let layout = Self::new(site, schema, catalog)?;
         let sql = layout
             .as_ddl(index_def)
             .map_err(|_| StoreError::Unknown(anyhow!("failed to generate DDL for layout")))?;
-        conn.batch_execute(&sql)?;
+        conn.batch_execute(&sql).await?;
         Ok(layout)
     }
 
@@ -410,7 +411,7 @@ impl Layout {
     /// Import the database schema for this layout from its own database
     /// shard (in `self.site.shard`) into the database represented by `conn`
     /// if the schema for this layout does not exist yet
-    pub fn import_schema(&self, conn: &mut PgConnection) -> Result<(), StoreError> {
+    pub async fn import_schema(&self, conn: &mut AsyncPgConnection) -> Result<(), StoreError> {
         let make_query = || -> Result<String, fmt::Error> {
             let nsp = self.site.namespace.as_str();
             let srvname = ForeignServer::name(&self.site.shard);
@@ -429,7 +430,7 @@ impl Layout {
             Ok(query)
         };
 
-        if !catalog::has_namespace(conn, &self.site.namespace)? {
+        if !catalog::has_namespace(conn, &self.site.namespace).await? {
             let query = make_query().map_err(|_| {
                 StoreError::Unknown(anyhow!(
                     "failed to generate SQL to import foreign schema {}",
@@ -437,17 +438,18 @@ impl Layout {
                 ))
             })?;
 
-            conn.batch_execute(&query)?;
+            conn.batch_execute(&query).await?;
         }
         Ok(())
     }
 
-    /// Find the table with the provided `name`. The name must exactly match
-    /// the name of an existing table. No conversions of the name are done
-    pub fn table(&self, name: &SqlName) -> Option<&Table> {
+    /// Find the table with the provided `sql_name`. The name must exactly
+    /// match the name of an existing table. No conversions of the name are
+    /// done
+    pub fn table(&self, sql_name: &str) -> Option<&Table> {
         self.tables
             .values()
-            .find(|table| &table.name == name)
+            .find(|table| &table.name == sql_name)
             .map(|rc| rc.as_ref())
     }
 
@@ -457,9 +459,9 @@ impl Layout {
             .ok_or_else(|| StoreError::UnknownTable(entity.to_string()))
     }
 
-    pub fn find(
+    pub async fn find(
         &self,
-        conn: &mut PgConnection,
+        conn: &mut AsyncPgConnection,
         key: &EntityKey,
         block: BlockNumber,
     ) -> Result<Option<Entity>, StoreError> {
@@ -474,15 +476,16 @@ impl Layout {
 
         query
             .get_result::<OidRow>(conn)
+            .await
             .optional()?
             .map(|row| Entity::from_oid_row(row, &self.input_schema, &columns))
             .transpose()
     }
 
     // An optimization when looking up multiple entities, it will generate a single sql query using `UNION ALL`.
-    pub fn find_many(
+    pub async fn find_many(
         &self,
-        conn: &mut PgConnection,
+        conn: &mut AsyncPgConnection,
         ids_for_type: &BTreeMap<(EntityType, CausalityRegion), IdList>,
         block: BlockNumber,
     ) -> Result<BTreeMap<EntityKey, Entity>, StoreError> {
@@ -496,12 +499,13 @@ impl Layout {
         }
         let query = FindManyQuery::new(tables, ids_for_type, block);
         let mut entities: BTreeMap<EntityKey, Entity> = BTreeMap::new();
-        for data in query.load::<EntityData>(conn)? {
+        for data in query.load::<EntityData>(conn).await? {
             let entity_type = data.entity_type(&self.input_schema);
             let entity_data: Entity = data.deserialize_with_layout(self, None)?;
 
             let key =
                 entity_type.key_in(entity_data.id(), CausalityRegion::from_entity(&entity_data));
+            #[allow(clippy::map_entry)]
             if entities.contains_key(&key) {
                 return Err(internal_error!(
                     "duplicate entity {}[{}] in result set, block = {}",
@@ -516,9 +520,9 @@ impl Layout {
         Ok(entities)
     }
 
-    pub fn find_range(
+    pub async fn find_range(
         &self,
-        conn: &mut PgConnection,
+        conn: &mut AsyncPgConnection,
         entity_types: Vec<EntityType>,
         causality_region: CausalityRegion,
         block_range: Range<BlockNumber>,
@@ -540,6 +544,7 @@ impl Layout {
             block_range.clone(),
         )
         .get_results::<EntityDataExt>(conn)
+        .await
         .optional()?
         .unwrap_or_default();
         // Collect all entities that have their 'upper(block_range)' attribute in the
@@ -552,6 +557,7 @@ impl Layout {
         let upper_vec =
             FindRangeQuery::new(&tables, causality_region, BoundSide::Upper, block_range)
                 .get_results::<EntityDataExt>(conn)
+                .await
                 .optional()?
                 .unwrap_or_default();
         let mut lower_iter = lower_vec.iter().fuse().peekable();
@@ -646,19 +652,19 @@ impl Layout {
         }
 
         // sort the elements in each blocks bucket by vid
-        for (_, vec) in &mut entities {
+        for vec in entities.values_mut() {
             vec.sort_by(|a, b| a.vid.cmp(&b.vid));
         }
 
         Ok(entities)
     }
 
-    pub fn find_derived(
+    pub async fn find_derived(
         &self,
-        conn: &mut PgConnection,
+        conn: &mut AsyncPgConnection,
         derived_query: &DerivedEntityQuery,
         block: BlockNumber,
-        excluded_keys: &Vec<EntityKey>,
+        excluded_keys: &[EntityKey],
     ) -> Result<BTreeMap<EntityKey, Entity>, StoreError> {
         let table = self.table_for_entity(&derived_query.entity_type)?;
         let ids = excluded_keys.iter().map(|key| &key.entity_id).cloned();
@@ -667,7 +673,7 @@ impl Layout {
 
         let mut entities = BTreeMap::new();
 
-        for data in query.load::<EntityData>(conn)? {
+        for data in query.load::<EntityData>(conn).await? {
             let entity_type = data.entity_type(&self.input_schema);
             let entity_data: Entity = data.deserialize_with_layout(self, None)?;
             let key =
@@ -678,9 +684,9 @@ impl Layout {
         Ok(entities)
     }
 
-    pub fn find_changes(
+    pub async fn find_changes(
         &self,
-        conn: &mut PgConnection,
+        conn: &mut AsyncPgConnection,
         block: BlockNumber,
     ) -> Result<Vec<EntityOperation>, StoreError> {
         let mut tables = Vec::new();
@@ -690,10 +696,12 @@ impl Layout {
             }
         }
 
-        let inserts_or_updates =
-            FindChangesQuery::new(&tables[..], block).load::<EntityData>(conn)?;
-        let deletions =
-            FindPossibleDeletionsQuery::new(&tables[..], block).load::<EntityDeletion>(conn)?;
+        let inserts_or_updates = FindChangesQuery::new(&tables[..], block)
+            .load::<EntityData>(conn)
+            .await?;
+        let deletions = FindPossibleDeletionsQuery::new(&tables[..], block)
+            .load::<EntityDeletion>(conn)
+            .await?;
 
         let mut processed_entities = HashSet::new();
         let mut changes = Vec::new();
@@ -726,9 +734,10 @@ impl Layout {
         Ok(changes)
     }
 
-    pub fn insert<'a>(
+    pub async fn insert<'a>(
         &'a self,
-        conn: &mut PgConnection,
+        logger: &Logger,
+        conn: &mut AsyncPgConnection,
         group: &'a RowGroup,
         stopwatch: &StopwatchMetrics,
     ) -> Result<(), StoreError> {
@@ -761,34 +770,62 @@ impl Layout {
         for chunk in group.write_chunks(chunk_size) {
             // Empty chunks would lead to invalid SQL
             if !chunk.is_empty() {
-                InsertQuery::new(table, &chunk)?
-                    .execute(conn)
-                    .map_err(|e| {
+                if let Err(e) = InsertQuery::new(table, &chunk)?.execute(conn).await {
+                    // We occasionally get these errors but it's entirely
+                    // unclear what causes them. We work around that by
+                    // switching to row-by-row inserts until we can figure
+                    // out what the underlying cause is
+                    let err_msg = e.to_string();
+                    if !err_msg.contains("value too large to transmit") {
                         let (block, msg) = chunk_details(&chunk);
-                        StoreError::write_failure(e, table.object.as_str(), block, msg)
-                    })?;
+                        return Err(StoreError::write_failure(
+                            e,
+                            table.object.as_str(),
+                            block,
+                            msg,
+                        ));
+                    }
+                    let (block, msg) = chunk_details(&chunk);
+                    warn!(logger, "Insert of entire chunk failed. Trying row by row insert.";
+                        "table" => table.object.as_str(),
+                        "block" => block,
+                        "error" => err_msg,
+                        "details" => msg
+                    );
+                    for single_chunk in chunk.as_single_writes() {
+                        InsertQuery::new(table, &single_chunk)?
+                            .execute(conn)
+                            .await
+                            .map_err(|e| {
+                                let (block, msg) = chunk_details(&single_chunk);
+                                let msg = format!("{}: offending row {:?}", msg, single_chunk);
+                                StoreError::write_failure(e, table.object.as_str(), block, msg)
+                            })?;
+                    }
+                }
             }
         }
         Ok(())
     }
 
-    pub fn conflicting_entities(
+    pub async fn conflicting_entities(
         &self,
-        conn: &mut PgConnection,
+        conn: &mut AsyncPgConnection,
         entities: &[EntityType],
         group: &RowGroup,
     ) -> Result<Option<(String, String)>, StoreError> {
         Ok(ConflictingEntitiesQuery::new(self, entities, group)?
-            .load(conn)?
+            .load(conn)
+            .await?
             .pop()
             .map(|data: ConflictingEntitiesData| (data.entity, data.id)))
     }
 
     /// order is a tuple (attribute, value_type, direction)
-    pub fn query<T: crate::relational_queries::FromEntityData>(
+    pub async fn query<T: crate::relational_queries::FromEntityData>(
         &self,
         logger: &Logger,
-        conn: &mut PgConnection,
+        conn: &mut AsyncPgConnection,
         query: EntityQuery,
     ) -> Result<(Vec<T>, Trace), QueryExecutionError> {
         fn log_query_timing(
@@ -852,11 +889,15 @@ impl Layout {
         let start = Instant::now();
         let values = conn
             .transaction(|conn| {
-                if let Some(ref timeout_sql) = *STATEMENT_TIMEOUT {
-                    conn.batch_execute(timeout_sql)?;
+                async {
+                    if let Some(ref timeout_sql) = *STATEMENT_TIMEOUT {
+                        conn.batch_execute(timeout_sql).await?;
+                    }
+                    query.load::<EntityData>(conn).await
                 }
-                query.load::<EntityData>(conn)
+                .scope_boxed()
             })
+            .await
             .map_err(|e| {
                 use diesel::result::DatabaseErrorKind;
                 use diesel::result::Error::*;
@@ -897,9 +938,9 @@ impl Layout {
             .map(|values| (values, trace))
     }
 
-    pub fn update<'a>(
+    pub async fn update<'a>(
         &'a self,
-        conn: &mut PgConnection,
+        conn: &mut AsyncPgConnection,
         group: &'a RowGroup,
         stopwatch: &StopwatchMetrics,
     ) -> Result<usize, StoreError> {
@@ -925,7 +966,9 @@ impl Layout {
                 group.entity_type.id_type()?,
                 entity_keys.into_iter().map(|id| id.to_owned()),
             )?;
-            ClampRangeQuery::new(table, &entity_keys, block)?.execute(conn)?;
+            ClampRangeQuery::new(table, &entity_keys, block)?
+                .execute(conn)
+                .await?;
         }
         section.end();
 
@@ -936,15 +979,15 @@ impl Layout {
         // not exceed the maximum number of bindings allowed in queries
         let chunk_size = InsertQuery::chunk_size(table);
         for chunk in group.write_chunks(chunk_size) {
-            count += InsertQuery::new(table, &chunk)?.execute(conn)?;
+            count += InsertQuery::new(table, &chunk)?.execute(conn).await?;
         }
 
         Ok(count)
     }
 
-    pub fn delete(
+    pub async fn delete(
         &self,
-        conn: &mut PgConnection,
+        conn: &mut AsyncPgConnection,
         group: &RowGroup,
         stopwatch: &StopwatchMetrics,
     ) -> Result<usize, StoreError> {
@@ -982,10 +1025,11 @@ impl Layout {
                 // FIXME: we clone all the ids here
                 let chunk = IdList::try_from_iter(
                     group.entity_type.id_type()?,
-                    chunk.into_iter().map(|id| (*id).to_owned()),
+                    chunk.iter().map(|id| (*id).to_owned()),
                 )?;
                 count += ClampRangeQuery::new(table, &chunk, block)?
                     .execute(conn)
+                    .await
                     .map_err(|e| {
                         StoreError::write_failure(
                             e,
@@ -999,9 +1043,11 @@ impl Layout {
         Ok(count)
     }
 
-    pub fn truncate_tables(&self, conn: &mut PgConnection) -> Result<(), StoreError> {
+    pub async fn truncate_tables(&self, conn: &mut AsyncPgConnection) -> Result<(), StoreError> {
         for table in self.tables.values() {
-            sql_query(&format!("TRUNCATE TABLE {}", table.qualified_name)).execute(conn)?;
+            sql_query(format!("TRUNCATE TABLE {}", table.qualified_name))
+                .execute(conn)
+                .await?;
         }
         Ok(())
     }
@@ -1013,9 +1059,9 @@ impl Layout {
     ///
     /// The `i32` that is returned is the amount by which the entity count
     /// for the subgraph needs to be adjusted
-    pub fn revert_block(
+    pub async fn revert_block(
         &self,
-        conn: &mut PgConnection,
+        conn: &mut AsyncPgConnection,
         block: BlockNumber,
     ) -> Result<i32, StoreError> {
         let mut count: i32 = 0;
@@ -1024,7 +1070,8 @@ impl Layout {
             // Remove all versions whose entire block range lies beyond
             // `block`
             let removed: HashSet<_> = RevertRemoveQuery::new(table, block)
-                .get_results::<ReturnedEntityData>(conn)?
+                .get_results::<ReturnedEntityData>(conn)
+                .await?
                 .into_iter()
                 .collect();
             // Make the versions current that existed at `block - 1` but that
@@ -1034,7 +1081,8 @@ impl Layout {
                 HashSet::new()
             } else {
                 RevertClampQuery::new(table, block - 1)?
-                    .get_results(conn)?
+                    .get_results(conn)
+                    .await?
                     .into_iter()
                     .collect::<HashSet<_>>()
             };
@@ -1055,14 +1103,14 @@ impl Layout {
     ///
     /// For metadata, reversion always means deletion since the metadata that
     /// is subject to reversion is only ever created but never updated
-    pub fn revert_metadata(
+    pub async fn revert_metadata(
         logger: &Logger,
-        conn: &mut PgConnection,
+        conn: &mut AsyncPgConnection,
         site: &Site,
         block: BlockNumber,
     ) -> Result<(), StoreError> {
-        crate::dynds::revert(conn, site, block)?;
-        crate::deployment::revert_subgraph_errors(logger, conn, &site.deployment, block)?;
+        crate::dynds::revert(conn, site, block).await?;
+        crate::deployment::revert_subgraph_errors(logger, conn, &site.deployment, block).await?;
 
         Ok(())
     }
@@ -1082,13 +1130,13 @@ impl Layout {
     /// This is tied closely to how the `LayoutCache` works and called from
     /// it right after creating a `Layout`, and periodically to update the
     /// `Layout` in case changes were made
-    fn refresh(
+    async fn refresh(
         self: Arc<Self>,
-        conn: &mut PgConnection,
+        conn: &mut AsyncPgConnection,
         site: Arc<Site>,
     ) -> Result<Arc<Self>, StoreError> {
-        let account_like = crate::catalog::account_like(conn, &self.site)?;
-        let history_blocks = deployment::history_blocks(conn, &self.site)?;
+        let account_like = crate::catalog::account_like(conn, &self.site).await?;
+        let history_blocks = deployment::history_blocks(conn, &self.site).await?;
 
         let is_account_like = { |table: &Table| account_like.contains(table.name.as_str()) };
 
@@ -1119,11 +1167,11 @@ impl Layout {
     /// for all aggregations, meaning that if some aggregations do not have
     /// an entry with the maximum timestamp that there was just no data for
     /// that interval, but we did try to aggregate at that time.
-    pub(crate) fn last_rollup(
+    pub(crate) async fn last_rollup(
         &self,
-        conn: &mut PgConnection,
+        conn: &mut AsyncPgConnection,
     ) -> Result<Option<BlockTime>, StoreError> {
-        Rollup::last_rollup(&self.rollups, conn)
+        Rollup::last_rollup(&self.rollups, conn).await
     }
 
     /// Construct `Rolllup` for each of the aggregation mappings
@@ -1155,6 +1203,27 @@ impl Layout {
         Ok(rollups)
     }
 
+    /// Given an aggregation name that is already snake-cased like `stats`
+    /// (for an an aggregation `type Stats @aggregation(..)`) and an
+    /// interval, return the table that holds the aggregated data, like
+    /// `stats_hour`.
+    pub fn aggregation_table(
+        &self,
+        aggregation: &str,
+        interval: AggregationInterval,
+    ) -> Option<&Table> {
+        let sql_name = format!("{}_{interval}", aggregation);
+        self.table(&sql_name)
+    }
+
+    /// Return true if the layout has an aggregation with the given name
+    /// like `stats` (already snake_cased)
+    pub fn has_aggregation(&self, aggregation: &str) -> bool {
+        self.input_schema
+            .aggregation_names()
+            .any(|agg_name| SqlName::from(agg_name).as_str() == aggregation)
+    }
+
     /// Roll up all timeseries for each entry in `block_times`. The overall
     /// effect is that all buckets that end after `last_rollup` and before
     /// the last entry in `block_times` are filled. This will fill all
@@ -1181,9 +1250,9 @@ impl Layout {
     ///
     /// Changing this would require that we have a complete list of block
     /// numbers and block times which we do not have anywhere in graph-node.
-    pub(crate) fn rollup(
+    pub(crate) async fn rollup(
         &self,
-        conn: &mut PgConnection,
+        conn: &mut AsyncPgConnection,
         last_rollup: Option<BlockTime>,
         block_times: &[(BlockNumber, BlockTime)],
     ) -> Result<(), StoreError> {
@@ -1224,7 +1293,7 @@ impl Layout {
                 // that, which will roll up the bucket `t5 <= b2 < t6`. So
                 // there's no need to worry about the buckets starting at
                 // `t2`, `t3`, and `t4`.
-                match buckets.first() {
+                match buckets.as_slice().first() {
                     None => {
                         // The rollups are in increasing order of interval size, so
                         // if a smaller interval doesn't have a bucket between
@@ -1233,7 +1302,7 @@ impl Layout {
                         break;
                     }
                     Some(bucket) => {
-                        rollup.insert(conn, &bucket, *block)?;
+                        rollup.insert(conn, bucket, *block).await?;
                     }
                 }
             }
@@ -1322,7 +1391,7 @@ impl ColumnType {
         if let Some(id_type) = schema
             .entity_type(name)
             .ok()
-            .and_then(|entity_type| Some(entity_type.id_type()))
+            .map(|entity_type| entity_type.id_type())
             .transpose()?
         {
             return Ok(id_type.into());
@@ -1419,7 +1488,7 @@ impl Column {
 
         let sql_name = SqlName::from(&*field.name);
 
-        let is_reference = schema.is_reference(&field.field_type.get_base_type());
+        let is_reference = schema.is_reference(field.field_type.get_base_type());
 
         let column_type = if sql_name.as_str() == PRIMARY_KEY_COLUMN {
             IdType::try_from(&field.field_type)?.into()
@@ -1497,13 +1566,7 @@ impl Column {
     }
 
     pub fn is_nullable(&self) -> bool {
-        fn is_nullable(field_type: &q::Type) -> bool {
-            match field_type {
-                q::Type::NonNullType(_) => false,
-                _ => true,
-            }
-        }
-        is_nullable(&self.field_type)
+        !matches!(&self.field_type, q::Type::NonNullType(_))
     }
 
     pub fn is_list(&self) -> bool {
@@ -1667,10 +1730,7 @@ impl Table {
     pub fn column(&self, name: &SqlName) -> Option<&Column> {
         self.columns
             .iter()
-            .filter(|column| match column.column_type {
-                ColumnType::TSVector(_) => false,
-                _ => true,
-            })
+            .filter(|column| !matches!(column.column_type, ColumnType::TSVector(_)))
             .find(|column| &column.name == name)
     }
 
@@ -1710,10 +1770,10 @@ impl Table {
             .expect("every table has a primary key")
     }
 
-    pub(crate) fn analyze(&self, conn: &mut PgConnection) -> Result<(), StoreError> {
+    pub(crate) async fn analyze(&self, conn: &mut AsyncPgConnection) -> Result<(), StoreError> {
         let table_name = &self.qualified_name;
         let sql = format!("analyze (skip_locked) {table_name}");
-        sql_query(&sql).execute(conn)?;
+        sql_query(&sql).execute(conn).await?;
         Ok(())
     }
 
@@ -1745,7 +1805,7 @@ pub struct LayoutCache {
     ttl: Duration,
     /// Use this so that we only refresh one layout at any given time to
     /// avoid refreshing the same layout multiple times
-    refresh: Mutex<()>,
+    refresh: tokio::sync::Mutex<()>,
     last_sweep: Mutex<Instant>,
 }
 
@@ -1754,18 +1814,22 @@ impl LayoutCache {
         Self {
             entries: Mutex::new(HashMap::new()),
             ttl,
-            refresh: Mutex::new(()),
+            refresh: tokio::sync::Mutex::new(()),
             last_sweep: Mutex::new(Instant::now()),
         }
     }
 
-    fn load(conn: &mut PgConnection, site: Arc<Site>) -> Result<Arc<Layout>, StoreError> {
-        let (subgraph_schema, use_bytea_prefix) = deployment::schema(conn, site.as_ref())?;
+    async fn load(
+        conn: &mut AsyncPgConnection,
+        site: Arc<Site>,
+    ) -> Result<Arc<Layout>, StoreError> {
+        let (subgraph_schema, use_bytea_prefix) = deployment::schema(conn, site.as_ref()).await?;
         let has_causality_region =
-            deployment::entities_with_causality_region(conn, site.id, &subgraph_schema)?;
-        let catalog = Catalog::load(conn, site.clone(), use_bytea_prefix, has_causality_region)?;
+            deployment::entities_with_causality_region(conn, site.id, &subgraph_schema).await?;
+        let catalog =
+            Catalog::load(conn, site.clone(), use_bytea_prefix, has_causality_region).await?;
         let layout = Arc::new(Layout::new(site.clone(), &subgraph_schema, catalog)?);
-        layout.refresh(conn, site)
+        layout.refresh(conn, site).await
     }
 
     fn cache(&self, layout: Arc<Layout>) {
@@ -1792,10 +1856,10 @@ impl LayoutCache {
     /// Get the layout for `site`. If it's not in cache, load it. If it is
     /// expired, try to refresh it if there isn't another refresh happening
     /// already
-    pub fn get(
+    pub async fn get(
         &self,
         logger: &Logger,
-        conn: &mut PgConnection,
+        conn: &mut AsyncPgConnection,
         site: Arc<Site>,
     ) -> Result<Arc<Layout>, StoreError> {
         let now = Instant::now();
@@ -1817,12 +1881,12 @@ impl LayoutCache {
                     if refresh.is_err() {
                         value
                     } else {
-                        self.refresh(logger, conn, site, value)
+                        self.refresh(logger, conn, site, value).await
                     }
                 }
             }
             None => {
-                let layout = Self::load(conn, site)?;
+                let layout = Self::load(conn, site).await?;
                 self.cache(layout.cheap_clone());
                 layout
             }
@@ -1831,14 +1895,14 @@ impl LayoutCache {
         Ok(layout)
     }
 
-    fn refresh(
+    async fn refresh(
         &self,
         logger: &Logger,
-        conn: &mut PgConnection,
+        conn: &mut AsyncPgConnection,
         site: Arc<Site>,
         value: Arc<Layout>,
     ) -> Arc<Layout> {
-        match value.cheap_clone().refresh(conn, site) {
+        match value.cheap_clone().refresh(conn, site).await {
             Err(e) => {
                 warn!(
                     logger,

@@ -58,6 +58,7 @@ impl List {
 /// A more general list of columns than `List`. In practical terms, this is
 /// a very simple table with two columns, where both columns are
 /// left-aligned
+#[derive(Default)]
 pub struct Columns {
     widths: Vec<usize>,
     rows: Vec<Row>,
@@ -81,15 +82,6 @@ impl Columns {
             row.render(out, &self.widths)?;
         }
         Ok(())
-    }
-}
-
-impl Default for Columns {
-    fn default() -> Self {
-        Self {
-            widths: Vec::new(),
-            rows: Vec::new(),
-        }
     }
 }
 
@@ -122,11 +114,7 @@ impl Row {
             }
             Row::Separator => {
                 let total_width = widths.iter().sum::<usize>();
-                let extra_width = if total_width >= LINE_WIDTH {
-                    0
-                } else {
-                    LINE_WIDTH - total_width
-                };
+                let extra_width = LINE_WIDTH.saturating_sub(total_width);
                 for (idx, width) in widths.iter().enumerate() {
                     if idx > 0 {
                         write!(out, "-+-")?;

@@ -1,16 +1,17 @@
 use crate::{chain::BlockFinality, ENV_VARS};
 use crate::{EthereumAdapter, EthereumAdapterTrait as _};
+use async_trait::async_trait;
 use graph::blockchain::client::ChainClient;
 use graph::blockchain::BlockchainKind;
 use graph::components::network_provider::ChainName;
+use graph::prelude::alloy::primitives::B256;
 use graph::slog::o;
 use graph::util::backoff::ExponentialBackoff;
 use graph::{
     blockchain::{BlockHash, BlockIngestor, BlockPtr, IngestorError},
     cheap_clone::CheapClone,
     prelude::{
-        async_trait, error, ethabi::ethereum_types::H256, info, tokio, trace, warn, ChainStore,
-        Error, EthereumBlockWithCalls, LogCode, Logger,
+        error, info, tokio, trace, warn, ChainStore, Error, EthereumBlockWithCalls, LogCode, Logger,
     },
 };
 use std::{sync::Arc, time::Duration};
@@ -43,8 +44,12 @@ impl PollingBlockIngestor {
         })
     }
 
-    fn cleanup_cached_blocks(&self) {
-        match self.chain_store.cleanup_cached_blocks(self.ancestor_count) {
+    async fn cleanup_cached_blocks(&self) {
+        match self
+            .chain_store
+            .cleanup_cached_blocks(self.ancestor_count)
+            .await
+        {
             Ok(Some((min_block, count))) => {
                 if count > 0 {
                     info!(
@@ -135,7 +140,7 @@ impl PollingBlockIngestor {
         // ingest_blocks will return a (potentially incomplete) list of blocks that are
         // missing.
         let mut missing_block_hash = self
-            .ingest_block(&logger, &eth_adapter, &latest_block.hash)
+            .ingest_block(logger, &eth_adapter, &latest_block.hash)
             .await?;
 
         // Repeatedly fetch missing parent blocks, and ingest them.
@@ -157,7 +162,7 @@ impl PollingBlockIngestor {
         //   iteration will have at most block number N-1.
         // - Therefore, the loop will iterate at most ancestor_count times.
         while let Some(hash) = missing_block_hash {
-            missing_block_hash = self.ingest_block(&logger, &eth_adapter, &hash).await?;
+            missing_block_hash = self.ingest_block(logger, &eth_adapter, &hash).await?;
         }
         Ok(())
     }
@@ -168,15 +173,14 @@ impl PollingBlockIngestor {
         eth_adapter: &Arc<EthereumAdapter>,
         block_hash: &BlockHash,
     ) -> Result<Option<BlockHash>, IngestorError> {
-        // TODO: H256::from_slice can panic
-        let block_hash = H256::from_slice(block_hash.as_slice());
+        let block_hash = B256::from_slice(block_hash.as_slice());
 
         // Get the fully populated block
         let block = eth_adapter
             .block_by_hash(logger, block_hash)
             .await?
             .ok_or(IngestorError::BlockUnavailable(block_hash))?;
-        let ethereum_block = eth_adapter.load_full_block(&logger, block).await?;
+        let ethereum_block = eth_adapter.load_full_block(logger, block).await?;
 
         // We need something that implements `Block` to store the block; the
         // store does not care whether the block is final or not
@@ -206,10 +210,7 @@ impl PollingBlockIngestor {
         logger: &Logger,
         eth_adapter: &Arc<EthereumAdapter>,
     ) -> Result<BlockPtr, IngestorError> {
-        eth_adapter
-            .latest_block_header(&logger)
-            .await
-            .map(|block| block.into())
+        eth_adapter.latest_block_ptr(logger).await
     }
 
     async fn eth_adapter(&self) -> anyhow::Result<Arc<EthereumAdapter>> {
@@ -247,16 +248,12 @@ impl BlockIngestor for PollingBlockIngestor {
                 .logger
                 .new(o!("provider" => eth_adapter.provider().to_string()));
 
-            match self.do_poll(&logger, eth_adapter).await {
-                // Some polls will fail due to transient issues
-                Err(err) => {
-                    error!(logger, "Trying again after block polling failed: {}", err);
-                }
-                Ok(()) => (),
+            if let Err(err) = self.do_poll(&logger, eth_adapter).await {
+                error!(logger, "Trying again after block polling failed: {}", err);
             }
 
             if ENV_VARS.cleanup_blocks {
-                self.cleanup_cached_blocks()
+                self.cleanup_cached_blocks().await
             }
 
             tokio::time::sleep(self.polling_interval).await;

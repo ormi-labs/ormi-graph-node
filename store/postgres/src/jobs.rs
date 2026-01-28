@@ -4,7 +4,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use diesel::{prelude::RunQueryDsl, sql_query, sql_types::Double};
+use diesel::{sql_query, sql_types::Double};
+use diesel_async::RunQueryDsl;
 
 use graph::prelude::{error, Logger, MetricsRegistry, StoreError, ENV_VARS};
 use graph::prometheus::Gauge;
@@ -47,6 +48,13 @@ pub fn register(
         Arc::new(RefreshMaterializedView::new(store.subgraph_store())),
         6 * ONE_HOUR,
     );
+
+    if let Some(interval) = ENV_VARS.store.account_like_scan_interval_hours {
+        runner.register(
+            Arc::new(AccountLikeJob::new(store.subgraph_store())),
+            interval * ONE_HOUR,
+        );
+    }
 }
 
 /// A job that vacuums `subgraphs.deployment` and `subgraphs.head`. With a
@@ -106,14 +114,12 @@ impl NotificationQueueUsage {
             usage: f64,
         }
         let usage_gauge = self.usage_gauge.clone();
-        self.primary
-            .with_conn(move |conn, _| {
-                let res = sql_query("select pg_notification_queue_usage() as usage")
-                    .get_result::<Usage>(conn)?;
-                usage_gauge.set(res.usage);
-                Ok(())
-            })
-            .await
+        let mut conn = self.primary.get().await?;
+        let res = sql_query("select pg_notification_queue_usage() as usage")
+            .get_result::<Usage>(&mut conn)
+            .await?;
+        usage_gauge.set(res.usage);
+        Ok(())
     }
 }
 
@@ -199,7 +205,7 @@ impl Job for UnusedJob {
 
         let start = Instant::now();
 
-        if let Err(e) = self.store.record_unused_deployments() {
+        if let Err(e) = self.store.record_unused_deployments().await {
             error!(logger, "failed to record unused deployments"; "error" => e.to_string());
             return;
         }
@@ -208,7 +214,9 @@ impl Job for UnusedJob {
             .store
             .list_unused_deployments(unused::Filter::UnusedLongerThan(
                 ENV_VARS.store.remove_unused_interval,
-            )) {
+            ))
+            .await
+        {
             Ok(remove) => remove,
             Err(e) => {
                 error!(logger, "failed to list removable deployments"; "error" => e.to_string());
@@ -217,7 +225,7 @@ impl Job for UnusedJob {
         };
 
         for deployment in remove {
-            match self.store.remove_deployment(deployment.id) {
+            match self.store.remove_deployment(deployment.id).await {
                 Ok(()) => { /* ignore */ }
                 Err(e) => {
                     error!(logger, "failed to remove unused deployment";
@@ -232,5 +240,39 @@ impl Job for UnusedJob {
                 return;
             }
         }
+    }
+}
+
+struct AccountLikeJob {
+    store: Arc<SubgraphStore>,
+}
+
+impl AccountLikeJob {
+    fn new(store: Arc<SubgraphStore>) -> AccountLikeJob {
+        AccountLikeJob { store }
+    }
+}
+
+#[async_trait]
+impl Job for AccountLikeJob {
+    fn name(&self) -> &str {
+        "Set account-like flag on eligible tables"
+    }
+
+    async fn run(&self, logger: &Logger) {
+        // Safe to unwrap due to a startup validation
+        // which ensures these values are present when account_like_scan_interval_hours is set.
+        let min_versions_count = ENV_VARS.store.account_like_min_versions_count.unwrap();
+        let ratio = ENV_VARS.store.account_like_max_unique_ratio.unwrap();
+
+        self.store
+            .identify_and_set_account_like(logger, min_versions_count, ratio)
+            .await
+            .unwrap_or_else(|e| {
+                error!(
+                    logger,
+                    "Failed to set account-like flag on eligible tables: {}", e
+                )
+            });
     }
 }
