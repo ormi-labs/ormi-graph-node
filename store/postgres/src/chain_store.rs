@@ -8,7 +8,7 @@ use graph::data::store::ethereum::call;
 use graph::derive::CheapClone;
 use graph::env::ENV_VARS;
 use graph::parking_lot::RwLock;
-use graph::prelude::MetricsRegistry;
+use graph::prelude::{trace, MetricsRegistry};
 use graph::prometheus::{CounterVec, GaugeVec};
 use graph::slog::Logger;
 use graph::stable_hash::crypto_stable_hash;
@@ -2018,16 +2018,23 @@ impl ChainStoreTrait for ChainStore {
         ancestor_count: BlockNumber,
     ) -> Result<Option<H256>, Error> {
         use public::ethereum_networks as n;
+        let logger = self.logger.cheap_clone();
+        trace!(&logger, "ChainStore::attempt_chain_head_update - begin"; "ancestor_count" => ancestor_count);
 
         let (missing, ptr) = {
             let chain_store = self.clone();
+
             let genesis_block_ptr = self.genesis_block_ptr()?.hash_as_h256();
-            self.pool
+            trace!(&logger, "ChainStore::attempt_chain_head_update - got genesis_block_ptr"; "genesis_block_ptr" => ?genesis_block_ptr);
+
+            let res = self.pool
                 .with_conn(move |conn, _| {
                     let candidate = chain_store
                         .storage
                         .chain_head_candidate(conn, &chain_store.chain)
                         .map_err(CancelableError::from)?;
+
+                    trace!(&logger, "ChainStore::attempt_chain_head_update - got chain head candidate"; "candidate" => ?candidate);
                     let (ptr, first_block) = match &candidate {
                         None => return Ok((None, None)),
                         Some(ptr) => (ptr, 0.max(ptr.number.saturating_sub(ancestor_count))),
@@ -2045,6 +2052,7 @@ impl ChainStoreTrait for ChainStore {
                         .map_err(CancelableError::from)?
                     {
                         Some(missing) => {
+                            trace!(&logger, "ChainStore::attempt_chain_head_update - got missing parent"; "missing" => ?missing);
                             return Ok((Some(missing), None));
                         }
                         None => { /* we have a complete chain, no missing parents */ }
@@ -2053,6 +2061,7 @@ impl ChainStoreTrait for ChainStore {
                     let hash = ptr.hash_hex();
                     let number = ptr.number as i64;
 
+                    trace!(&logger, "ChainStore::attempt_chain_head_update - begin head block update transaction");
                     conn.transaction(
                         |conn| -> Result<(Option<H256>, Option<(String, i64)>), StoreError> {
                             update(n::table.filter(n::name.eq(&chain_store.chain)))
@@ -2066,7 +2075,10 @@ impl ChainStoreTrait for ChainStore {
                     )
                     .map_err(CancelableError::from)
                 })
-                .await?
+                .await;
+
+            trace!(&self.logger, "ChainStore::attempt_chain_head_update - transaction complete with result"; "res" => ?res);
+            res?
         };
         if let Some((hash, number)) = ptr {
             self.chain_head_update_sender.send(&hash, number)?;
