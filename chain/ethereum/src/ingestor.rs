@@ -3,7 +3,7 @@ use crate::{EthereumAdapter, EthereumAdapterTrait as _};
 use graph::blockchain::client::ChainClient;
 use graph::blockchain::BlockchainKind;
 use graph::components::network_provider::ChainName;
-use graph::slog::o;
+use graph::slog::{debug, o};
 use graph::util::backoff::ExponentialBackoff;
 use graph::{
     blockchain::{BlockHash, BlockIngestor, BlockPtr, IngestorError},
@@ -138,6 +138,8 @@ impl PollingBlockIngestor {
             .ingest_block(&logger, &eth_adapter, &latest_block.hash)
             .await?;
 
+        debug!(&logger, "Fetched missing block hash"; "missing_block_hash" => ?missing_block_hash);
+
         // Repeatedly fetch missing parent blocks, and ingest them.
         // ingest_blocks will continue to tell us about more missing parent
         // blocks until we have filled in all missing pieces of the
@@ -156,9 +158,13 @@ impl PollingBlockIngestor {
         //   most block number N, then the missing parents in the next
         //   iteration will have at most block number N-1.
         // - Therefore, the loop will iterate at most ancestor_count times.
+        let mut ingested_blocks = 1;
         while let Some(hash) = missing_block_hash {
             missing_block_hash = self.ingest_block(&logger, &eth_adapter, &hash).await?;
+            debug!(&logger, "Fetched missing block hash parent"; "missing_block_hash" => ?missing_block_hash, "ingested_blocks" => ingested_blocks);
+            ingested_blocks += 1;
         }
+        info!(&logger, "Synced {} blocks from Ethereum", ingested_blocks);
         Ok(())
     }
 
@@ -178,6 +184,8 @@ impl PollingBlockIngestor {
             .ok_or(IngestorError::BlockUnavailable(block_hash))?;
         let ethereum_block = eth_adapter.load_full_block(&logger, block).await?;
 
+        trace!(logger, "PollingBlockIngestor::ingest_block - fetched block from adapter"; "block_hash" => ?block_hash);
+
         // We need something that implements `Block` to store the block; the
         // store does not care whether the block is final or not
         let ethereum_block = BlockFinality::NonFinal(EthereumBlockWithCalls {
@@ -190,11 +198,16 @@ impl PollingBlockIngestor {
             .upsert_block(Arc::new(ethereum_block))
             .await?;
 
+        trace!(logger, "PollingBlockIngestor::ingest_block - stored block in DB"; "block_hash" => ?block_hash);
+
         self.chain_store
             .cheap_clone()
             .attempt_chain_head_update(self.ancestor_count)
             .await
-            .map(|missing| missing.map(|h256| h256.into()))
+            .map(|missing| {
+                trace!(&logger, "PollingBlockIngestor::ingest_block - chain head updated"; "block_hash" => ?block_hash, "next_missing" => ?missing);
+                missing.map(|h256| h256.into())
+            })
             .map_err(|e| {
                 error!(logger, "failed to update chain head");
                 IngestorError::Unknown(e)
