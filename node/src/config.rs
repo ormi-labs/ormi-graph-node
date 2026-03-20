@@ -153,7 +153,7 @@ impl Config {
             ));
         }
         for (key, shard) in self.stores.iter_mut() {
-            shard.validate(key)?;
+            shard.validate(key, &self.node)?;
         }
         self.deployment.validate()?;
 
@@ -281,10 +281,10 @@ pub struct Shard {
 }
 
 impl Shard {
-    fn validate(&mut self, name: &str) -> Result<()> {
+    fn validate(&mut self, name: &str, node: &NodeId) -> Result<()> {
         ShardName::new(name.to_string()).map_err(|e| anyhow!(e))?;
 
-        self.expand_connection()?;
+        self.expand_connection(node)?;
 
         if matches!(self.pool_size, PoolSize::None) {
             return Err(anyhow!("missing pool size definition for shard `{}`", name));
@@ -334,22 +334,25 @@ impl Shard {
         })
     }
 
-    fn expand_connection(&mut self) -> Result<()> {
+    // Put the PGAPPNAME into the URL since tokio-postgres ignores this
+    // environment variable. If PGAPPNAME is not set, use `node`.
+    fn expand_connection(&mut self, node: &NodeId) -> Result<()> {
+        let app_name = std::env::var("PGAPPNAME").unwrap_or(node.to_string());
+
         let mut url = Url::parse(shellexpand::env(&self.connection)?.as_ref())?;
-        // Put the PGAPPNAME into the URL since tokio-postgres ignores this
-        // environment variable
-        if let Ok(app_name) = std::env::var("PGAPPNAME") {
-            let query = match url.query() {
-                Some(query) => {
-                    format!("{query}&application_name={app_name}")
-                }
-                None => {
-                    format!("application_name={app_name}")
-                }
-            };
-            url.set_query(Some(&query));
-        }
+
+        let query = match url.query() {
+            Some(query) => {
+                format!("{query}&application_name={app_name}")
+            }
+            None => {
+                format!("application_name={app_name}")
+            }
+        };
+        url.set_query(Some(&query));
+
         self.connection = url.to_string();
+
         Ok(())
     }
 }
@@ -1947,7 +1950,9 @@ fdw_pool_size = [
             )
             .unwrap();
 
-            shard.validate("index_node_1").unwrap();
+            shard
+                .validate("shard_1", &NodeId::new("index_node_1").unwrap())
+                .unwrap();
             shard
         };
         if let Some(appname) = appname {
