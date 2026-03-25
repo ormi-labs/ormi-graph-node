@@ -560,6 +560,13 @@ pub trait ChainStore: ChainHeadStore {
     /// Returns the blocks present in the store as typed cached blocks.
     async fn blocks(self: Arc<Self>, hashes: Vec<BlockHash>) -> Result<Vec<CachedBlock>, Error>;
 
+    /// Return the parent block pointer for the block with the given hash.
+    /// Only reads header columns (hash, number, parent_hash), not the data
+    /// column. More efficient than `blocks` when only the parent pointer is
+    /// needed.
+    async fn block_parent_ptr(self: Arc<Self>, hash: &BlockHash)
+        -> Result<Option<BlockPtr>, Error>;
+
     /// Returns the blocks present in the store for the given block numbers.
     async fn block_ptrs_by_numbers(
         self: Arc<Self>,
@@ -586,6 +593,16 @@ pub trait ChainStore: ChainHeadStore {
         offset: BlockNumber,
         root: Option<BlockHash>,
     ) -> Result<Option<(CachedBlock, BlockPtr)>, Error>;
+
+    /// Like `ancestor_block` but returns only the block pointer, not the
+    /// block data. More efficient when callers only need to identify which
+    /// block is the ancestor without reading the full block body.
+    async fn ancestor_block_ptr(
+        self: Arc<Self>,
+        block_ptr: BlockPtr,
+        offset: BlockNumber,
+        root: Option<BlockHash>,
+    ) -> Result<Option<BlockPtr>, Error>;
 
     /// Remove old blocks from the cache we maintain in the database and
     /// return a pair containing the number of the oldest block retained
