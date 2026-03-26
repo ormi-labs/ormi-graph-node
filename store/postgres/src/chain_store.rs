@@ -129,7 +129,10 @@ mod data {
     use diesel::dsl::sql;
     use diesel::insert_into;
     use diesel::sql_types::{Array, Binary, Bool, Nullable, Text};
-    use diesel::{delete, sql_query, ExpressionMethods, JoinOnDsl, OptionalExtension, QueryDsl};
+    use diesel::{
+        delete, sql_query, BoolExpressionMethods, ExpressionMethods, JoinOnDsl,
+        NullableExpressionMethods, OptionalExtension, QueryDsl,
+    };
     use diesel::{
         deserialize::FromSql,
         pg::Pg,
@@ -757,36 +760,57 @@ mod data {
                 Storage::Shared => {
                     use public::ethereum_blocks as b;
 
-                    b::table
-                        .select((b::parent_hash, b::number))
-                        .filter(b::network_name.eq(chain))
-                        .filter(b::hash.eq(format!("{:x}", hash)))
-                        .first::<(Option<String>, i64)>(conn)
+                    let (child, parent) = diesel::alias!(
+                        public::ethereum_blocks as child,
+                        public::ethereum_blocks as parent
+                    );
+
+                    child
+                        .inner_join(
+                            parent.on(child
+                                .field(b::parent_hash)
+                                .assume_not_null()
+                                .eq(parent.field(b::hash))
+                                .and(parent.field(b::network_name).eq(chain))),
+                        )
+                        .select((parent.field(b::hash), parent.field(b::number)))
+                        .filter(child.field(b::hash).eq(format!("{:x}", hash)))
+                        .filter(child.field(b::network_name).eq(chain))
+                        .first::<(String, i64)>(conn)
                         .await
                         .optional()?
-                        .and_then(|(parent_hash, number)| {
-                            parent_hash.map(|ph| {
-                                Ok::<_, Error>(BlockPtr::new(
-                                    ph.parse()?,
-                                    i32::try_from(number).unwrap() - 1,
-                                ))
-                            })
+                        .map(|(h, n)| {
+                            Ok::<_, Error>(BlockPtr::new(h.parse()?, i32::try_from(n).unwrap()))
                         })
                         .transpose()?
                 }
-                Storage::Private(Schema { blocks, .. }) => blocks
-                    .table()
-                    .select((blocks.parent_hash(), blocks.number()))
-                    .filter(blocks.hash().eq(hash.as_slice()))
-                    .first::<(Vec<u8>, i64)>(conn)
-                    .await
-                    .optional()?
-                    .map(|(parent_hash, number)| {
-                        BlockPtr::new(
-                            BlockHash::from(parent_hash),
-                            i32::try_from(number).unwrap() - 1,
-                        )
-                    }),
+                Storage::Private(Schema { blocks, .. }) => {
+                    // We can't use diesel::alias! here because the table is
+                    // dynamic, so we write the SQL query manually
+
+                    let query = format!(
+                        "SELECT parent.hash, parent.number \
+                         FROM {qname} child, {qname} parent \
+                         WHERE child.hash = $1 \
+                         AND child.parent_hash = parent.hash",
+                        qname = blocks.qname
+                    );
+
+                    #[derive(QueryableByName)]
+                    struct BlockHashAndNumber {
+                        #[diesel(sql_type = Bytea)]
+                        hash: Vec<u8>,
+                        #[diesel(sql_type = BigInt)]
+                        number: i64,
+                    }
+
+                    sql_query(query)
+                        .bind::<Bytea, _>(hash.as_slice())
+                        .get_result::<BlockHashAndNumber>(conn)
+                        .await
+                        .optional()?
+                        .map(|block| BlockPtr::from((block.hash, block.number)))
+                }
             };
             Ok(result)
         }
@@ -3292,10 +3316,11 @@ mod recent_blocks_cache {
         }
 
         fn get_parent_ptr_by_hash(&self, hash: &BlockHash) -> Option<BlockPtr> {
+            let block = self.blocks.values().find(|b| &b.ptr.hash == hash)?;
             self.blocks
                 .values()
-                .find(|block| &block.ptr.hash == hash)
-                .map(|block| BlockPtr::new(block.parent_hash.clone(), block.ptr.number - 1))
+                .find(|b| b.ptr.hash == block.parent_hash)
+                .map(|parent| parent.ptr.clone())
         }
 
         fn get_block_by_number(&self, number: BlockNumber) -> Option<&CacheBlock> {
