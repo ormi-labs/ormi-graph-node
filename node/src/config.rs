@@ -1,7 +1,10 @@
 use graph::{
     anyhow::Error,
     blockchain::BlockchainKind,
-    components::network_provider::{AmpChainNames, ChainName},
+    components::{
+        network_provider::{AmpChainNames, ChainName},
+        store::BLOCK_CACHE_SIZE,
+    },
     env::ENV_VARS,
     firehose::{SubgraphLimit, SUBGRAPHS_PER_CONN},
     itertools::Itertools,
@@ -462,8 +465,17 @@ impl ChainSection {
     fn validate(&mut self) -> Result<()> {
         NodeId::new(&self.ingestor)
             .map_err(|node| anyhow!("invalid node id for ingestor {}", node))?;
-        for (_, chain) in self.chains.iter_mut() {
-            chain.validate()?
+        let reorg_threshold = ENV_VARS.reorg_threshold();
+        for (name, chain) in self.chains.iter_mut() {
+            chain.validate()?;
+            if chain.cache_size <= reorg_threshold {
+                return Err(anyhow!(
+                    "chain '{}': cache_size ({}) must be greater than reorg_threshold ({})",
+                    name,
+                    chain.cache_size,
+                    reorg_threshold
+                ));
+            }
         }
 
         // Validate that effective AMP names are unique and don't collide
@@ -587,6 +599,7 @@ impl ChainSection {
                     polling_interval: default_polling_interval(),
                     providers: vec![],
                     amp: None,
+                    cache_size: default_cache_size(),
                 });
                 entry.providers.push(provider);
             }
@@ -611,6 +624,15 @@ pub struct Chain {
     /// resolve to this chain. Defaults to the chain name.
     #[serde(default)]
     pub amp: Option<String>,
+    /// Number of blocks from chain head for which to keep block data
+    /// cached. When `GRAPH_STORE_IGNORE_BLOCK_CACHE` is set, blocks
+    /// older than this are treated as if they have no data.
+    #[serde(default = "default_cache_size")]
+    pub cache_size: i32,
+}
+
+fn default_cache_size() -> i32 {
+    BLOCK_CACHE_SIZE
 }
 
 fn default_blockchain_kind() -> BlockchainKind {
@@ -1297,7 +1319,7 @@ where
 #[cfg(test)]
 mod tests {
 
-    use crate::config::{default_polling_interval, ChainSection, Web3Rule};
+    use crate::config::{default_cache_size, default_polling_interval, ChainSection, Web3Rule};
 
     use super::{
         Chain, Config, FirehoseProvider, Provider, ProviderDetails, Shard, Transport, Web3Provider,
@@ -1345,6 +1367,7 @@ mod tests {
                 polling_interval: default_polling_interval(),
                 providers: vec![],
                 amp: None,
+                cache_size: default_cache_size(),
             },
             actual
         );
@@ -1368,6 +1391,7 @@ mod tests {
                 polling_interval: default_polling_interval(),
                 providers: vec![],
                 amp: None,
+                cache_size: default_cache_size(),
             },
             actual
         );

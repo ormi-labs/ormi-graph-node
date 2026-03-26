@@ -525,6 +525,11 @@ pub trait ChainIdStore: Send + Sync + 'static {
     ) -> Result<(), Error>;
 }
 
+/// The default size for the block cache, i.e., how many blocks behind
+/// the chain head we should keep in the database cache. The
+/// configuration can change this for individual chains
+pub const BLOCK_CACHE_SIZE: BlockNumber = 500;
+
 /// Common trait for blockchain store implementations.
 #[async_trait]
 pub trait ChainStore: ChainHeadStore {
