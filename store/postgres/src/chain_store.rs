@@ -2347,6 +2347,9 @@ pub struct ChainStore {
     chain_head_ptr_cache: ChainHeadPtrCache,
     /// Herd cache to prevent thundering herd on chain_head_ptr() lookups
     chain_head_ptr_herd: HerdCache<Arc<Result<Option<BlockPtr>, StoreError>>>,
+    /// Number of blocks from chain head for which to keep block data cached.
+    /// Used with `GRAPH_STORE_IGNORE_BLOCK_CACHE` to simulate block data eviction.
+    cache_size: BlockNumber,
 }
 
 impl ChainStore {
@@ -2358,6 +2361,7 @@ impl ChainStore {
         pool: ConnectionPool,
         recent_blocks_cache_capacity: usize,
         metrics: Arc<ChainStoreMetrics>,
+        cache_size: BlockNumber,
     ) -> Self {
         let recent_blocks_cache =
             RecentBlocksCache::new(recent_blocks_cache_capacity, chain.clone(), metrics.clone());
@@ -2378,6 +2382,7 @@ impl ChainStore {
             ancestor_cache,
             chain_head_ptr_cache,
             chain_head_ptr_herd,
+            cache_size,
         }
     }
 
