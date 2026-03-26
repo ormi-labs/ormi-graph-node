@@ -2386,6 +2386,20 @@ impl ChainStore {
         }
     }
 
+    /// Return the block number below which blocks should be treated as
+    /// not cached. Returns `0` when the feature is disabled (effectively
+    /// no cutoff). Returns `i32::MAX` when no chain head is known to
+    /// avoid serving stale data.
+    async fn cache_cutoff(self: &Arc<Self>) -> BlockNumber {
+        if !ENV_VARS.store.ignore_block_cache {
+            return 0;
+        }
+        match self.clone().chain_head_ptr().await {
+            Ok(Some(head)) => head.block_number().saturating_sub(self.cache_size),
+            _ => i32::MAX,
+        }
+    }
+
     /// Execute a cached query, avoiding thundering herd for identical requests.
     /// Returns `(result, was_cached)`.
     async fn cached_lookup<K, T, F>(
@@ -2611,15 +2625,20 @@ impl ChainStore {
         self: &Arc<Self>,
         hashes: Vec<BlockHash>,
     ) -> Result<Vec<JsonBlock>, StoreError> {
+        let cutoff = self.cache_cutoff().await;
         let mut conn = self.pool.get_permitted().await?;
         let values = self.storage.blocks(&mut conn, &self.chain, &hashes).await?;
-        Ok(values)
+        Ok(values
+            .into_iter()
+            .filter(|b| b.ptr.block_number() >= cutoff)
+            .collect())
     }
 
     async fn blocks_from_store_by_numbers(
         self: &Arc<Self>,
         numbers: Vec<BlockNumber>,
     ) -> Result<BTreeMap<BlockNumber, Vec<JsonBlock>>, StoreError> {
+        let cutoff = self.cache_cutoff().await;
         let mut conn = self.pool.get_permitted().await?;
         let values = self
             .storage
@@ -2628,7 +2647,10 @@ impl ChainStore {
 
         let mut block_map = BTreeMap::new();
 
-        for block in values {
+        for block in values
+            .into_iter()
+            .filter(|b| b.ptr.block_number() >= cutoff)
+        {
             let block_number = block.ptr.block_number();
             block_map
                 .entry(block_number)
@@ -3022,6 +3044,12 @@ impl ChainStoreTrait for ChainStore {
             offset,
             block_ptr.hash_hex()
         );
+
+        let target_number = block_ptr.block_number() - offset;
+        let cutoff = self.cache_cutoff().await;
+        if target_number < cutoff {
+            return Ok(None);
+        }
 
         // Use herd cache to avoid thundering herd when multiple callers
         // request the same ancestor block simultaneously. The cache check
