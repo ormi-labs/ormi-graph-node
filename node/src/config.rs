@@ -16,7 +16,7 @@ use graph::{
             de::{self, value, SeqAccess, Visitor},
             Deserialize, Deserializer,
         },
-        serde_json, serde_regex, toml, Logger, NodeId, StoreError,
+        serde_json, serde_regex, toml, Logger, NodeId, StoreError, BLOCK_NUMBER_MAX,
     },
 };
 use graph_chain_ethereum as ethereum;
@@ -459,6 +459,11 @@ pub struct ChainSection {
     pub ingestor: String,
     #[serde(flatten)]
     pub chains: BTreeMap<String, Chain>,
+    /// The default for chains that don't set this explicitly. When running
+    /// without a config file, we use `BLOCK_NUMBER_MAX` to turn off pruning
+    /// the block cache
+    #[serde(default = "default_cache_size")]
+    pub cache_size: i32,
 }
 
 impl ChainSection {
@@ -466,6 +471,23 @@ impl ChainSection {
         NodeId::new(&self.ingestor)
             .map_err(|node| anyhow!("invalid node id for ingestor {}", node))?;
         let reorg_threshold = ENV_VARS.reorg_threshold();
+
+        if self.cache_size <= reorg_threshold {
+            return Err(anyhow!(
+                "default chains.cache_size ({}) must be greater than reorg_threshold ({})",
+                self.cache_size,
+                reorg_threshold
+            ));
+        }
+
+        // Apply section-level cache_size as default for chains that
+        // don't set their own.
+        for chain in self.chains.values_mut() {
+            if chain.cache_size == 0 {
+                chain.cache_size = self.cache_size;
+            }
+        }
+
         for (name, chain) in self.chains.iter_mut() {
             chain.validate()?;
             if chain.cache_size <= reorg_threshold {
@@ -520,7 +542,12 @@ impl ChainSection {
         Self::parse_networks(&mut chains, Transport::Rpc, &opt.ethereum_rpc)?;
         Self::parse_networks(&mut chains, Transport::Ws, &opt.ethereum_ws)?;
         Self::parse_networks(&mut chains, Transport::Ipc, &opt.ethereum_ipc)?;
-        Ok(Self { ingestor, chains })
+        Ok(Self {
+            ingestor,
+            chains,
+            // When running without a config file, we do not prune the block cache
+            cache_size: BLOCK_NUMBER_MAX,
+        })
     }
 
     pub fn providers(&self) -> Vec<String> {
@@ -599,7 +626,7 @@ impl ChainSection {
                     polling_interval: default_polling_interval(),
                     providers: vec![],
                     amp: None,
-                    cache_size: default_cache_size(),
+                    cache_size: 0,
                 });
                 entry.providers.push(provider);
             }
@@ -627,7 +654,7 @@ pub struct Chain {
     /// Number of blocks from chain head for which to keep block data
     /// cached. When `GRAPH_STORE_IGNORE_BLOCK_CACHE` is set, blocks
     /// older than this are treated as if they have no data.
-    #[serde(default = "default_cache_size")]
+    #[serde(default)]
     pub cache_size: i32,
 }
 
@@ -1319,7 +1346,7 @@ where
 #[cfg(test)]
 mod tests {
 
-    use crate::config::{default_cache_size, default_polling_interval, ChainSection, Web3Rule};
+    use crate::config::{default_polling_interval, ChainSection, Web3Rule};
 
     use super::{
         Chain, Config, FirehoseProvider, Provider, ProviderDetails, Shard, Transport, Web3Provider,
@@ -1367,7 +1394,7 @@ mod tests {
                 polling_interval: default_polling_interval(),
                 providers: vec![],
                 amp: None,
-                cache_size: default_cache_size(),
+                cache_size: 0,
             },
             actual
         );
@@ -1391,10 +1418,35 @@ mod tests {
                 polling_interval: default_polling_interval(),
                 providers: vec![],
                 amp: None,
-                cache_size: default_cache_size(),
+                cache_size: 0,
             },
             actual
         );
+    }
+
+    #[test]
+    fn chain_inherits_cache_size_from_section() {
+        let mut section = toml::from_str::<ChainSection>(
+            r#"
+            ingestor = "block_ingestor_node"
+            cache_size = 1000
+            [mainnet]
+            shard = "primary"
+            provider = []
+            [sepolia]
+            shard = "primary"
+            provider = []
+            cache_size = 2000
+            "#,
+        )
+        .unwrap();
+
+        section.validate().unwrap();
+
+        // mainnet inherits from section
+        assert_eq!(section.chains["mainnet"].cache_size, 1000);
+        // sepolia keeps its explicit value
+        assert_eq!(section.chains["sepolia"].cache_size, 2000);
     }
 
     #[test]
