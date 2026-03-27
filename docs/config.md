@@ -110,6 +110,13 @@ whose `--node-id` matches the `ingestor` value. The
 acts as a hard override that always prevents ingestion regardless of
 the config.
 
+The section-level setting `cache_size` controls the default number of
+blocks from the chain head for which block data is kept cached. Individual
+chains can override this value. The default is 500. When the environment
+variable `GRAPH_STORE_IGNORE_BLOCK_CACHE` is set, blocks older than
+`cache_size` are treated as if they have no data. The value must be greater
+than the reorg threshold.
+
 The configuration for a chain `name` is specified in the section
 `[chains.<name>]`, with the following:
 
@@ -120,6 +127,8 @@ The configuration for a chain `name` is specified in the section
 - `amp`: the network name used by AMP for this chain; defaults to the chain name.
   Set this when AMP uses a different name than graph-node (e.g., `amp = "ethereum-mainnet"`
   on a chain named `mainnet`).
+- `cache_size`: number of blocks from the chain head for which to keep
+  block data cached. Defaults to the section-level `cache_size`.
 - `provider`: a list of providers for that chain
 
 A `provider` is an object with the following characteristics:
@@ -168,6 +177,7 @@ optimisations.
 ```toml
 [chains]
 ingestor = "block_ingestor_node"
+cache_size = 500
 [chains.mainnet]
 shard = "vip"
 amp = "ethereum-mainnet"
