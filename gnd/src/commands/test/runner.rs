@@ -121,7 +121,7 @@ fn deployment_hash_from_path_and_seed(path: &Path, seed: u128) -> Result<Deploym
 
     let input = format!("{}\0{}", path.display(), seed);
     let digest = Sha1::digest(input.as_bytes());
-    let qm = format!("Qm{:x}", digest);
+    let qm = format!("Qm{}", hex::encode(digest));
     DeploymentHash::new(qm).map_err(|e| anyhow!("Failed to create deployment hash: {}", e))
 }
 
