@@ -1643,6 +1643,59 @@ mod data {
             }
         }
 
+        const CALL_CACHE_CONTRACT_ADDRESS_INDEX: &str = "call_cache_contract_address";
+
+        /// Ensure that an index on `contract_address` exists on the
+        /// call_cache table to speed up deletion queries. If the index does
+        /// not exist, create it concurrently.
+        async fn ensure_contract_address_index(
+            &self,
+            conn: &mut AsyncPgConnection,
+            logger: &Logger,
+        ) -> Result<(), Error> {
+            let (schema_name, table_qname) = match self {
+                Storage::Shared => ("public", "public.eth_call_cache".to_string()),
+                Storage::Private(Schema {
+                    name, call_cache, ..
+                }) => (name.as_str(), call_cache.qname.clone()),
+            };
+
+            let has_index = crate::catalog::table_has_index(
+                conn,
+                schema_name,
+                Self::CALL_CACHE_CONTRACT_ADDRESS_INDEX,
+            )
+            .await?;
+
+            if !has_index {
+                let start = Instant::now();
+                info!(
+                    logger,
+                    "Creating index {} on {}.contract_address; \
+                     this may take a long time",
+                    Self::CALL_CACHE_CONTRACT_ADDRESS_INDEX,
+                    table_qname
+                );
+                conn.batch_execute(&format!(
+                    "create index concurrently if not exists {} \
+                     on {}(contract_address)",
+                    Self::CALL_CACHE_CONTRACT_ADDRESS_INDEX,
+                    table_qname
+                ))
+                .await?;
+                let duration = start.elapsed();
+                info!(
+                    logger,
+                    "Finished creating index {} on {}.contract_address in {:?}",
+                    Self::CALL_CACHE_CONTRACT_ADDRESS_INDEX,
+                    table_qname,
+                    duration
+                );
+            }
+
+            Ok(())
+        }
+
         pub async fn clear_stale_call_cache(
             &self,
             conn: &mut AsyncPgConnection,
@@ -1650,6 +1703,8 @@ mod data {
             ttl_days: i32,
             ttl_max_contracts: Option<i64>,
         ) -> Result<(), Error> {
+            self.ensure_contract_address_index(conn, logger).await?;
+
             let mut total_calls: usize = 0;
             let mut total_contracts: i64 = 0;
             // We process contracts in batches to avoid loading too many
