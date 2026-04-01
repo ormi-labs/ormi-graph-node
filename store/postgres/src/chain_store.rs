@@ -159,7 +159,10 @@ mod data {
     use std::iter::FromIterator;
     use std::str::FromStr;
 
+    use std::time::Instant;
+
     use crate::transaction_receipt::RawTransactionReceipt;
+    use crate::vid_batcher::AdaptiveBatchSize;
 
     use super::JsonBlock;
 
@@ -1649,12 +1652,12 @@ mod data {
         ) -> Result<(), Error> {
             let mut total_calls: usize = 0;
             let mut total_contracts: i64 = 0;
-            // We process contracts in batches to avoid loading too many entries into memory
-            // at once. Each contract can have many calls, so we also delete calls in batches.
-            // Note: The batch sizes were chosen based on experimentation. Potentially, they
-            // could be made configurable via ENV vars.
+            // We process contracts in batches to avoid loading too many
+            // entries into memory at once. Each contract can have many
+            // calls, so we delete calls in adaptive batches that
+            // self-tune based on query duration.
             let contracts_batch_size: i64 = 2000;
-            let cache_batch_size: usize = 10000;
+            let mut batch_size = AdaptiveBatchSize::with_size(100);
 
             // Limits the number of contracts to process if ttl_max_contracts is set.
             // Used also to adjust the final batch size, so we don't process more
@@ -1704,20 +1707,23 @@ mod data {
                         }
 
                         loop {
+                            let current_size = batch_size.size;
+                            let start = Instant::now();
                             let next_batch = cache::table
                                 .select(cache::id)
                                 .filter(cache::contract_address.eq_any(&stale_contracts))
-                                .limit(cache_batch_size as i64)
+                                .limit(current_size)
                                 .get_results::<Vec<u8>>(conn)
                                 .await?;
                             let deleted_count =
                                 diesel::delete(cache::table.filter(cache::id.eq_any(&next_batch)))
                                     .execute(conn)
                                     .await?;
+                            batch_size.adapt(start.elapsed());
 
                             total_calls += deleted_count;
 
-                            if deleted_count < cache_batch_size {
+                            if (deleted_count as i64) < current_size {
                                 break;
                             }
                         }
@@ -1754,11 +1760,11 @@ mod data {
                             SELECT id
                             FROM {}
                             WHERE contract_address = ANY($1)
-                            LIMIT {}
+                            LIMIT $2
                         )
                         DELETE FROM {} USING targets
                         WHERE {}.id = targets.id",
-                        call_cache.qname, cache_batch_size, call_cache.qname, call_cache.qname
+                        call_cache.qname, call_cache.qname, call_cache.qname
                     );
 
                     let delete_meta_query = format!(
@@ -1806,14 +1812,18 @@ mod data {
                         }
 
                         loop {
+                            let current_size = batch_size.size;
+                            let start = Instant::now();
                             let deleted_count = sql_query(&delete_cache_query)
                                 .bind::<Array<Bytea>, _>(&stale_contracts)
+                                .bind::<BigInt, _>(current_size)
                                 .execute(conn)
                                 .await?;
+                            batch_size.adapt(start.elapsed());
 
                             total_calls += deleted_count;
 
-                            if deleted_count < cache_batch_size {
+                            if (deleted_count as i64) < current_size {
                                 break;
                             }
                         }
