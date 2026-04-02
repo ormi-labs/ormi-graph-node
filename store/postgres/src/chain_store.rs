@@ -3287,7 +3287,7 @@ impl ChainStoreTrait for ChainStore {
         // entries into memory at once. Each contract can have many
         // calls, so we delete calls in adaptive batches that
         // self-tune based on query duration.
-        let contracts_batch_size: usize = 2000;
+        let contracts_batch_size: usize = ENV_VARS.store.stale_call_cache_contracts_batch_size;
         let mut batch_size = AdaptiveBatchSize::with_size(100);
 
         // Limits the number of contracts to process if ttl_max_contracts is set.
