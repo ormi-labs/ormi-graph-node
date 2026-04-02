@@ -305,6 +305,11 @@ mod data {
         fn contract_address(&self) -> DynColumn<Bytea> {
             self.table.column::<Bytea, _>("contract_address")
         }
+
+        fn accessed_at(&self) -> DynColumn<diesel::sql_types::Date> {
+            self.table
+                .column::<diesel::sql_types::Date, _>(Self::ACCESSED_AT)
+        }
     }
 
     #[derive(Clone, Debug)]
@@ -1799,17 +1804,6 @@ mod data {
                     call_meta,
                     ..
                 }) => {
-                    let select_query = format!(
-                        "WITH stale_contracts AS (
-                            SELECT contract_address
-                            FROM {}
-                            WHERE accessed_at < current_date - interval '{} days'
-                            LIMIT $1
-                        )
-                        SELECT contract_address FROM stale_contracts",
-                        call_meta.qname, ttl_days
-                    );
-
                     let delete_cache_query = format!(
                         "WITH targets AS (
                             SELECT id
@@ -1827,12 +1821,6 @@ mod data {
                         call_meta.qname
                     );
 
-                    #[derive(QueryableByName)]
-                    struct ContractAddress {
-                        #[diesel(sql_type = Bytea)]
-                        contract_address: Vec<u8>,
-                    }
-
                     loop {
                         if let Some(0) = remaining_contracts(total_contracts) {
                             info!(
@@ -1848,13 +1836,17 @@ mod data {
                             .map(|left| left.min(contracts_batch_size))
                             .unwrap_or(contracts_batch_size);
 
-                        let stale_contracts: Vec<Vec<u8>> = sql_query(&select_query)
-                            .bind::<BigInt, _>(batch_limit)
-                            .load::<ContractAddress>(conn)
-                            .await?
-                            .into_iter()
-                            .map(|r| r.contract_address)
-                            .collect();
+                        let stale_contracts = call_meta
+                            .table()
+                            .select(call_meta.contract_address())
+                            .filter(
+                                call_meta
+                                    .accessed_at()
+                                    .lt(diesel::dsl::date(diesel::dsl::now - ttl_days.days())),
+                            )
+                            .limit(batch_limit)
+                            .get_results::<Vec<u8>>(conn)
+                            .await?;
 
                         if stale_contracts.is_empty() {
                             info!(
