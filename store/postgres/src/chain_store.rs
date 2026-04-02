@@ -12,7 +12,7 @@ use graph::parking_lot::RwLock;
 use graph::prelude::alloy::primitives::B256;
 use graph::prelude::MetricsRegistry;
 use graph::prometheus::{CounterVec, GaugeVec};
-use graph::slog::Logger;
+use graph::slog::{info, Logger};
 use graph::stable_hash::crypto_stable_hash;
 use graph::util::herd_cache::HerdCache;
 
@@ -37,6 +37,7 @@ use graph::prelude::{
 use graph::{ensure, internal_error};
 
 use self::recent_blocks_cache::RecentBlocksCache;
+use crate::vid_batcher::AdaptiveBatchSize;
 use crate::AsyncPgConnection;
 use crate::{chain_head_listener::ChainHeadUpdateSender, pool::ConnectionPool};
 
@@ -162,7 +163,6 @@ mod data {
     use std::time::Instant;
 
     use crate::transaction_receipt::RawTransactionReceipt;
-    use crate::vid_batcher::AdaptiveBatchSize;
 
     use super::JsonBlock;
 
@@ -1653,11 +1653,11 @@ mod data {
         /// Ensure that an index on `contract_address` exists on the
         /// call_cache table to speed up deletion queries. If the index does
         /// not exist, create it concurrently.
-        async fn ensure_contract_address_index(
+        pub(super) async fn ensure_contract_address_index(
             &self,
             conn: &mut AsyncPgConnection,
             logger: &Logger,
-        ) -> Result<(), Error> {
+        ) -> Result<(), StoreError> {
             let (schema_name, table_qname) = match self {
                 Storage::Shared => ("public", "public.eth_call_cache".to_string()),
                 Storage::Private(Schema {
@@ -1701,189 +1701,120 @@ mod data {
             Ok(())
         }
 
-        pub async fn clear_stale_call_cache(
+        /// Find up to `batch_limit` contract addresses that have not
+        /// been accessed in the last `ttl_days` days
+        pub(super) async fn stale_contracts(
             &self,
             conn: &mut AsyncPgConnection,
-            logger: &Logger,
-            ttl_days: i32,
-            ttl_max_contracts: Option<i64>,
-        ) -> Result<(), Error> {
-            self.ensure_contract_address_index(conn, logger).await?;
+            batch_limit: usize,
+            ttl_days: usize,
+        ) -> Result<Vec<Vec<u8>>, StoreError> {
+            let ttl_days = ttl_days as i64;
+            let batch_limit = batch_limit as i64;
+            match self {
+                Storage::Shared => {
+                    use public::eth_call_meta as meta;
 
-            let mut total_calls: usize = 0;
-            let mut total_contracts: i64 = 0;
-            // We process contracts in batches to avoid loading too many
-            // entries into memory at once. Each contract can have many
-            // calls, so we delete calls in adaptive batches that
-            // self-tune based on query duration.
-            let contracts_batch_size: i64 = 2000;
-            let mut batch_size = AdaptiveBatchSize::with_size(100);
+                    meta::table
+                        .select(meta::contract_address)
+                        .filter(
+                            meta::accessed_at
+                                .lt(diesel::dsl::date(diesel::dsl::now - ttl_days.days())),
+                        )
+                        .limit(batch_limit)
+                        .get_results::<Vec<u8>>(conn)
+                        .await
+                        .map_err(StoreError::from)
+                }
+                Storage::Private(Schema { call_meta, .. }) => call_meta
+                    .table()
+                    .select(call_meta.contract_address())
+                    .filter(
+                        call_meta
+                            .accessed_at()
+                            .lt(diesel::dsl::date(diesel::dsl::now - ttl_days.days())),
+                    )
+                    .limit(batch_limit)
+                    .get_results::<Vec<u8>>(conn)
+                    .await
+                    .map_err(StoreError::from),
+            }
+        }
 
-            // Limits the number of contracts to process if ttl_max_contracts is set.
-            // Used also to adjust the final batch size, so we don't process more
-            // contracts than the set limit.
-            let remaining_contracts = |processed: i64| -> Option<i64> {
-                ttl_max_contracts.map(|limit| limit.saturating_sub(processed))
-            };
-
+        /// Delete up to `batch_size` calls for the given
+        /// `stale_contracts`. Returns the number of deleted calls.
+        pub(super) async fn delete_calls(
+            &self,
+            conn: &mut AsyncPgConnection,
+            stale_contracts: &[Vec<u8>],
+            batch_size: i64,
+        ) -> Result<usize, StoreError> {
             match self {
                 Storage::Shared => {
                     use public::eth_call_cache as cache;
-                    use public::eth_call_meta as meta;
 
-                    loop {
-                        if let Some(0) = remaining_contracts(total_contracts) {
-                            info!(
-                                logger,
-                                "Finished cleaning call cache: deleted {} entries for {} contracts (limit reached)",
-                                total_calls,
-                                total_contracts
-                            );
-                            break;
-                        }
-
-                        let batch_limit = remaining_contracts(total_contracts)
-                            .map(|left| left.min(contracts_batch_size))
-                            .unwrap_or(contracts_batch_size);
-
-                        let stale_contracts = meta::table
-                            .select(meta::contract_address)
-                            .filter(
-                                meta::accessed_at
-                                    .lt(diesel::dsl::date(diesel::dsl::now - ttl_days.days())),
-                            )
-                            .limit(batch_limit)
-                            .get_results::<Vec<u8>>(conn)
-                            .await?;
-
-                        if stale_contracts.is_empty() {
-                            info!(
-                                logger,
-                                "Finished cleaning call cache: deleted {} entries for {} contracts",
-                                total_calls,
-                                total_contracts
-                            );
-                            break;
-                        }
-
-                        loop {
-                            let current_size = batch_size.size;
-                            let start = Instant::now();
-                            let next_batch = cache::table
-                                .select(cache::id)
-                                .filter(cache::contract_address.eq_any(&stale_contracts))
-                                .limit(current_size)
-                                .get_results::<Vec<u8>>(conn)
-                                .await?;
-                            let deleted_count =
-                                diesel::delete(cache::table.filter(cache::id.eq_any(&next_batch)))
-                                    .execute(conn)
-                                    .await?;
-                            batch_size.adapt(start.elapsed());
-
-                            total_calls += deleted_count;
-
-                            if (deleted_count as i64) < current_size {
-                                break;
-                            }
-                        }
-
-                        let deleted_contracts = diesel::delete(
-                            meta::table.filter(meta::contract_address.eq_any(&stale_contracts)),
-                        )
-                        .execute(conn)
+                    let next_batch = cache::table
+                        .select(cache::id)
+                        .filter(cache::contract_address.eq_any(stale_contracts))
+                        .limit(batch_size)
+                        .get_results::<Vec<u8>>(conn)
                         .await?;
 
-                        total_contracts += deleted_contracts as i64;
-                    }
-
-                    Ok(())
+                    diesel::delete(cache::table.filter(cache::id.eq_any(&next_batch)))
+                        .execute(conn)
+                        .await
+                        .map_err(StoreError::from)
                 }
-                Storage::Private(Schema {
-                    call_cache,
-                    call_meta,
-                    ..
-                }) => {
+                Storage::Private(Schema { call_cache, .. }) => {
                     let delete_cache_query = format!(
                         "WITH targets AS (
                             SELECT id
-                            FROM {}
+                            FROM {qname}
                             WHERE contract_address = ANY($1)
                             LIMIT $2
                         )
-                        DELETE FROM {} USING targets
-                        WHERE {}.id = targets.id",
-                        call_cache.qname, call_cache.qname, call_cache.qname
+                        DELETE FROM {qname} USING targets
+                        WHERE {qname}.id = targets.id",
+                        qname = call_cache.qname
                     );
 
+                    sql_query(&delete_cache_query)
+                        .bind::<Array<Bytea>, _>(stale_contracts)
+                        .bind::<BigInt, _>(batch_size)
+                        .execute(conn)
+                        .await
+                        .map_err(StoreError::from)
+                }
+            }
+        }
+
+        pub(super) async fn delete_contracts(
+            &self,
+            conn: &mut AsyncPgConnection,
+            stale_contracts: &[Vec<u8>],
+        ) -> Result<usize, StoreError> {
+            match self {
+                Storage::Shared => {
+                    use public::eth_call_meta as meta;
+
+                    diesel::delete(
+                        meta::table.filter(meta::contract_address.eq_any(stale_contracts)),
+                    )
+                    .execute(conn)
+                    .await
+                    .map_err(StoreError::from)
+                }
+                Storage::Private(Schema { call_meta, .. }) => {
                     let delete_meta_query = format!(
                         "DELETE FROM {} WHERE contract_address = ANY($1)",
                         call_meta.qname
                     );
 
-                    loop {
-                        if let Some(0) = remaining_contracts(total_contracts) {
-                            info!(
-                                logger,
-                                "Finished cleaning call cache: deleted {} entries for {} contracts (limit reached)",
-                                total_calls,
-                                total_contracts
-                            );
-                            break;
-                        }
-
-                        let batch_limit = remaining_contracts(total_contracts)
-                            .map(|left| left.min(contracts_batch_size))
-                            .unwrap_or(contracts_batch_size);
-
-                        let stale_contracts = call_meta
-                            .table()
-                            .select(call_meta.contract_address())
-                            .filter(
-                                call_meta
-                                    .accessed_at()
-                                    .lt(diesel::dsl::date(diesel::dsl::now - ttl_days.days())),
-                            )
-                            .limit(batch_limit)
-                            .get_results::<Vec<u8>>(conn)
-                            .await?;
-
-                        if stale_contracts.is_empty() {
-                            info!(
-                                logger,
-                                "Finished cleaning call cache: deleted {} entries for {} contracts",
-                                total_calls,
-                                total_contracts
-                            );
-                            break;
-                        }
-
-                        loop {
-                            let current_size = batch_size.size;
-                            let start = Instant::now();
-                            let deleted_count = sql_query(&delete_cache_query)
-                                .bind::<Array<Bytea>, _>(&stale_contracts)
-                                .bind::<BigInt, _>(current_size)
-                                .execute(conn)
-                                .await?;
-                            batch_size.adapt(start.elapsed());
-
-                            total_calls += deleted_count;
-
-                            if (deleted_count as i64) < current_size {
-                                break;
-                            }
-                        }
-
-                        let deleted_contracts = sql_query(&delete_meta_query)
-                            .bind::<Array<Bytea>, _>(&stale_contracts)
-                            .execute(conn)
-                            .await?;
-
-                        total_contracts += deleted_contracts as i64;
-                    }
-
-                    Ok(())
+                    sql_query(&delete_meta_query)
+                        .bind::<Array<Bytea>, _>(stale_contracts)
+                        .execute(conn)
+                        .await
+                        .map_err(StoreError::from)
                 }
             }
         }
@@ -3341,13 +3272,84 @@ impl ChainStoreTrait for ChainStore {
 
     async fn clear_stale_call_cache(
         &self,
-        ttl_days: i32,
-        ttl_max_contracts: Option<i64>,
+        ttl_days: usize,
+        ttl_max_contracts: Option<usize>,
     ) -> Result<(), Error> {
         let conn = &mut self.pool.get_permitted().await?;
+
         self.storage
-            .clear_stale_call_cache(conn, &self.logger, ttl_days, ttl_max_contracts)
-            .await
+            .ensure_contract_address_index(conn, &self.logger)
+            .await?;
+
+        let mut total_calls: usize = 0;
+        let mut total_contracts: usize = 0;
+        // We process contracts in batches to avoid loading too many
+        // entries into memory at once. Each contract can have many
+        // calls, so we delete calls in adaptive batches that
+        // self-tune based on query duration.
+        let contracts_batch_size: usize = 2000;
+        let mut batch_size = AdaptiveBatchSize::with_size(100);
+
+        // Limits the number of contracts to process if ttl_max_contracts is set.
+        // Used also to adjust the final batch size, so we don't process more
+        // contracts than the set limit.
+        let remaining_contracts = |processed: usize| -> Option<usize> {
+            ttl_max_contracts.map(|limit| limit.saturating_sub(processed))
+        };
+
+        loop {
+            if let Some(0) = remaining_contracts(total_contracts) {
+                info!(self.logger,
+                    "Finished cleaning call cache: deleted {} entries for {} contracts (limit reached)",
+                    total_calls, total_contracts);
+                break;
+            }
+
+            let batch_limit = remaining_contracts(total_contracts)
+                .map(|left| left.min(contracts_batch_size))
+                .unwrap_or(contracts_batch_size);
+
+            let stale_contracts = self
+                .storage
+                .stale_contracts(conn, batch_limit, ttl_days)
+                .await?;
+
+            if stale_contracts.is_empty() {
+                info!(
+                    self.logger,
+                    "Finished cleaning call cache: deleted {} entries for {} contracts",
+                    total_calls,
+                    total_contracts
+                );
+                break;
+            }
+
+            loop {
+                let current_size = batch_size.size;
+                let start = Instant::now();
+                let deleted_count = self
+                    .storage
+                    .delete_calls(conn, &stale_contracts, current_size)
+                    .await?;
+
+                batch_size.adapt(start.elapsed());
+
+                total_calls += deleted_count;
+
+                if (deleted_count as i64) < current_size {
+                    break;
+                }
+            }
+
+            let deleted_contracts = self
+                .storage
+                .delete_contracts(conn, &stale_contracts)
+                .await?;
+
+            total_contracts += deleted_contracts;
+        }
+
+        Ok(())
     }
 
     async fn transaction_receipts_in_block(
