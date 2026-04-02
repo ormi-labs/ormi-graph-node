@@ -126,7 +126,7 @@ pub use data::Storage;
 /// Encapuslate access to the blocks table for a chain.
 mod data {
     use crate::diesel::dsl::IntervalDsl;
-    use crate::AsyncPgConnection;
+    use crate::{catalog, AsyncPgConnection};
     use diesel::dsl::sql;
     use diesel::insert_into;
     use diesel::sql_types::{Array, Binary, Bool, Nullable, Text};
@@ -1648,8 +1648,6 @@ mod data {
             }
         }
 
-        const CALL_CACHE_CONTRACT_ADDRESS_INDEX: &str = "call_cache_contract_address";
-
         /// Ensure that an index on `contract_address` exists on the
         /// call_cache table to speed up deletion queries. If the index does
         /// not exist, create it concurrently.
@@ -1658,6 +1656,8 @@ mod data {
             conn: &mut AsyncPgConnection,
             logger: &Logger,
         ) -> Result<(), StoreError> {
+            const CONTRACT_INDEX: &str = "call_cache_contract_address";
+
             let (schema_name, table_qname) = match self {
                 Storage::Shared => ("public", "public.eth_call_cache".to_string()),
                 Storage::Private(Schema {
@@ -1665,38 +1665,44 @@ mod data {
                 }) => (name.as_str(), call_cache.qname.clone()),
             };
 
-            let has_index = crate::catalog::table_has_index(
-                conn,
-                schema_name,
-                Self::CALL_CACHE_CONTRACT_ADDRESS_INDEX,
-            )
-            .await?;
+            let has_index = catalog::table_has_index(conn, schema_name, CONTRACT_INDEX).await?;
 
-            if !has_index {
-                let start = Instant::now();
-                info!(
-                    logger,
-                    "Creating index {} on {}.contract_address; \
-                     this may take a long time",
-                    Self::CALL_CACHE_CONTRACT_ADDRESS_INDEX,
-                    table_qname
-                );
+            let idx_valid =
+                catalog::check_index_is_valid(conn, schema_name, CONTRACT_INDEX).await?;
+
+            if has_index && idx_valid {
+                return Ok(());
+            }
+
+            if !idx_valid {
                 conn.batch_execute(&format!(
-                    "create index concurrently if not exists {} \
-                     on {}(contract_address)",
-                    Self::CALL_CACHE_CONTRACT_ADDRESS_INDEX,
-                    table_qname
+                    "drop index concurrently if exists {schema_name}.{}",
+                    CONTRACT_INDEX
                 ))
                 .await?;
-                let duration = start.elapsed();
-                info!(
-                    logger,
-                    "Finished creating index {} on {}.contract_address in {:?}",
-                    Self::CALL_CACHE_CONTRACT_ADDRESS_INDEX,
-                    table_qname,
-                    duration
-                );
             }
+
+            let start = Instant::now();
+            info!(
+                logger,
+                "Creating index {} on {}.contract_address; \
+                     this may take a long time",
+                CONTRACT_INDEX,
+                table_qname
+            );
+            conn.batch_execute(&format!(
+                "create index concurrently {} on {}(contract_address)",
+                CONTRACT_INDEX, table_qname
+            ))
+            .await?;
+            let duration = start.elapsed();
+            info!(
+                logger,
+                "Finished creating index {} on {}.contract_address in {:?}",
+                CONTRACT_INDEX,
+                table_qname,
+                duration
+            );
 
             Ok(())
         }
