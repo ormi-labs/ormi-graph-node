@@ -32,7 +32,8 @@ use graph::cheap_clone::CheapClone;
 use graph::components::ethereum::CachedBlock;
 use graph::prelude::{
     serde_json as json, transaction_receipt::LightTransactionReceipt, BlockNumber, BlockPtr,
-    CachedEthereumCall, ChainStore as ChainStoreTrait, Error, EthereumCallCache, StoreError,
+    CachedEthereumCall, ChainStore as ChainStoreTrait, Error, EthereumCallCache,
+    StaleCallCacheResult, StoreError,
 };
 use graph::{ensure, internal_error};
 
@@ -3281,7 +3282,7 @@ impl ChainStoreTrait for ChainStore {
         &self,
         ttl_days: usize,
         max_contracts: Option<usize>,
-    ) -> Result<(), Error> {
+    ) -> Result<StaleCallCacheResult, Error> {
         const LOG_INTERVAL: Duration = Duration::from_mins(5);
 
         let conn = &mut self.pool.get_permitted().await?;
@@ -3357,7 +3358,11 @@ impl ChainStoreTrait for ChainStore {
             batch_count
         );
 
-        Ok(())
+        Ok(StaleCallCacheResult {
+            effective_ttl_days: effective_ttl as usize,
+            cache_entries_deleted: total_deleted,
+            contracts_deleted,
+        })
     }
 
     async fn transaction_receipts_in_block(

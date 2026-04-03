@@ -530,6 +530,18 @@ pub trait ChainIdStore: Send + Sync + 'static {
 /// configuration can change this for individual chains
 pub const BLOCK_CACHE_SIZE: BlockNumber = i32::MAX;
 
+/// Result of clearing stale call cache entries.
+pub struct StaleCallCacheResult {
+    /// The effective TTL in days that was actually used for deletion.
+    /// This may be larger than the requested TTL if `max_contracts`
+    /// was set and caused the cutoff to be adjusted.
+    pub effective_ttl_days: usize,
+    /// Number of cache entries deleted from the call cache.
+    pub cache_entries_deleted: usize,
+    /// Number of contract entries deleted from call meta.
+    pub contracts_deleted: usize,
+}
+
 /// Common trait for blockchain store implementations.
 #[async_trait]
 pub trait ChainStore: ChainHeadStore {
@@ -664,7 +676,7 @@ pub trait ChainStore: ChainHeadStore {
         &self,
         ttl_days: usize,
         max_contracts: Option<usize>,
-    ) -> Result<(), Error>;
+    ) -> Result<StaleCallCacheResult, Error>;
 
     /// Return the chain identifier for this store.
     async fn chain_identifier(&self) -> Result<ChainIdentifier, Error>;

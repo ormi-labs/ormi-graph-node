@@ -90,9 +90,21 @@ pub async fn clear_stale_call_cache(
         "Removing stale entries from the call cache for `{}`",
         chain_store.chain
     );
-    chain_store
+    let result = chain_store
         .clear_stale_call_cache(ttl_days, max_contracts)
         .await?;
+    if result.effective_ttl_days != ttl_days {
+        println!(
+            "Effective TTL: {} days (adjusted from {} to stay within {} contracts)",
+            result.effective_ttl_days,
+            ttl_days,
+            max_contracts.unwrap()
+        );
+    }
+    println!(
+        "Deleted {} cache entries for {} contracts",
+        result.cache_entries_deleted, result.contracts_deleted
+    );
     Ok(())
 }
 

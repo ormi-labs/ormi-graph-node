@@ -6,7 +6,7 @@ use crate::{
         network_provider::ChainName,
         store::{
             BlockNumber, ChainHeadStore, ChainIdStore, DeploymentCursorTracker, DeploymentLocator,
-            SourceableStore,
+            SourceableStore, StaleCallCacheResult,
         },
         subgraph::InstanceDSTemplateInfo,
     },
@@ -596,7 +596,7 @@ impl ChainStore for MockChainStore {
         &self,
         _ttl_days: usize,
         _max_contracts: Option<usize>,
-    ) -> Result<(), Error> {
+    ) -> Result<StaleCallCacheResult, Error> {
         unimplemented!()
     }
     async fn chain_identifier(&self) -> Result<ChainIdentifier, Error> {
