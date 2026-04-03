@@ -658,11 +658,7 @@ pub trait ChainStore: ChainHeadStore {
     async fn clear_call_cache(&self, from: BlockNumber, to: BlockNumber) -> Result<(), Error>;
 
     /// Clears stale call cache entries for the given TTL in days.
-    async fn clear_stale_call_cache(
-        &self,
-        ttl_days: usize,
-        ttl_max_contracts: Option<usize>,
-    ) -> Result<(), Error>;
+    async fn clear_stale_call_cache(&self, ttl_days: usize) -> Result<(), Error>;
 
     /// Return the chain identifier for this store.
     async fn chain_identifier(&self) -> Result<ChainIdentifier, Error>;

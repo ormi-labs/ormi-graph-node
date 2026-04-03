@@ -592,11 +592,7 @@ impl ChainStore for MockChainStore {
     async fn clear_call_cache(&self, _from: BlockNumber, _to: BlockNumber) -> Result<(), Error> {
         unimplemented!()
     }
-    async fn clear_stale_call_cache(
-        &self,
-        _ttl_days: usize,
-        _ttl_max_contracts: Option<usize>,
-    ) -> Result<(), Error> {
+    async fn clear_stale_call_cache(&self, _ttl_days: usize) -> Result<(), Error> {
         unimplemented!()
     }
     async fn chain_identifier(&self) -> Result<ChainIdentifier, Error> {

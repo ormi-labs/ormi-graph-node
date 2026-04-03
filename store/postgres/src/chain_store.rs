@@ -3276,11 +3276,7 @@ impl ChainStoreTrait for ChainStore {
         Ok(())
     }
 
-    async fn clear_stale_call_cache(
-        &self,
-        ttl_days: usize,
-        ttl_max_contracts: Option<usize>,
-    ) -> Result<(), Error> {
+    async fn clear_stale_call_cache(&self, ttl_days: usize) -> Result<(), Error> {
         let conn = &mut self.pool.get_permitted().await?;
 
         self.storage
@@ -3289,35 +3285,13 @@ impl ChainStoreTrait for ChainStore {
 
         let mut total_calls: usize = 0;
         let mut total_contracts: usize = 0;
-        // We process contracts in batches to avoid loading too many
-        // entries into memory at once. Each contract can have many
-        // calls, so we delete calls in adaptive batches that
-        // self-tune based on query duration.
         let contracts_batch_size: usize = ENV_VARS.store.stale_call_cache_contracts_batch_size;
         let mut batch_size = AdaptiveBatchSize::with_size(100);
 
-        // Limits the number of contracts to process if ttl_max_contracts is set.
-        // Used also to adjust the final batch size, so we don't process more
-        // contracts than the set limit.
-        let remaining_contracts = |processed: usize| -> Option<usize> {
-            ttl_max_contracts.map(|limit| limit.saturating_sub(processed))
-        };
-
         loop {
-            if let Some(0) = remaining_contracts(total_contracts) {
-                info!(self.logger,
-                    "Finished cleaning call cache: deleted {} entries for {} contracts (limit reached)",
-                    total_calls, total_contracts);
-                break;
-            }
-
-            let batch_limit = remaining_contracts(total_contracts)
-                .map(|left| left.min(contracts_batch_size))
-                .unwrap_or(contracts_batch_size);
-
             let stale_contracts = self
                 .storage
-                .stale_contracts(conn, batch_limit, ttl_days)
+                .stale_contracts(conn, contracts_batch_size, ttl_days)
                 .await?;
 
             if stale_contracts.is_empty() {
