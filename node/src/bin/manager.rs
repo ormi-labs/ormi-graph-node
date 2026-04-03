@@ -620,7 +620,11 @@ pub enum CallCacheCommand {
         remove_entire_cache: bool,
         /// Remove the cache for contracts that have not been accessed in the last <TTL_DAYS> days
         #[clap(long, conflicts_with_all = &["from", "to", "remove-entire-cache"], value_parser = clap::value_parser!(u32).range(1..))]
-        ttl_days: Option<usize>,
+        ttl_days: Option<u32>,
+        /// Maximum number of contracts to evict. When set, the effective TTL
+        /// is increased so that at most this many contracts are deleted.
+        #[clap(long, requires = "ttl_days")]
+        max_contracts: Option<usize>,
         /// Starting block number
         #[clap(long, short, conflicts_with = "remove-entire-cache", requires = "to")]
         from: Option<i32>,
@@ -1546,12 +1550,14 @@ async fn main() -> anyhow::Result<()> {
                             to,
                             remove_entire_cache,
                             ttl_days,
+                            max_contracts,
                         } => {
                             let chain_store = ctx.chain_store(&chain_name).await?;
                             if let Some(ttl_days) = ttl_days {
                                 return commands::chain::clear_stale_call_cache(
                                     chain_store,
-                                    ttl_days,
+                                    ttl_days as usize,
+                                    max_contracts,
                                 )
                                 .await;
                             }

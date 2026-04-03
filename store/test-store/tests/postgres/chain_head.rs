@@ -636,7 +636,7 @@ fn test_clear_stale_call_cache() {
             .await
             .unwrap();
         }
-        let result = chain_store.clear_stale_call_cache(7).await;
+        let result = chain_store.clear_stale_call_cache(7, None).await;
         assert!(result.is_ok());
 
         // Confirm the call cache entry was removed

@@ -657,8 +657,14 @@ pub trait ChainStore: ChainHeadStore {
     /// Clears call cache of the chain for the given `from` and `to` block number.
     async fn clear_call_cache(&self, from: BlockNumber, to: BlockNumber) -> Result<(), Error>;
 
-    /// Clears stale call cache entries for the given TTL in days.
-    async fn clear_stale_call_cache(&self, ttl_days: usize) -> Result<(), Error>;
+    /// Clears stale call cache entries for the given TTL in days. If
+    /// `max_contracts` is set, increase the effective TTL so that at
+    /// most `max_contracts` contracts are evicted.
+    async fn clear_stale_call_cache(
+        &self,
+        ttl_days: usize,
+        max_contracts: Option<usize>,
+    ) -> Result<(), Error>;
 
     /// Return the chain identifier for this store.
     async fn chain_identifier(&self) -> Result<ChainIdentifier, Error>;

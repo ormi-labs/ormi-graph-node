@@ -169,6 +169,7 @@ mod data {
     pub(crate) const ETHEREUM_BLOCKS_TABLE_NAME: &str = "public.ethereum_blocks";
 
     pub(crate) const ETHEREUM_CALL_CACHE_TABLE_NAME: &str = "public.eth_call_cache";
+    pub(crate) const ETHEREUM_CALL_META_TABLE_NAME: &str = "public.eth_call_meta";
 
     mod public {
         pub(super) use super::super::public::ethereum_networks;
@@ -1742,6 +1743,56 @@ mod data {
                 .map_err(StoreError::from)
         }
 
+        /// Given `ttl_days` and `max_contracts`, compute an effective
+        /// TTL in days such that at most `max_contracts` contracts would
+        /// be evicted. Returns a value >= `ttl_days`.
+        ///
+        /// We look at the (max_contracts+1)th oldest stale contract. If
+        /// it exists with `accessed_at = D`, the effective TTL is set to
+        /// `current_date - D` days, making the deletion cutoff exactly
+        /// `D`. Since the deletion query uses `accessed_at < cutoff`,
+        /// contracts with `accessed_at = D` are excluded, guaranteeing
+        /// at most `max_contracts` deletions.
+        ///
+        /// When multiple contracts share the boundary date, we may
+        /// delete fewer than `max_contracts` since we can only control
+        /// the cutoff at date granularity.
+        pub(super) async fn effective_ttl(
+            &self,
+            conn: &mut AsyncPgConnection,
+            ttl_days: i64,
+            max_contracts: i64,
+        ) -> Result<i64, StoreError> {
+            #[derive(QueryableByName)]
+            struct Row {
+                #[diesel(sql_type = diesel::sql_types::BigInt)]
+                effective_ttl: i64,
+            }
+
+            let meta_table = match self {
+                Storage::Shared => ETHEREUM_CALL_META_TABLE_NAME,
+                Storage::Private(Schema { call_meta, .. }) => call_meta.qname.as_str(),
+            };
+            let query = format!(
+                "select extract(day from current_date - accessed_at)::int8 + 1\
+                        as effective_ttl \
+                   from {meta_table} \
+                  where accessed_at < current_date - $1 * interval '1 day' \
+                  order by accessed_at asc \
+                 offset $2 \
+                  limit 1"
+            );
+            let effective_ttl: Option<i64> = sql_query(&query)
+                .bind::<BigInt, _>(ttl_days)
+                .bind::<BigInt, _>(max_contracts)
+                .get_result::<Row>(conn)
+                .await
+                .optional()?
+                .map(|r| r.effective_ttl);
+
+            Ok(effective_ttl.unwrap_or(ttl_days))
+        }
+
         /// Delete all call_meta entries with accessed_at older than
         /// `ttl_days`. Should be called after all corresponding
         /// call_cache rows have been deleted.
@@ -3226,7 +3277,11 @@ impl ChainStoreTrait for ChainStore {
         Ok(())
     }
 
-    async fn clear_stale_call_cache(&self, ttl_days: usize) -> Result<(), Error> {
+    async fn clear_stale_call_cache(
+        &self,
+        ttl_days: usize,
+        max_contracts: Option<usize>,
+    ) -> Result<(), Error> {
         const LOG_INTERVAL: Duration = Duration::from_mins(5);
 
         let conn = &mut self.pool.get_permitted().await?;
@@ -3238,6 +3293,25 @@ impl ChainStoreTrait for ChainStore {
             .await?;
 
         let ttl_days = ttl_days as i64;
+        let effective_ttl = match max_contracts {
+            Some(max) => {
+                self.storage
+                    .effective_ttl(conn, ttl_days, max as i64)
+                    .await?
+            }
+            None => ttl_days,
+        };
+
+        if effective_ttl != ttl_days {
+            info!(
+                logger,
+                "adjusted ttl from {} to {} days to stay within {} contracts",
+                ttl_days,
+                effective_ttl,
+                max_contracts.unwrap()
+            );
+        }
+
         let mut total_deleted: usize = 0;
         let mut batch_count: usize = 0;
         let mut batch_size = AdaptiveBatchSize::with_size(100);
@@ -3248,7 +3322,7 @@ impl ChainStoreTrait for ChainStore {
             let start = Instant::now();
             let deleted = self
                 .storage
-                .delete_stale_calls_batch(conn, ttl_days, current_size)
+                .delete_stale_calls_batch(conn, effective_ttl, current_size)
                 .await?;
 
             batch_size.adapt(start.elapsed());
@@ -3273,7 +3347,7 @@ impl ChainStoreTrait for ChainStore {
             }
         }
 
-        let contracts_deleted = self.storage.delete_stale_meta(conn, ttl_days).await?;
+        let contracts_deleted = self.storage.delete_stale_meta(conn, effective_ttl).await?;
 
         info!(
             logger,
