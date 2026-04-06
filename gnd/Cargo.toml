@@ -58,7 +58,7 @@ reqwest = { workspace = true }
 thiserror = { workspace = true }
 
 # Console output
-similar = "2"
+similar = "3"
 indicatif = { workspace = true }
 console = { workspace = true }
 
