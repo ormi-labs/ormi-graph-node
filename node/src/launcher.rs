@@ -413,6 +413,13 @@ pub async fn run(
         render_testament!(TESTAMENT)
     );
 
+    #[cfg(debug_assertions)]
+    warn!(
+        logger,
+        "This is a DEBUG build — performance is severely degraded. \
+        Use `cargo build --release` for production deployments."
+    );
+
     if !graph_server_index_node::PoiProtection::from_env(&ENV_VARS).is_active() {
         warn!(
             logger,

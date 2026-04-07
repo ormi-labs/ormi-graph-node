@@ -97,6 +97,9 @@ where
 
     fn format_custom(&self, record: &Record, values: &OwnedKVList) -> io::Result<()> {
         self.decorator.with_record(record, values, |mut decorator| {
+            #[cfg(debug_assertions)]
+            write!(decorator, "[DEBUG-BUILD] ")?;
+
             decorator.start_timestamp()?;
             formatted_timestamp_local(&mut decorator)?;
             decorator.start_whitespace()?;
