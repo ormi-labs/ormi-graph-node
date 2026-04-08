@@ -582,6 +582,18 @@ impl Blockchain for Chain {
                 .await
                 .map_err(IngestorError::Unknown),
             ChainClient::Rpc(adapters) => {
+                let cached = self
+                    .chain_store
+                    .cheap_clone()
+                    .block_ptrs_by_numbers(vec![number])
+                    .await
+                    .unwrap_or_default();
+                if let Some(ptrs) = cached.get(&number) {
+                    if ptrs.len() == 1 {
+                        return Ok(BlockPtr::new(ptrs[0].hash.clone(), ptrs[0].number));
+                    }
+                }
+
                 let adapter = adapters
                     .cheapest()
                     .await
@@ -1076,6 +1088,18 @@ impl TriggersAdapterTrait<Chain> for TriggersAdapter {
                 Ok(block.hash() == ptr.hash)
             }
             ChainClient::Rpc(adapter) => {
+                let cached = self
+                    .chain_store
+                    .cheap_clone()
+                    .block_ptrs_by_numbers(vec![ptr.number])
+                    .await
+                    .unwrap_or_default();
+                if let Some(ptrs) = cached.get(&ptr.number) {
+                    if ptrs.len() == 1 {
+                        return Ok(ptrs[0].hash == ptr.hash);
+                    }
+                }
+
                 let adapter = adapter
                     .cheapest()
                     .await
