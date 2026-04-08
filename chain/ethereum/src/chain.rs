@@ -588,10 +588,10 @@ impl Blockchain for Chain {
                     .block_ptrs_by_numbers(vec![number])
                     .await
                     .unwrap_or_default();
-                if let Some(ptrs) = cached.get(&number) {
-                    if ptrs.len() == 1 {
-                        return Ok(BlockPtr::new(ptrs[0].hash.clone(), ptrs[0].number));
-                    }
+                if let Some(ptrs) = cached.get(&number)
+                    && ptrs.len() == 1
+                {
+                    return Ok(BlockPtr::new(ptrs[0].hash.clone(), ptrs[0].number));
                 }
 
                 let adapter = adapters
@@ -1094,10 +1094,10 @@ impl TriggersAdapterTrait<Chain> for TriggersAdapter {
                     .block_ptrs_by_numbers(vec![ptr.number])
                     .await
                     .unwrap_or_default();
-                if let Some(ptrs) = cached.get(&ptr.number) {
-                    if ptrs.len() == 1 {
-                        return Ok(ptrs[0].hash == ptr.hash);
-                    }
+                if let Some(ptrs) = cached.get(&ptr.number)
+                    && ptrs.len() == 1
+                {
+                    return Ok(ptrs[0].hash == ptr.hash);
                 }
 
                 let adapter = adapter
@@ -1285,16 +1285,14 @@ impl TriggersAdapter {
         adapters: &EthereumNetworkAdapters,
         block_ptr: &BlockPtr,
     ) -> Result<Option<EthereumBlock>, Error> {
-        let adapter = adapters.cheapest_with(&self.capabilities).await?;
-
-        let block = adapter
-            .block_by_hash(&self.logger, block_ptr.hash.as_b256())
-            .await?;
-
-        match block {
-            Some(block) => {
+        // Use the cache-aware light block fetch first; it checks recent_blocks_cache
+        // and the DB before falling back to eth_getBlockByHash.
+        let light_block = self.fetch_light_block_with_rpc(adapters, block_ptr).await?;
+        match light_block {
+            Some(light_block) => {
+                let adapter = adapters.cheapest_with(&self.capabilities).await?;
                 let ethereum_block = adapter
-                    .load_full_block(&self.logger, block)
+                    .load_full_block(&self.logger, light_block.inner().clone())
                     .await
                     .map_err(|e| anyhow!("Failed to load full block: {}", e))?;
                 Ok(Some(ethereum_block))
