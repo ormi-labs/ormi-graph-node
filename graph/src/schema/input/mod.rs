@@ -42,6 +42,7 @@ pub mod kw {
     pub const ENTITY: &str = "entity";
     pub const IMMUTABLE: &str = "immutable";
     pub const TIMESERIES: &str = "timeseries";
+    pub const SKIP_DUPLICATES: &str = "skipDuplicates";
     pub const TIMESTAMP: &str = "timestamp";
     pub const AGGREGATE: &str = "aggregate";
     pub const AGGREGATION: &str = "aggregation";
@@ -125,9 +126,24 @@ impl TypeInfo {
 
     fn is_immutable(&self) -> bool {
         match self {
-            TypeInfo::Object(obj_type) => obj_type.immutable,
+            TypeInfo::Object(obj_type) => {
+                matches!(obj_type.mutability, ObjectMutability::Immutable { .. })
+            }
             TypeInfo::Interface(_) => false,
             TypeInfo::Aggregation(_) => true,
+        }
+    }
+
+    fn skip_duplicates(&self) -> bool {
+        match self {
+            TypeInfo::Object(obj_type) => matches!(
+                obj_type.mutability,
+                ObjectMutability::Immutable {
+                    skip_duplicates: true
+                }
+            ),
+            TypeInfo::Interface(_) => false,
+            TypeInfo::Aggregation(_) => false,
         }
     }
 
@@ -409,7 +425,7 @@ pub struct ObjectType {
     pub name: Atom,
     pub id_type: IdType,
     pub fields: Box<[Field]>,
-    pub immutable: bool,
+    pub mutability: ObjectMutability,
     /// The name of the aggregation to which this object type belongs if it
     /// is part of an aggregation
     aggregation: Option<Atom>,
@@ -448,16 +464,28 @@ impl ObjectType {
             None => false,
             _ => unreachable!("validations ensure we don't get here"),
         };
-        let immutable = match dir.argument("immutable") {
+        let immutable = match dir.argument(kw::IMMUTABLE) {
             Some(Value::Boolean(im)) => *im,
             None => timeseries,
             _ => unreachable!("validations ensure we don't get here"),
         };
+
+        let mutability = if immutable {
+            let skip_duplicates = match dir.argument(kw::SKIP_DUPLICATES) {
+                Some(Value::Boolean(sd)) => *sd,
+                _ => false,
+            };
+
+            ObjectMutability::Immutable { skip_duplicates }
+        } else {
+            ObjectMutability::Mutable
+        };
+
         Self {
             name,
             fields,
             id_type,
-            immutable,
+            mutability,
             aggregation: None,
             timeseries,
             interfaces,
@@ -488,7 +516,7 @@ impl ObjectType {
             name,
             interfaces: Box::new([]),
             id_type: IdType::String,
-            immutable: false,
+            mutability: ObjectMutability::Mutable,
             aggregation: None,
             timeseries: false,
             fields,
@@ -504,6 +532,12 @@ impl ObjectType {
     pub fn is_aggregation(&self) -> bool {
         self.aggregation.is_some()
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ObjectMutability {
+    Mutable,
+    Immutable { skip_duplicates: bool },
 }
 
 #[derive(PartialEq, Debug)]
@@ -886,7 +920,9 @@ impl Aggregation {
                         .cloned()
                         .chain(aggregates.iter().map(Aggregate::as_agg_field))
                         .collect(),
-                    immutable: true,
+                    mutability: ObjectMutability::Immutable {
+                        skip_duplicates: false,
+                    },
                     aggregation: Some(name),
                     timeseries: false,
                     interfaces: Box::new([]),
@@ -1203,6 +1239,13 @@ impl InputSchema {
             .unwrap_or(false)
     }
 
+    pub(in crate::schema) fn skip_duplicates(&self, entity_type: Atom) -> bool {
+        self.type_info(entity_type)
+            .ok()
+            .map(|ti| ti.skip_duplicates())
+            .unwrap_or(false)
+    }
+
     /// Return true if `type_name` is the name of an object or interface type
     pub fn is_reference(&self, type_name: &str) -> bool {
         self.inner
@@ -1344,7 +1387,7 @@ impl InputSchema {
                 TypeInfo::Object(obj_type) => Some(obj_type),
                 TypeInfo::Interface(_) | TypeInfo::Aggregation(_) => None,
             })
-            .filter(|obj_type| obj_type.immutable)
+            .filter(|obj_type| matches!(obj_type.mutability, ObjectMutability::Immutable { .. }))
             .map(|obj_type| EntityType::new(self.cheap_clone(), obj_type.name))
     }
 
@@ -2050,6 +2093,15 @@ mod validations {
                         Ok(b) => b.unwrap_or(timeseries),
                         Err(e) => return Some(e),
                     };
+                    let skip_duplicates = match bool_arg(dir, kw::SKIP_DUPLICATES) {
+                        Ok(b) => b.unwrap_or(false),
+                        Err(e) => return Some(e),
+                    };
+                    if skip_duplicates && !immutable {
+                        return Some(SchemaValidationError::SkipDuplicatesRequiresImmutable(
+                            object_type.name.clone(),
+                        ));
+                    }
                     if timeseries {
                         if !immutable {
                             Some(SchemaValidationError::MutableTimeseries(
