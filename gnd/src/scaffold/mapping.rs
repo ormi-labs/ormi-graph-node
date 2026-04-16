@@ -276,11 +276,10 @@ fn extract_callable_functions(options: &ScaffoldOptions) -> String {
                 .unwrap_or("");
 
             // Only include view and pure functions (callable from mappings)
-            if state == "view" || state == "pure" {
-                if let Some(name) = item.get("name").and_then(|n| n.as_str()) {
+            if (state == "view" || state == "pure")
+                && let Some(name) = item.get("name").and_then(|n| n.as_str()) {
                     functions.push(format!("\n  // - contract.{}(...)", name));
                 }
-            }
         }
     }
 

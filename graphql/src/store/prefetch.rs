@@ -597,12 +597,11 @@ impl<'a> Loader<'a> {
 
         // Process all field groups in order
         for (object_type, fields) in selection_set.interior_fields() {
-            if let Some(deadline) = self.ctx.deadline {
-                if deadline < Instant::now() {
+            if let Some(deadline) = self.ctx.deadline
+                && deadline < Instant::now() {
                     errors.push(QueryExecutionError::Timeout);
                     break;
                 }
-            }
 
             // Filter out parents that do not match the type condition.
             let mut parents: Vec<&mut Node> = if at_root {

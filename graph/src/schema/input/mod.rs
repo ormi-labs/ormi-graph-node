@@ -4,7 +4,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{anyhow, Error};
+use anyhow::{Error, anyhow};
 use semver::Version;
 use store::Entity;
 
@@ -15,13 +15,13 @@ use crate::components::store::LoadRelatedRequest;
 use crate::data::graphql::ext::DirectiveFinder;
 use crate::data::graphql::{DirectiveExt, DocumentExt, ObjectTypeExt, TypeExt, ValueExt};
 use crate::data::store::{
-    self, EntityValidationError, IdType, IntoEntityIterator, TryIntoEntityIterator, ValueType, ID,
+    self, EntityValidationError, ID, IdType, IntoEntityIterator, TryIntoEntityIterator, ValueType,
 };
 use crate::data::subgraph::SPEC_VERSION_1_3_0;
 use crate::data::value::Word;
 use crate::derive::CheapClone;
 use crate::prelude::q::Value;
-use crate::prelude::{s, DeploymentHash};
+use crate::prelude::{DeploymentHash, s};
 use crate::schema::api::api_schema;
 use crate::util::intern::{Atom, AtomPool};
 
@@ -1265,7 +1265,7 @@ impl InputSchema {
         obj_type.interfaces().map(|intf| {
             let atom = self.inner.pool.lookup(intf).unwrap();
             match self.type_info(atom).unwrap() {
-                TypeInfo::Interface(ref intf_type) => intf_type,
+                TypeInfo::Interface(intf_type) => intf_type,
                 _ => unreachable!("expected `{intf}` to refer to an interface"),
             }
         })
@@ -1745,17 +1745,17 @@ mod validations {
     use crate::{
         data::{
             graphql::{
-                ext::{DirectiveFinder, FieldExt},
                 DirectiveExt, DocumentExt, ObjectTypeExt, TypeExt, ValueExt,
+                ext::{DirectiveFinder, FieldExt},
             },
-            store::{IdType, ValueType, ID},
+            store::{ID, IdType, ValueType},
             subgraph::SPEC_VERSION_1_1_0,
         },
         prelude::s,
         schema::{
-            input::{kw, sqlexpr, AggregateFn, AggregationInterval},
-            FulltextAlgorithm, FulltextLanguage, Schema as BaseSchema, SchemaValidationError,
-            SchemaValidationError as Err, Strings, SCHEMA_TYPE_NAME,
+            FulltextAlgorithm, FulltextLanguage, SCHEMA_TYPE_NAME, Schema as BaseSchema,
+            SchemaValidationError, SchemaValidationError as Err, Strings,
+            input::{AggregateFn, AggregationInterval, kw, sqlexpr},
         },
     };
 
@@ -1975,7 +1975,7 @@ mod validations {
                             .find(|typ| typ.name[..].eq(entity))
                         {
                             None => {
-                                return vec![SchemaValidationError::FulltextIncludedEntityNotFound]
+                                return vec![SchemaValidationError::FulltextIncludedEntityNotFound];
                             }
                             Some(t) => t,
                         };
@@ -2304,7 +2304,7 @@ mod validations {
                             object_type,
                             &field.name,
                             "the @derivedFrom `field` argument must be a string",
-                        ))
+                        ));
                     }
                 };
 
@@ -2362,11 +2362,11 @@ mod validations {
                     let valid_types = valid_types.join(", ");
 
                     let msg = format!(
-                    "field `{tf}` on type `{tt}` must have one of the following types: {valid_types}",
-                    tf = target_field.name,
-                    tt = target_type_name,
-                    valid_types = valid_types,
-                );
+                        "field `{tf}` on type `{tt}` must have one of the following types: {valid_types}",
+                        tf = target_field.name,
+                        tt = target_type_name,
+                        valid_types = valid_types,
+                    );
                     return Err(invalid(object_type, &field.name, &msg));
                 }
             }
@@ -3215,8 +3215,8 @@ mod tests {
         data::store::ID,
         prelude::DeploymentHash,
         schema::{
-            input::{POI_DIGEST, POI_OBJECT},
             EntityType,
+            input::{POI_DIGEST, POI_OBJECT},
         },
     };
 

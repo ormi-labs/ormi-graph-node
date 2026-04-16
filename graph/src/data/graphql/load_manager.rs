@@ -417,8 +417,8 @@ impl LoadManager {
         let total_effort = total_effort.as_millis() as f64;
 
         // When this variable is not set, we never jail any queries.
-        if let Some(jail_threshold) = ENV_VARS.load_jail_threshold {
-            if known_query && query_effort / total_effort > jail_threshold {
+        if let Some(jail_threshold) = ENV_VARS.load_jail_threshold
+            && known_query && query_effort / total_effort > jail_threshold {
                 // Any single query that causes at least JAIL_THRESHOLD of the
                 // effort in an overload situation gets killed
                 warn!(self.logger, "Jailing query";
@@ -435,7 +435,6 @@ impl LoadManager {
                     TooExpensive
                 };
             }
-        }
 
         // Kill random queries in case we have no queries, or not enough queries
         // that cause at least 20% of the effort

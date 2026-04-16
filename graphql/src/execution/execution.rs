@@ -7,8 +7,8 @@ use graph::{
         value::{Object, Word},
     },
     futures03::future::TryFutureExt,
-    prelude::{s, CheapClone},
-    schema::{is_introspection_field, INTROSPECTION_QUERY_TYPE, META_FIELD_NAME},
+    prelude::{CheapClone, s},
+    schema::{INTROSPECTION_QUERY_TYPE, META_FIELD_NAME, is_introspection_field},
     util::{herd_cache::HerdCache, lfu_cache::EvictStats, timed_rw_lock::TimedMutex},
 };
 use lazy_static::lazy_static;
@@ -39,11 +39,7 @@ lazy_static! {
 
     // We will not add entries to the cache that exceed this weight.
     static ref MAX_ENTRY_WEIGHT: usize = {
-        if ENV_VARS.graphql.query_cache_max_entry_ratio == 0 {
-            usize::MAX
-        } else {
-        *MAX_WEIGHT / ENV_VARS.graphql.query_cache_max_entry_ratio
-        }
+        MAX_WEIGHT.checked_div(ENV_VARS.graphql.query_cache_max_entry_ratio).unwrap_or(usize::MAX)
     };
 
     // Sharded query results cache for recent blocks by network.
@@ -168,8 +164,8 @@ fn log_lfu_evict_stats(
 ) {
     let total_shards = ENV_VARS.graphql.query_lfu_cache_shards as usize;
 
-    if total_shards > 0 {
-        if let Some(EvictStats {
+    if total_shards > 0
+        && let Some(EvictStats {
             new_weight,
             evicted_weight,
             new_count,
@@ -179,27 +175,26 @@ fn log_lfu_evict_stats(
             accesses,
             hits,
         }) = evict_stats
+    {
         {
-            {
-                let shard = (cache_key[0] as usize) % total_shards;
-                let network = network.to_string();
-                let logger = logger.clone();
+            let shard = (cache_key[0] as usize) % total_shards;
+            let network = network.to_string();
+            let logger = logger.clone();
 
-                graph::spawn(async move {
-                    debug!(logger, "Evicted LFU cache";
-                        "shard" => shard,
-                        "network" => network,
-                        "entries" => new_count,
-                        "entries_evicted" => evicted_count,
-                        "weight" => new_weight,
-                        "weight_evicted" => evicted_weight,
-                        "stale_update" => stale_update,
-                        "hit_rate" => format!("{:.0}%", hits as f64 / accesses as f64 * 100.0),
-                        "accesses" => accesses,
-                        "evict_time_ms" => evict_time.as_millis()
-                    )
-                });
-            }
+            graph::spawn(async move {
+                debug!(logger, "Evicted LFU cache";
+                    "shard" => shard,
+                    "network" => network,
+                    "entries" => new_count,
+                    "entries_evicted" => evicted_count,
+                    "weight" => new_weight,
+                    "weight_evicted" => evicted_weight,
+                    "stale_update" => stale_update,
+                    "hit_rate" => format!("{:.0}%", hits as f64 / accesses as f64 * 100.0),
+                    "accesses" => accesses,
+                    "evict_time_ms" => evict_time.as_millis()
+                )
+            });
         }
     }
 }
@@ -336,34 +331,34 @@ pub(crate) async fn execute_root_selection_set<R: Resolver>(
             }
         };
 
-    if should_check_cache {
-        if let (Some(block_ptr), Some(network)) = (block_ptr.as_ref(), &ctx.query.network) {
-            // JSONB and metadata queries use `BLOCK_NUMBER_MAX`. Ignore this case for two reasons:
-            // - Metadata queries are not cacheable.
-            // - Caching `BLOCK_NUMBER_MAX` would make this cache think all other blocks are old.
-            if block_ptr.number != BLOCK_NUMBER_MAX {
-                // Calculate the hash outside of the lock
-                let cache_key = cache_key(&ctx, &selection_set, block_ptr);
-                let shard = (cache_key[0] as usize) % QUERY_BLOCK_CACHE.len();
+    if should_check_cache
+        && let (Some(block_ptr), Some(network)) = (block_ptr.as_ref(), &ctx.query.network)
+    {
+        // JSONB and metadata queries use `BLOCK_NUMBER_MAX`. Ignore this case for two reasons:
+        // - Metadata queries are not cacheable.
+        // - Caching `BLOCK_NUMBER_MAX` would make this cache think all other blocks are old.
+        if block_ptr.number != BLOCK_NUMBER_MAX {
+            // Calculate the hash outside of the lock
+            let cache_key = cache_key(&ctx, &selection_set, block_ptr);
+            let shard = (cache_key[0] as usize) % QUERY_BLOCK_CACHE.len();
 
-                // Check if the response is cached, first in the recent blocks cache,
-                // and then in the LfuCache for historical queries
-                // The blocks are used to delimit how long locks need to be held
-                {
-                    let cache = QUERY_BLOCK_CACHE[shard].lock(&ctx.logger);
-                    if let Some(result) = cache.get(network, block_ptr, &cache_key) {
-                        ctx.cache_status.store(CacheStatus::Hit);
-                        return result;
-                    }
+            // Check if the response is cached, first in the recent blocks cache,
+            // and then in the LfuCache for historical queries
+            // The blocks are used to delimit how long locks need to be held
+            {
+                let cache = QUERY_BLOCK_CACHE[shard].lock(&ctx.logger);
+                if let Some(result) = cache.get(network, block_ptr, &cache_key) {
+                    ctx.cache_status.store(CacheStatus::Hit);
+                    return result;
                 }
-                if let Some(mut cache) = lfu_cache(&ctx.logger, &cache_key) {
-                    if let Some(weighted) = cache.get(&cache_key) {
-                        ctx.cache_status.store(CacheStatus::Hit);
-                        return weighted.result.cheap_clone();
-                    }
-                }
-                key = Some(cache_key);
             }
+            if let Some(mut cache) = lfu_cache(&ctx.logger, &cache_key)
+                && let Some(weighted) = cache.get(&cache_key)
+            {
+                ctx.cache_status.store(CacheStatus::Hit);
+                return weighted.result.cheap_clone();
+            }
+            key = Some(cache_key);
         }
     }
 
@@ -614,7 +609,7 @@ async fn resolve_field_value(
             .await
         }
 
-        s::Type::NamedType(ref name) => {
+        s::Type::NamedType(name) => {
             resolve_field_value_for_named_type(
                 ctx,
                 object_type,
@@ -702,7 +697,7 @@ async fn resolve_field_value_for_list_type(
                 .await
         }
 
-        s::Type::NamedType(ref type_name) => {
+        s::Type::NamedType(type_name) => {
             let named_type = ctx
                 .query
                 .schema

@@ -872,20 +872,17 @@ impl<C: Blockchain> UnvalidatedSubgraphManifest<C> {
             errors.push(e);
         }
 
-        if let Some(graft) = &self.0.graft {
-            if validate_graft_base {
-                if let Err(graft_err) = graft.validate(store).await {
+        if let Some(graft) = &self.0.graft
+            && validate_graft_base
+                && let Err(graft_err) = graft.validate(store).await {
                     errors.push(graft_err);
                 }
-            }
-        }
 
         // Validate subgraph feature usage and declaration.
-        if self.0.spec_version >= SPEC_VERSION_0_0_4 {
-            if let Err(feature_validation_error) = validate_subgraph_features(&self.0) {
+        if self.0.spec_version >= SPEC_VERSION_0_0_4
+            && let Err(feature_validation_error) = validate_subgraph_features(&self.0) {
                 errors.push(feature_validation_error.into())
             }
-        }
 
         // Validate subgraph datasource constraints
         errors.extend(Self::validate_subgraph_datasources(

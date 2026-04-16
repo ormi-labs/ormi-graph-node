@@ -139,11 +139,9 @@ fn manifest_has_api_version(manifest: &serde_json::Value, version: &str) -> bool
                 .get("mapping")
                 .and_then(|m| m.get("apiVersion"))
                 .and_then(|v| v.as_str())
-            {
-                if api_version == version {
+                && api_version == version {
                     return true;
                 }
-            }
         }
     }
 
@@ -154,11 +152,9 @@ fn manifest_has_api_version(manifest: &serde_json::Value, version: &str) -> bool
                 .get("mapping")
                 .and_then(|m| m.get("apiVersion"))
                 .and_then(|v| v.as_str())
-            {
-                if api_version == version {
+                && api_version == version {
                     return true;
                 }
-            }
         }
     }
 

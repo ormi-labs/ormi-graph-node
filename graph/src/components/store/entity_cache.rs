@@ -354,8 +354,8 @@ impl EntityCache {
         // - Check if there's an update for the same entity in handler_updates and apply it.
         // - Add the entity to entity_map.
         for (key, op) in self.updates.iter() {
-            if !entity_map.contains_key(key) {
-                if let Some(entity) = matches_query(op, &query, key)? {
+            if !entity_map.contains_key(key)
+                && let Some(entity) = matches_query(op, &query, key)? {
                     if let Some(handler_op) = self.handler_updates.get(key).cloned() {
                         // If there's a corresponding update in handler_updates, apply it to the entity
                         // and insert the updated entity into entity_map
@@ -372,7 +372,6 @@ impl EntityCache {
                         entity_map.insert(key.clone(), entity);
                     }
                 }
-            }
         }
 
         // Iterate over handler_updates to find entities that:
@@ -381,11 +380,10 @@ impl EntityCache {
         // - Match the query.
         // If these conditions are met, add the entity to entity_map.
         for (key, handler_op) in self.handler_updates.iter() {
-            if !entity_map.contains_key(key) && !self.updates.contains_key(key) {
-                if let Some(entity) = matches_query(handler_op, &query, key)? {
+            if !entity_map.contains_key(key) && !self.updates.contains_key(key)
+                && let Some(entity) = matches_query(handler_op, &query, key)? {
                     entity_map.insert(key.clone(), entity);
                 }
-            }
         }
 
         // Remove entities that are in the store but have been removed by an update.

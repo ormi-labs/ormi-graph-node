@@ -5,15 +5,15 @@ use graph::data::store::scalar;
 use graph::entity;
 use graph::prelude::alloy::primitives::B256;
 use graph::prelude::{
-    o, slog, DeploymentHash, Entity, EntityCollection, EntityFilter, EntityOrder, EntityQuery,
-    Logger, StopwatchMetrics, Value, ValueType, BLOCK_NUMBER_MAX,
+    BLOCK_NUMBER_MAX, DeploymentHash, Entity, EntityCollection, EntityFilter, EntityOrder,
+    EntityQuery, Logger, StopwatchMetrics, Value, ValueType, o, slog,
 };
 use graph::prelude::{BlockNumber, MetricsRegistry};
 use graph::schema::{EntityKey, EntityType, InputSchema};
-use graph_store_postgres::layout_for_tests::set_account_like;
+use graph_store_postgres::AsyncPgConnection;
 use graph_store_postgres::layout_for_tests::LayoutCache;
 use graph_store_postgres::layout_for_tests::SqlName;
-use graph_store_postgres::AsyncPgConnection;
+use graph_store_postgres::layout_for_tests::set_account_like;
 use hex_literal::hex;
 use lazy_static::lazy_static;
 use std::collections::BTreeSet;
@@ -773,13 +773,11 @@ async fn serialize_bigdecimal() {
 
         // Update with overwrite
         let mut entity = SCALAR_ENTITY.clone();
-        let mut vid = 1i64;
 
-        for d in &["50", "50.00", "5000", "0.5000", "0.050", "0.5", "0.05"] {
+        for (vid, d) in (1i64..).zip(&["50", "50.00", "5000", "0.5000", "0.050", "0.5", "0.05"]) {
             let d = BigDecimal::from_str(d).unwrap();
             entity.set("bigDecimal", d).unwrap();
             entity.set("vid", vid).unwrap();
-            vid += 1;
 
             let key = SCALAR_TYPE.key(entity.id());
             let entity_type = layout.input_schema.entity_type("Scalar").unwrap();

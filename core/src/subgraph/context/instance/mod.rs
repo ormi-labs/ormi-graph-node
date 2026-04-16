@@ -5,8 +5,8 @@ use graph::futures01::sync::mpsc::Sender;
 use graph::{
     blockchain::{Blockchain, TriggerData as _},
     data_source::{
-        causality_region::CausalityRegionSeq, offchain, CausalityRegion, DataSource,
-        DataSourceTemplate, TriggerData,
+        CausalityRegion, DataSource, DataSourceTemplate, TriggerData,
+        causality_region::CausalityRegionSeq, offchain,
     },
     prelude::*,
 };
@@ -100,7 +100,7 @@ where
     ) -> Result<Option<Arc<T::Host>>, Error> {
         let module_bytes = match &data_source.runtime() {
             None => return Ok(None),
-            Some(ref module_bytes) => module_bytes.cheap_clone(),
+            Some(module_bytes) => module_bytes.cheap_clone(),
         };
 
         let mapping_request_sender = {

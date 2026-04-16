@@ -656,7 +656,7 @@ impl Layout {
 
         // sort the elements in each blocks bucket by vid
         for vec in entities.values_mut() {
-            vec.sort_by(|a, b| a.vid.cmp(&b.vid));
+            vec.sort_by_key(|a| a.vid);
         }
 
         Ok(entities)

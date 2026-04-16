@@ -468,14 +468,13 @@ impl<'s> RawQuery<'s> {
         max_depth: u8,
     ) -> Result<u64, Vec<QueryExecutionError>> {
         let complexity = self.complexity(max_depth).map_err(|e| vec![e])?;
-        if let Some(max_complexity) = max_complexity {
-            if complexity > max_complexity {
+        if let Some(max_complexity) = max_complexity
+            && complexity > max_complexity {
                 return Err(vec![QueryExecutionError::TooComplex(
                     complexity,
                     max_complexity,
                 )]);
             }
-        }
         Ok(complexity)
     }
 

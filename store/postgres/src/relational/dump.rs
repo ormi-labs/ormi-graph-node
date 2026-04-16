@@ -654,8 +654,8 @@ async fn dump_entity_table(
     if effective_range.is_empty() {
         // No new rows, but for incremental mutable tables we still
         // need to check for clamps
-        if let (Some(prev_info), Some(prev_head)) = (prev, prev_head_block_number) {
-            if !table.immutable {
+        if let (Some(prev_info), Some(prev_head)) = (prev, prev_head_block_number)
+            && !table.immutable {
                 let clamp_index = prev_info.clamps.len();
                 if let Some(clamp_info) = dump_clamp(
                     conn,
@@ -671,7 +671,6 @@ async fn dump_entity_table(
                     clamps.push(clamp_info);
                 }
             }
-        }
 
         let max_vid = prev.map_or(-1, |p| p.max_vid);
         reporter.finish_table(table_dir_name, 0);
@@ -733,8 +732,8 @@ async fn dump_entity_table(
     }
 
     // For incremental mutable tables, dump clamps
-    if let (Some(prev_info), Some(prev_head)) = (prev, prev_head_block_number) {
-        if !table.immutable {
+    if let (Some(prev_info), Some(prev_head)) = (prev, prev_head_block_number)
+        && !table.immutable {
             let clamp_index = prev_info.clamps.len();
             if let Some(clamp_info) = dump_clamp(
                 conn,
@@ -750,7 +749,6 @@ async fn dump_entity_table(
                 clamps.push(clamp_info);
             }
         }
-    }
 
     reporter.finish_table(table_dir_name, total_rows);
 
@@ -1070,15 +1068,14 @@ impl Layout {
         if let (Some(prev_head), Some(curr_head)) = (
             prev_head_block_number,
             metadata.head_block.as_ref().map(|b| b.number),
-        ) {
-            if curr_head <= prev_head {
+        )
+            && curr_head <= prev_head {
                 return Err(StoreError::InternalError(format!(
                     "incremental dump refused: current head block ({}) <= previous head block ({}); \
                      possible reorg — delete the dump directory and re-dump",
                     curr_head, prev_head
                 )));
             }
-        }
 
         write_file(dir.join("schema.graphql"), &schema)?;
 

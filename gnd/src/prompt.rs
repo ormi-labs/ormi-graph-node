@@ -608,14 +608,13 @@ fn prompt_network_interactive(registry: &NetworksRegistry) -> Result<String> {
 
     // Extract network ID from the selection
     // Format is "Full Name (id)"
-    if let Some(start) = input.rfind('(') {
-        if let Some(end) = input.rfind(')') {
+    if let Some(start) = input.rfind('(')
+        && let Some(end) = input.rfind(')') {
             let id = &input[start + 1..end];
             if registry.get_network(id).is_some() {
                 return Ok(id.to_string());
             }
         }
-    }
 
     // Try the input as-is
     if registry.get_network(&input).is_some() {

@@ -2,7 +2,7 @@
 //!
 //! Generates AssemblyScript entity classes from GraphQL schemas.
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use graphql_tools::parser::schema::{
     Definition, Document, Field, ObjectType, Type, TypeDefinition,
 };
@@ -210,8 +210,8 @@ impl SchemaCodeGenerator {
 
         // First pass: collect entity names and their ID types
         for def in &document.definitions {
-            if let Definition::TypeDefinition(TypeDefinition::Object(obj)) = def {
-                if is_entity_type(obj) {
+            if let Definition::TypeDefinition(TypeDefinition::Object(obj)) = def
+                && is_entity_type(obj) {
                     entity_names.insert(obj.name.clone());
                     let id_field = obj.fields.iter().find(|f| f.name == "id");
                     let id_kind = id_field
@@ -219,13 +219,12 @@ impl SchemaCodeGenerator {
                         .unwrap_or(IdFieldKind::String);
                     entity_id_kinds.insert(obj.name.clone(), id_kind);
                 }
-            }
         }
 
         // Second pass: collect entity info
         for def in &document.definitions {
-            if let Definition::TypeDefinition(TypeDefinition::Object(obj)) = def {
-                if is_entity_type(obj) {
+            if let Definition::TypeDefinition(TypeDefinition::Object(obj)) = def
+                && is_entity_type(obj) {
                     let name = obj.name.clone();
 
                     // Find ID field
@@ -254,7 +253,6 @@ impl SchemaCodeGenerator {
                         fields,
                     });
                 }
-            }
         }
 
         // Validate: non-nullable lists must have non-nullable members
@@ -713,6 +711,7 @@ enum StoreMethod {
 #[cfg(test)]
 mod tests {
     use super::*;
+    
     use graphql_tools::parser::parse_schema;
 
     #[test]
@@ -726,9 +725,9 @@ mod tests {
             }
         "#;
         let doc = parse_schema::<String>(schema).unwrap();
-        let gen = SchemaCodeGenerator::new(&doc).unwrap();
+        let generator = SchemaCodeGenerator::new(&doc).unwrap();
 
-        let classes = gen.generate_types(true);
+        let classes = generator.generate_types(true);
         assert_eq!(classes.len(), 1);
 
         let transfer = &classes[0];
@@ -747,9 +746,9 @@ mod tests {
             }
         "#;
         let doc = parse_schema::<String>(schema).unwrap();
-        let gen = SchemaCodeGenerator::new(&doc).unwrap();
+        let generator = SchemaCodeGenerator::new(&doc).unwrap();
 
-        let classes = gen.generate_types(true);
+        let classes = generator.generate_types(true);
         assert_eq!(classes.len(), 1);
 
         // Check that we have methods for nullable and non-nullable fields
@@ -802,9 +801,9 @@ mod tests {
             }
         "#;
         let doc = parse_schema::<String>(schema).unwrap();
-        let gen = SchemaCodeGenerator::new(&doc).unwrap();
+        let generator = SchemaCodeGenerator::new(&doc).unwrap();
 
-        let classes = gen.generate_types(true);
+        let classes = generator.generate_types(true);
         assert_eq!(classes.len(), 1);
 
         let counter = &classes[0];
@@ -846,9 +845,9 @@ mod tests {
             }
         "#;
         let doc = parse_schema::<String>(schema).unwrap();
-        let gen = SchemaCodeGenerator::new(&doc).unwrap();
+        let generator = SchemaCodeGenerator::new(&doc).unwrap();
 
-        let classes = gen.generate_types(true);
+        let classes = generator.generate_types(true);
         assert_eq!(classes.len(), 1);
 
         let event = &classes[0];
@@ -890,9 +889,9 @@ mod tests {
             }
         "#;
         let doc = parse_schema::<String>(schema).unwrap();
-        let gen = SchemaCodeGenerator::new(&doc).unwrap();
+        let generator = SchemaCodeGenerator::new(&doc).unwrap();
 
-        let classes = gen.generate_types(true);
+        let classes = generator.generate_types(true);
         assert_eq!(classes.len(), 1);
 
         let user = &classes[0];
@@ -937,11 +936,11 @@ mod tests {
             }
         "#;
         let doc = parse_schema::<String>(schema).unwrap();
-        let gen = SchemaCodeGenerator::new(&doc).unwrap();
+        let generator = SchemaCodeGenerator::new(&doc).unwrap();
 
         // The Post.author field should be treated as a string (entity ID reference)
-        assert!(gen.entity_names.contains("User"));
-        assert!(gen.entity_names.contains("Post"));
+        assert!(generator.entity_names.contains("User"));
+        assert!(generator.entity_names.contains("Post"));
     }
 
     #[test]
@@ -953,9 +952,9 @@ mod tests {
             }
         "#;
         let doc = parse_schema::<String>(schema).unwrap();
-        let gen = SchemaCodeGenerator::new(&doc).unwrap();
+        let generator = SchemaCodeGenerator::new(&doc).unwrap();
 
-        let classes = gen.generate_types(true);
+        let classes = generator.generate_types(true);
         assert_eq!(classes.len(), 1);
 
         let token = &classes[0];
@@ -989,9 +988,9 @@ mod tests {
             }
         "#;
         let doc = parse_schema::<String>(schema).unwrap();
-        let gen = SchemaCodeGenerator::new(&doc).unwrap();
+        let generator = SchemaCodeGenerator::new(&doc).unwrap();
 
-        let classes = gen.generate_types(true);
+        let classes = generator.generate_types(true);
         assert_eq!(classes.len(), 1);
 
         let matrix = &classes[0];
@@ -1100,19 +1099,19 @@ mod tests {
             }
         "#;
         let doc = parse_schema::<String>(schema).unwrap();
-        let gen = SchemaCodeGenerator::new(&doc).unwrap();
+        let generator = SchemaCodeGenerator::new(&doc).unwrap();
 
         // Find the entity
-        let entity = &gen.entities[0];
+        let entity = &generator.entities[0];
 
         // Find each field and check its value type
         let scalar_field = entity.fields.iter().find(|f| f.name == "scalar").unwrap();
         let array_field = entity.fields.iter().find(|f| f.name == "array").unwrap();
         let matrix_field = entity.fields.iter().find(|f| f.name == "matrix").unwrap();
 
-        assert_eq!(gen.value_type_from_field(scalar_field), "String");
-        assert_eq!(gen.value_type_from_field(array_field), "[String]");
-        assert_eq!(gen.value_type_from_field(matrix_field), "[[String]]");
+        assert_eq!(generator.value_type_from_field(scalar_field), "String");
+        assert_eq!(generator.value_type_from_field(array_field), "[String]");
+        assert_eq!(generator.value_type_from_field(matrix_field), "[[String]]");
     }
 
     #[test]
@@ -1129,9 +1128,9 @@ mod tests {
             }
         "#;
         let doc = parse_schema::<String>(schema).unwrap();
-        let gen = SchemaCodeGenerator::new(&doc).unwrap();
+        let generator = SchemaCodeGenerator::new(&doc).unwrap();
 
-        let classes = gen.generate_types(true);
+        let classes = generator.generate_types(true);
         let balance = classes.iter().find(|c| c.name == "Balance").unwrap();
         let output = balance.to_string();
 
@@ -1170,9 +1169,9 @@ mod tests {
             }
         "#;
         let doc = parse_schema::<String>(schema).unwrap();
-        let gen = SchemaCodeGenerator::new(&doc).unwrap();
+        let generator = SchemaCodeGenerator::new(&doc).unwrap();
 
-        let classes = gen.generate_types(true);
+        let classes = generator.generate_types(true);
         let snapshot = classes.iter().find(|c| c.name == "Snapshot").unwrap();
         let output = snapshot.to_string();
 
@@ -1211,9 +1210,9 @@ mod tests {
             }
         "#;
         let doc = parse_schema::<String>(schema).unwrap();
-        let gen = SchemaCodeGenerator::new(&doc).unwrap();
+        let generator = SchemaCodeGenerator::new(&doc).unwrap();
 
-        let classes = gen.generate_types(true);
+        let classes = generator.generate_types(true);
         let token = classes.iter().find(|c| c.name == "Token").unwrap();
         let output = token.to_string();
 
@@ -1244,9 +1243,9 @@ mod tests {
             }
         "#;
         let doc = parse_schema::<String>(schema).unwrap();
-        let gen = SchemaCodeGenerator::new(&doc).unwrap();
+        let generator = SchemaCodeGenerator::new(&doc).unwrap();
 
-        let classes = gen.generate_types(true);
+        let classes = generator.generate_types(true);
         let balance = classes.iter().find(|c| c.name == "Balance").unwrap();
         let output = balance.to_string();
 
@@ -1272,9 +1271,9 @@ mod tests {
             }
         "#;
         let doc = parse_schema::<String>(schema).unwrap();
-        let gen = SchemaCodeGenerator::new(&doc).unwrap();
+        let generator = SchemaCodeGenerator::new(&doc).unwrap();
 
-        let classes = gen.generate_types(true);
+        let classes = generator.generate_types(true);
         let token = classes.iter().find(|c| c.name == "Token").unwrap();
         let output = token.to_string();
 

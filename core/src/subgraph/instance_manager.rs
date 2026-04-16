@@ -278,8 +278,8 @@ impl<S: SubgraphStore, AC: amp::Client> SubgraphInstanceManager<S, AC> {
                 .with_retries(),
         );
 
-        if let Some(graft) = &manifest.graft {
-            if self.subgraph_store.is_deployed(&graft.base).await? {
+        if let Some(graft) = &manifest.graft
+            && self.subgraph_store.is_deployed(&graft.base).await? {
                 // Makes sure the raw manifest is cached in the subgraph store
                 let _raw_manifest = subgraph_manifest::load_raw_subgraph_manifest(
                     &logger,
@@ -289,7 +289,6 @@ impl<S: SubgraphStore, AC: amp::Client> SubgraphInstanceManager<S, AC> {
                 )
                 .await?;
             }
-        }
 
         info!(logger, "Resolve subgraph files using IPFS";
             "n_data_sources" => manifest.data_sources.len(),

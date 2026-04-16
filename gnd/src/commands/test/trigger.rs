@@ -470,11 +470,10 @@ fn create_block_with_triggers(
     // Collect unique transaction hashes from log triggers.
     let mut tx_hashes: HashSet<B256> = HashSet::new();
     for trigger in &triggers {
-        if let EthereumTrigger::Log(LogRef::FullLog(log, _)) = trigger {
-            if let Some(tx_hash) = log.transaction_hash {
+        if let EthereumTrigger::Log(LogRef::FullLog(log, _)) = trigger
+            && let Some(tx_hash) = log.transaction_hash {
                 tx_hashes.insert(tx_hash);
             }
-        }
     }
 
     let transactions: Vec<_> = tx_hashes

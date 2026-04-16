@@ -1483,8 +1483,8 @@ impl DeploymentStore {
         let info = self
             .subgraph_info_with_conn(&mut conn, site.cheap_clone())
             .await?;
-        if let Some(graft_block) = info.graft_block {
-            if graft_block > block_ptr_to.number {
+        if let Some(graft_block) = info.graft_block
+            && graft_block > block_ptr_to.number {
                 return Err(internal_error!(
                     "Can not revert subgraph `{}` to block {} as it was \
                         grafted at block {} and reverting past a graft point \
@@ -1494,7 +1494,6 @@ impl DeploymentStore {
                     graft_block
                 ));
             }
-        }
 
         self.rewind_or_truncate_with_conn(&mut conn, site, block_ptr_to, firehose_cursor, false)
             .await

@@ -453,8 +453,8 @@ impl NotificationSender {
 
             // If we can't get the lock, another thread in this process is
             // already checking, and we can just skip checking
-            if let Ok(mut last_check) = LAST_CLEANUP_CHECK.try_lock() {
-                if last_check.elapsed() > ENV_VARS.store.large_notification_cleanup_interval {
+            if let Ok(mut last_check) = LAST_CLEANUP_CHECK.try_lock()
+                && last_check.elapsed() > ENV_VARS.store.large_notification_cleanup_interval {
                     diesel::sql_query(format!(
                         "delete from large_notifications
                          where created_at < current_timestamp - interval '{}s'",
@@ -464,7 +464,6 @@ impl NotificationSender {
                     .await?;
                     *last_check = Instant::now();
                 }
-            }
         }
         self.sent_counter
             .with_label_values(&[channel, network.unwrap_or("none")])

@@ -290,8 +290,8 @@ where
             }
 
             // Stop subgraph when we reach maximum endblock.
-            if let Some(max_end_block) = self.inputs.max_end_block {
-                if max_end_block <= current_ptr.block_number() {
+            if let Some(max_end_block) = self.inputs.max_end_block
+                && max_end_block <= current_ptr.block_number() {
                     info!(self.logger, "Stopping subgraph as we reached maximum endBlock";
                                 "max_end_block" => max_end_block,
                                 "current_block" => current_ptr.block_number());
@@ -300,7 +300,6 @@ where
                         reason: StopReason::MaxEndBlockReached,
                     });
                 }
-            }
         }
 
         // Normal case: proceed to start the block stream
@@ -1312,15 +1311,14 @@ where
                     }
                 }
 
-                if let Some(stop_block) = self.inputs.stop_block {
-                    if block_ptr.number >= stop_block {
+                if let Some(stop_block) = self.inputs.stop_block
+                    && block_ptr.number >= stop_block {
                         info!(self.logger, "Stop block reached for subgraph");
                         return Ok(Action::Stop);
                     }
-                }
 
-                if let Some(max_end_block) = self.inputs.max_end_block {
-                    if block_ptr.number >= max_end_block {
+                if let Some(max_end_block) = self.inputs.max_end_block
+                    && block_ptr.number >= max_end_block {
                         info!(
                             self.logger,
                             "Stopping subgraph as maximum endBlock reached";
@@ -1329,7 +1327,6 @@ where
                         );
                         return Ok(Action::Stop);
                     }
-                }
 
                 Ok(action)
             }

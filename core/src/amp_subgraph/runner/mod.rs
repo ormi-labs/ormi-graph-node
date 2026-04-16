@@ -119,11 +119,9 @@ where
             )
             .await?;
 
-            if deployment_is_failed {
-                if let Some(block_ptr) = cx.store.block_ptr() {
-                    cx.store.unfail_non_deterministic_error(&block_ptr).await?;
-                    deployment_is_failed = false;
-                }
+            if deployment_is_failed && let Some(block_ptr) = cx.store.block_ptr() {
+                cx.store.unfail_non_deterministic_error(&block_ptr).await?;
+                deployment_is_failed = false;
             }
         }
 

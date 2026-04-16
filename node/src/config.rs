@@ -517,8 +517,8 @@ impl ChainSection {
             }
             // Check that an explicit amp alias doesn't collide with
             // another chain's own name (which would be ambiguous).
-            if chain.amp.is_some() {
-                if let Some(other) = self.chains.get(effective) {
+            if chain.amp.is_some()
+                && let Some(other) = self.chains.get(effective) {
                     // Only a collision if the other chain doesn't also
                     // set the same amp alias (which is covered by the
                     // duplicate check above).
@@ -531,7 +531,6 @@ impl ChainSection {
                         ));
                     }
                 }
-            }
             amp_names.insert(effective.to_string(), chain_name.clone());
         }
 
@@ -1324,11 +1323,10 @@ impl Predicate {
     }
 
     pub fn matches(&self, name: &str, network: &str) -> bool {
-        if let Some(n) = &self.network {
-            if !n.matches(network) {
+        if let Some(n) = &self.network
+            && !n.matches(network) {
                 return false;
             }
-        }
 
         match self.name.find(name) {
             None => false,

@@ -521,8 +521,8 @@ impl EntityQuery {
         // If there is one window, with one id, in a direct relation to the
         // entities, we can simplify the query by changing the filter and
         // getting rid of the window
-        if let EntityCollection::Window(windows) = &self.collection {
-            if windows.len() == 1 {
+        if let EntityCollection::Window(windows) = &self.collection
+            && windows.len() == 1 {
                 let window = windows.first().expect("we just checked");
                 if window.ids.len() == 1 {
                     let id = window.ids.first().expect("we just checked").to_value();
@@ -543,7 +543,6 @@ impl EntityQuery {
                     }
                 }
             }
-        }
         self
     }
 }

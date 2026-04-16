@@ -385,11 +385,10 @@ async fn init_from_contract(opt: &InitOpt, prefetched: Option<ContractInfo>) -> 
     }
 
     // Install dependencies unless skipped
-    if !opt.skip_install {
-        if let Err(e) = install_dependencies(&directory) {
+    if !opt.skip_install
+        && let Err(e) = install_dependencies(&directory) {
             eprintln!("Warning: {}", e);
         }
-    }
 
     // Run codegen to generate types (requires dependencies to be installed)
     if !opt.skip_install {
@@ -573,11 +572,10 @@ fn init_from_example(opt: &InitOpt) -> Result<()> {
     }
 
     // Install dependencies unless skipped
-    if !opt.skip_install {
-        if let Err(e) = install_dependencies(&directory) {
+    if !opt.skip_install
+        && let Err(e) = install_dependencies(&directory) {
             eprintln!("Warning: {}", e);
         }
-    }
 
     // Run codegen unless install was skipped (codegen requires dependencies)
     if !opt.skip_install {
@@ -908,8 +906,8 @@ async fn init_from_subgraph(opt: &InitOpt) -> Result<()> {
         serde_yaml::from_str(&manifest_yaml).context("Failed to parse subgraph manifest YAML")?;
 
     // Validate network matches
-    if let Some(manifest_network) = extract_network(&manifest) {
-        if manifest_network != network {
+    if let Some(manifest_network) = extract_network(&manifest)
+        && manifest_network != network {
             return Err(anyhow!(
                 "Network mismatch: The source subgraph is indexing '{}', but you specified '{}'.\n\
                  When composing subgraphs, they must index the same network.",
@@ -917,7 +915,6 @@ async fn init_from_subgraph(opt: &InitOpt) -> Result<()> {
                 network
             ));
         }
-    }
 
     // Get start block from manifest if not provided
     let start_block = opt
@@ -999,11 +996,10 @@ async fn init_from_subgraph(opt: &InitOpt) -> Result<()> {
     }
 
     // Install dependencies unless skipped
-    if !opt.skip_install {
-        if let Err(e) = install_dependencies(&directory) {
+    if !opt.skip_install
+        && let Err(e) = install_dependencies(&directory) {
             eprintln!("Warning: {}", e);
         }
-    }
 
     step(
         Step::Done,
@@ -1097,11 +1093,10 @@ fn is_immutable_entity(obj: &gql::ObjectType<String>) -> bool {
     for directive in &obj.directives {
         if directive.name == "entity" {
             for (name, value) in &directive.arguments {
-                if name == "immutable" {
-                    if let gql::Value::Boolean(true) = value {
+                if name == "immutable"
+                    && let gql::Value::Boolean(true) = value {
                         return true;
                     }
-                }
             }
         }
     }
@@ -1422,11 +1417,10 @@ mod tests {
 
         let ast = gql::parse_schema::<String>(schema).unwrap();
         for def in ast.definitions {
-            if let gql::Definition::TypeDefinition(gql::TypeDefinition::Object(obj)) = def {
-                if obj.name == "Transfer" {
+            if let gql::Definition::TypeDefinition(gql::TypeDefinition::Object(obj)) = def
+                && obj.name == "Transfer" {
                     assert!(is_immutable_entity(&obj));
                 }
-            }
         }
 
         // Non-immutable entity
@@ -1438,11 +1432,10 @@ mod tests {
 
         let ast = gql::parse_schema::<String>(schema).unwrap();
         for def in ast.definitions {
-            if let gql::Definition::TypeDefinition(gql::TypeDefinition::Object(obj)) = def {
-                if obj.name == "Account" {
+            if let gql::Definition::TypeDefinition(gql::TypeDefinition::Object(obj)) = def
+                && obj.name == "Account" {
                     assert!(!is_immutable_entity(&obj));
                 }
-            }
         }
     }
 }

@@ -159,6 +159,8 @@ impl TemplateCodeGenerator {
 
 #[cfg(test)]
 mod tests {
+    
+
     use super::*;
 
     #[test]
@@ -185,16 +187,16 @@ mod tests {
     #[test]
     fn test_ethereum_template() {
         let template = Template::new("DynamicToken", TemplateKind::Ethereum);
-        let gen = TemplateCodeGenerator::new(vec![template]);
+        let generator = TemplateCodeGenerator::new(vec![template]);
 
-        let imports = gen.generate_module_imports();
+        let imports = generator.generate_module_imports();
         assert_eq!(imports.len(), 1);
         let import_names: Vec<_> = imports[0].names.iter().collect();
         assert!(import_names.contains(&&"DataSourceTemplate".to_string()));
         assert!(import_names.contains(&&"DataSourceContext".to_string()));
         assert!(import_names.contains(&&"Address".to_string()));
 
-        let types = gen.generate_types();
+        let types = generator.generate_types();
         assert_eq!(types.len(), 1);
 
         let klass = &types[0];
@@ -218,9 +220,9 @@ mod tests {
     #[test]
     fn test_file_ipfs_template() {
         let template = Template::new("TokenMetadata", TemplateKind::FileIpfs);
-        let gen = TemplateCodeGenerator::new(vec![template]);
+        let generator = TemplateCodeGenerator::new(vec![template]);
 
-        let imports = gen.generate_module_imports();
+        let imports = generator.generate_module_imports();
         assert_eq!(imports.len(), 1);
         let import_names: Vec<_> = imports[0].names.iter().collect();
         assert!(import_names.contains(&&"DataSourceTemplate".to_string()));
@@ -228,7 +230,7 @@ mod tests {
         // No Address for file templates
         assert!(!import_names.contains(&&"Address".to_string()));
 
-        let types = gen.generate_types();
+        let types = generator.generate_types();
         assert_eq!(types.len(), 1);
 
         let klass = &types[0];
@@ -246,30 +248,30 @@ mod tests {
             Template::new("DynamicToken", TemplateKind::Ethereum),
             Template::new("TokenMetadata", TemplateKind::FileIpfs),
         ];
-        let gen = TemplateCodeGenerator::new(templates);
+        let generator = TemplateCodeGenerator::new(templates);
 
-        let imports = gen.generate_module_imports();
+        let imports = generator.generate_module_imports();
         // Should have Address because of Ethereum template
         let import_names: Vec<_> = imports[0].names.iter().collect();
         assert!(import_names.contains(&&"Address".to_string()));
 
-        let types = gen.generate_types();
+        let types = generator.generate_types();
         assert_eq!(types.len(), 2);
     }
 
     #[test]
     fn test_empty_templates() {
-        let gen = TemplateCodeGenerator::new(vec![]);
-        assert!(gen.generate_module_imports().is_empty());
-        assert!(gen.generate_types().is_empty());
+        let generator = TemplateCodeGenerator::new(vec![]);
+        assert!(generator.generate_module_imports().is_empty());
+        assert!(generator.generate_types().is_empty());
     }
 
     #[test]
     fn test_generated_output() {
         let template = Template::new("DynamicToken", TemplateKind::Ethereum);
-        let gen = TemplateCodeGenerator::new(vec![template]);
+        let generator = TemplateCodeGenerator::new(vec![template]);
 
-        let types = gen.generate_types();
+        let types = generator.generate_types();
         let output = types[0].to_string();
 
         assert!(output.contains("export class DynamicToken extends DataSourceTemplate"));

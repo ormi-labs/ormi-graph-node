@@ -1375,6 +1375,8 @@ fn indexed_input_type(param_type: &DynSolType) -> DynSolType {
 
 #[cfg(test)]
 mod tests {
+    
+
     use super::*;
 
     fn parse_abi(json: &str) -> JsonAbi {
@@ -1397,8 +1399,8 @@ mod tests {
         ]"#;
 
         let contract = parse_abi(abi_json);
-        let gen = AbiCodeGenerator::new(contract, "Token");
-        let types = gen.generate_types();
+        let generator = AbiCodeGenerator::new(contract, "Token");
+        let types = generator.generate_types();
 
         assert!(types.iter().any(|c| c.name == "Transfer"));
         assert!(types.iter().any(|c| c.name == "Transfer__Params"));
@@ -1417,17 +1419,19 @@ mod tests {
         ]"#;
 
         let contract = parse_abi(abi_json);
-        let gen = AbiCodeGenerator::new(contract, "Token");
-        let types = gen.generate_types();
+        let generator = AbiCodeGenerator::new(contract, "Token");
+        let types = generator.generate_types();
 
         assert!(types.iter().any(|c| c.name == "Token"));
         let token_class = types.iter().find(|c| c.name == "Token").unwrap();
 
         assert!(token_class.methods.iter().any(|m| m.name == "balanceOf"));
-        assert!(token_class
-            .methods
-            .iter()
-            .any(|m| m.name == "try_balanceOf"));
+        assert!(
+            token_class
+                .methods
+                .iter()
+                .any(|m| m.name == "try_balanceOf")
+        );
     }
 
     #[test]
@@ -1443,8 +1447,8 @@ mod tests {
 
     #[test]
     fn test_name_sanitization() {
-        let gen = AbiCodeGenerator::new(JsonAbi::default(), "Test!Contract@Name");
-        assert_eq!(gen.name, "Test_Contract_Name");
+        let generator = AbiCodeGenerator::new(JsonAbi::default(), "Test!Contract@Name");
+        assert_eq!(generator.name, "Test_Contract_Name");
     }
 
     #[test]
@@ -1500,8 +1504,8 @@ mod tests {
         ]"#;
 
         let contract = parse_abi(abi_json);
-        let gen = AbiCodeGenerator::new(contract, "Token");
-        let types = gen.generate_types();
+        let generator = AbiCodeGenerator::new(contract, "Token");
+        let types = generator.generate_types();
 
         // Get all event class names
         let event_names: Vec<&str> = types
@@ -1555,8 +1559,8 @@ mod tests {
         ]"#;
 
         let contract = parse_abi(abi_json);
-        let gen = AbiCodeGenerator::new(contract, "Token");
-        let types = gen.generate_types();
+        let generator = AbiCodeGenerator::new(contract, "Token");
+        let types = generator.generate_types();
 
         // Find the Token contract class
         let token_class = types.iter().find(|c| c.name == "Token").unwrap();
@@ -1612,8 +1616,8 @@ mod tests {
         ]"#;
 
         let contract = parse_abi(abi_json);
-        let gen = AbiCodeGenerator::new(contract, "TestContract");
-        let types = gen.generate_types();
+        let generator = AbiCodeGenerator::new(contract, "TestContract");
+        let types = generator.generate_types();
 
         // Get class names
         let class_names: Vec<&str> = types.iter().map(|c| c.name.as_str()).collect();
@@ -1699,8 +1703,8 @@ mod tests {
         ]"#;
 
         let contract = parse_abi(abi_json);
-        let gen = AbiCodeGenerator::new(contract, "TestContract");
-        let types = gen.generate_types();
+        let generator = AbiCodeGenerator::new(contract, "TestContract");
+        let types = generator.generate_types();
 
         // Get class names
         let class_names: Vec<&str> = types.iter().map(|c| c.name.as_str()).collect();
@@ -1758,8 +1762,8 @@ mod tests {
         ]"#;
 
         let contract = parse_abi(abi_json);
-        let gen = AbiCodeGenerator::new(contract, "TestContract");
-        let types = gen.generate_types();
+        let generator = AbiCodeGenerator::new(contract, "TestContract");
+        let types = generator.generate_types();
 
         // Get class names
         let class_names: Vec<&str> = types.iter().map(|c| c.name.as_str()).collect();
@@ -1803,8 +1807,8 @@ mod tests {
         ]"#;
 
         let contract = parse_abi(abi_json);
-        let gen = AbiCodeGenerator::new(contract, "TestContract");
-        let types = gen.generate_types();
+        let generator = AbiCodeGenerator::new(contract, "TestContract");
+        let types = generator.generate_types();
 
         // Find the contract class
         let contract_class = types.iter().find(|c| c.name == "TestContract").unwrap();
@@ -1846,8 +1850,8 @@ mod tests {
         ]"#;
 
         let contract = parse_abi(abi_json);
-        let gen = AbiCodeGenerator::new(contract, "Token");
-        let types = gen.generate_types();
+        let generator = AbiCodeGenerator::new(contract, "Token");
+        let types = generator.generate_types();
 
         // Find the params class
         let params_class = types
@@ -1924,8 +1928,8 @@ mod tests {
         ]"#;
 
         let contract = parse_abi(abi_json);
-        let gen = AbiCodeGenerator::new(contract, "TestContract");
-        let types = gen.generate_types();
+        let generator = AbiCodeGenerator::new(contract, "TestContract");
+        let types = generator.generate_types();
 
         // Find the contract class
         let contract_class = types.iter().find(|c| c.name == "TestContract").unwrap();

@@ -5,13 +5,13 @@
 //!
 //! Code in this module works very hard to minimize the number of allocations
 //! that it performs
+use diesel::QuerySource as _;
 use diesel::pg::Pg;
 use diesel::query_builder::{AstPass, Query, QueryFragment, QueryId};
 use diesel::query_dsl::RunQueryDsl;
 use diesel::result::{Error as DieselError, QueryResult};
 use diesel::sql_types::Untyped;
 use diesel::sql_types::{Array, BigInt, Binary, Bool, Int8, Integer, Jsonb, Text, Timestamptz};
-use diesel::QuerySource as _;
 use graph::components::store::write::{EntityWrite, RowGroup, WriteChunk};
 use graph::components::store::{Child as StoreChild, DerivedEntityQuery};
 
@@ -21,9 +21,9 @@ use graph::data::store::{IdList, IdRef, QueryObject};
 use graph::data::value::{Object, Word};
 use graph::data_source::CausalityRegion;
 use graph::prelude::{
-    anyhow, r, serde_json, BlockNumber, ChildMultiplicity, Entity, EntityCollection, EntityFilter,
-    EntityLink, EntityOrder, EntityOrderByChild, EntityOrderByChildInfo, EntityRange, EntityWindow,
-    ParentLink, QueryExecutionError, StoreError, Value, ENV_VARS,
+    BlockNumber, ChildMultiplicity, ENV_VARS, Entity, EntityCollection, EntityFilter, EntityLink,
+    EntityOrder, EntityOrderByChild, EntityOrderByChildInfo, EntityRange, EntityWindow, ParentLink,
+    QueryExecutionError, StoreError, Value, anyhow, r, serde_json,
 };
 use graph::schema::{EntityType, FulltextAlgorithm, FulltextConfig, InputSchema};
 use graph::{
@@ -44,13 +44,14 @@ use crate::block_range::{BoundSide, EntityBlockRange};
 use crate::parquet::convert::RestoreRow;
 use crate::relational::dsl::AtBlock;
 use crate::relational::{
-    dsl, rollup::Rollup, Column, ColumnType, Layout, SqlName, Table, BYTE_ARRAY_PREFIX_SIZE,
-    PRIMARY_KEY_COLUMN, STRING_PREFIX_SIZE, VID_COLUMN,
+    BYTE_ARRAY_PREFIX_SIZE, Column, ColumnType, Layout, PRIMARY_KEY_COLUMN, STRING_PREFIX_SIZE,
+    SqlName, Table, VID_COLUMN, dsl, rollup::Rollup,
 };
 use crate::{
     block_range::{
-        BlockRangeColumn, BlockRangeLowerBoundClause, BlockRangeUpperBoundClause, BlockRangeValue,
-        BLOCK_COLUMN, BLOCK_RANGE_COLUMN, BLOCK_RANGE_CURRENT, CAUSALITY_REGION_COLUMN,
+        BLOCK_COLUMN, BLOCK_RANGE_COLUMN, BLOCK_RANGE_CURRENT, BlockRangeColumn,
+        BlockRangeLowerBoundClause, BlockRangeUpperBoundClause, BlockRangeValue,
+        CAUSALITY_REGION_COLUMN,
     },
     primary::Site,
 };
@@ -631,7 +632,7 @@ impl<'a> SqlValue<'a> {
 
         let value = match value {
             String(s) => match column_type {
-                ColumnType::String|ColumnType::Enum(_)|ColumnType::TSVector(_) => S::Text(s),
+                ColumnType::String | ColumnType::Enum(_) | ColumnType::TSVector(_) => S::Text(s),
                 ColumnType::Int8 => S::Int8(s.parse::<i64>().map_err(|e| {
                     internal_error!("failed to convert `{}` to an Int8: {}", s, e.to_string())
                 })?),
@@ -646,35 +647,26 @@ impl<'a> SqlValue<'a> {
             },
             Int(i) => S::Int(*i),
             Value::Int8(i) => S::Int8(*i),
-            BigDecimal(d) => {
-                S::Numeric(d.to_string())
-            }
+            BigDecimal(d) => S::Numeric(d.to_string()),
             Timestamp(ts) => S::Timestamp(*ts),
             Bool(b) => S::Bool(*b),
-            List(values) => {
-                match column_type {
-                    ColumnType::BigDecimal | ColumnType::BigInt => {
-                        let text_values: Vec<_> = values.iter().map(|v| v.to_string()).collect();
-                        S::Numerics(text_values)
-                    },
-                    ColumnType::Boolean|ColumnType::Bytes|
-                    ColumnType::Int|
-                    ColumnType::Int8|
-                    ColumnType::String|
-                    ColumnType::Timestamp|
-                    ColumnType::Enum(_)|
-                    ColumnType::TSVector(_) => {
-                        S::List(values)
-                    }
+            List(values) => match column_type {
+                ColumnType::BigDecimal | ColumnType::BigInt => {
+                    let text_values: Vec<_> = values.iter().map(|v| v.to_string()).collect();
+                    S::Numerics(text_values)
                 }
-            }
-            Null => {
-                S::Null
-            }
+                ColumnType::Boolean
+                | ColumnType::Bytes
+                | ColumnType::Int
+                | ColumnType::Int8
+                | ColumnType::String
+                | ColumnType::Timestamp
+                | ColumnType::Enum(_)
+                | ColumnType::TSVector(_) => S::List(values),
+            },
+            Null => S::Null,
             Bytes(b) => S::Bytes(b),
-            BigInt(i) => {
-                S::Numeric(i.to_string())
-            }
+            BigInt(i) => S::Numeric(i.to_string()),
         };
         Ok(value)
     }
@@ -765,7 +757,7 @@ impl<'a> QueryFragment<Pg> for QueryValue<'a> {
         use SqlValue as S;
         match &self.value {
             S::Text(s) => push_string(s, column_type, &mut out),
-            S::String(ref s) => push_string(s, column_type, &mut out),
+            S::String(s) => push_string(s, column_type, &mut out),
             S::Int(i) => out.push_bind_param::<Integer, _>(i),
             S::Int8(i) => out.push_bind_param::<Int8, _>(i),
             S::Timestamp(i) => out.push_bind_param::<Timestamptz, _>(&i.0),
@@ -2432,11 +2424,11 @@ impl<'a> InsertQuery<'a> {
             for column in table.columns.iter() {
                 if !column.is_nullable() && !row.entity.contains_key(&column.field) {
                     return Err(StoreError::QueryExecutionError(format!(
-                    "can not insert entity {}[{}] since value for non-nullable attribute {} is missing. \
+                        "can not insert entity {}[{}] since value for non-nullable attribute {} is missing. \
                      To fix this, mark the attribute as nullable in the GraphQL schema or change the \
                      mapping code to always set this attribute.",
-                    table.object, row.id, column.field
-                )));
+                        table.object, row.id, column.field
+                    )));
                 }
             }
         }

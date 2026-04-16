@@ -281,11 +281,10 @@ async fn on_poll_failure<A: crate::EthereumAdapterTrait>(
     // at the match level. If the current provider responds to eth_blockNumber, the
     // failure was not caused by provider unavailability — switching cannot help.
     let current = providers.iter().find(|p| p.provider() == current_name);
-    if let Some(current) = current {
-        if current.is_reachable().await {
+    if let Some(current) = current
+        && current.is_reachable().await {
             return;
         }
-    }
 
     // Probe all alternatives in parallel; switch to the first that responds.
     let futs = providers

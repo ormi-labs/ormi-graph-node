@@ -10,13 +10,13 @@ use crate::cheap_clone::CheapClone;
 use crate::data::graphql::{ObjectOrInterface, ObjectTypeExt, TypeExt};
 use crate::data::store::IdType;
 use crate::env::ENV_VARS;
-use crate::schema::{ast, META_FIELD_NAME, META_FIELD_TYPE, SCHEMA_TYPE_NAME};
+use crate::schema::{META_FIELD_NAME, META_FIELD_TYPE, SCHEMA_TYPE_NAME, ast};
 
 use crate::data::graphql::ext::{
-    camel_cased_names, DefinitionExt, DirectiveExt, DocumentExt, ValueExt,
+    DefinitionExt, DirectiveExt, DocumentExt, ValueExt, camel_cased_names,
 };
 use crate::derive::CheapClone;
-use crate::prelude::{q, r, s, DeploymentHash};
+use crate::prelude::{DeploymentHash, q, r, s};
 
 use super::{Aggregation, Field, InputSchema, Schema, TypeKind};
 
@@ -817,10 +817,10 @@ fn field_filter_input_values(
                 extend_with_child_filter_input_value(field, type_name, &mut input_values);
                 input_values
             }
-            s::TypeDefinition::Scalar(ref t) => {
+            s::TypeDefinition::Scalar(t) => {
                 field_scalar_filter_input_values(&schema.document, field, ops.for_type(t))
             }
-            s::TypeDefinition::Enum(ref t) => {
+            s::TypeDefinition::Enum(t) => {
                 field_enum_filter_input_values(&schema.document, field, t)
             }
             _ => vec![],
@@ -1016,8 +1016,8 @@ fn field_list_filter_input_values(
                 (Some(named_type), Some(name.clone()))
             }
         }
-        s::TypeDefinition::Scalar(ref t) => (Some(s::Type::NamedType(t.name.clone())), None),
-        s::TypeDefinition::Enum(ref t) => (Some(s::Type::NamedType(t.name.clone())), None),
+        s::TypeDefinition::Scalar(t) => (Some(s::Type::NamedType(t.name.clone())), None),
+        s::TypeDefinition::Enum(t) => (Some(s::Type::NamedType(t.name.clone())), None),
         s::TypeDefinition::InputObject(_) | s::TypeDefinition::Union(_) => (None, None),
     };
 
@@ -1307,10 +1307,10 @@ fn meta_field() -> s::Field {
 mod tests {
     use crate::{
         data::{
-            graphql::{ext::FieldExt, ObjectTypeExt, TypeExt as _},
+            graphql::{ObjectTypeExt, TypeExt as _, ext::FieldExt},
             subgraph::LATEST_VERSION,
         },
-        prelude::{s, DeploymentHash},
+        prelude::{DeploymentHash, s},
         schema::{InputSchema, SCHEMA_TYPE_NAME},
     };
     use lazy_static::lazy_static;
@@ -2044,7 +2044,7 @@ mod tests {
             .expect("Query type is missing in derived API schema");
 
         let singular_field = match query_type {
-            s::TypeDefinition::Object(ref t) => ast::get_field(t, "node"),
+            s::TypeDefinition::Object(t) => ast::get_field(t, "node"),
             _ => None,
         }
         .expect("\"node\" field is missing on Query type");
@@ -2068,7 +2068,7 @@ mod tests {
         );
 
         let plural_field = match query_type {
-            s::TypeDefinition::Object(ref t) => ast::get_field(t, "nodes"),
+            s::TypeDefinition::Object(t) => ast::get_field(t, "nodes"),
             _ => None,
         }
         .expect("\"nodes\" field is missing on Query type");

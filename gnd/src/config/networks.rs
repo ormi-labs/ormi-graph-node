@@ -85,17 +85,16 @@ pub fn apply_network_config(
     network_config: &NetworkConfig,
 ) -> Result<()> {
     // Update data sources
-    if let Some(data_sources) = manifest.get_mut("dataSources") {
-        if let Some(arr) = data_sources.as_sequence_mut() {
+    if let Some(data_sources) = manifest.get_mut("dataSources")
+        && let Some(arr) = data_sources.as_sequence_mut() {
             for ds in arr.iter_mut() {
                 update_data_source(ds, network, network_config)?;
             }
         }
-    }
 
     // Update templates to use the same network
-    if let Some(templates) = manifest.get_mut("templates") {
-        if let Some(arr) = templates.as_sequence_mut() {
+    if let Some(templates) = manifest.get_mut("templates")
+        && let Some(arr) = templates.as_sequence_mut() {
             for template in arr.iter_mut() {
                 if let Some(mapping) = template.as_mapping_mut() {
                     mapping.insert(
@@ -105,7 +104,6 @@ pub fn apply_network_config(
                 }
             }
         }
-    }
 
     Ok(())
 }

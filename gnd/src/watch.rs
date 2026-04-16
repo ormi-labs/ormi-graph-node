@@ -65,13 +65,12 @@ where
     // Watch directories containing the files
     let mut watched_dirs = HashSet::new();
     for file in &files_to_watch {
-        if let Some(dir) = file.parent() {
-            if watched_dirs.insert(dir.to_path_buf()) {
+        if let Some(dir) = file.parent()
+            && watched_dirs.insert(dir.to_path_buf()) {
                 watcher
                     .watch(dir, RecursiveMode::NonRecursive)
                     .map_err(|e| anyhow!("Failed to watch {}: {}", dir.display(), e))?;
             }
-        }
     }
 
     // Event loop

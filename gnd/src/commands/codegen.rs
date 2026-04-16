@@ -9,7 +9,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 use graph::abi::JsonAbi;
 use graphql_tools::parser::schema as gql;
@@ -17,13 +17,13 @@ use semver::Version;
 
 use crate::abi::normalize_abi_json;
 use crate::codegen::{
-    AbiCodeGenerator, Class, ModuleImports, SchemaCodeGenerator, Template as CodegenTemplate,
-    TemplateCodeGenerator, TemplateKind, GENERATED_FILE_NOTE,
+    AbiCodeGenerator, Class, GENERATED_FILE_NOTE, ModuleImports, SchemaCodeGenerator,
+    Template as CodegenTemplate, TemplateCodeGenerator, TemplateKind,
 };
 use crate::formatter::try_format_typescript;
-use crate::manifest::{load_manifest, resolve_path, DataSource, Manifest, Template};
+use crate::manifest::{DataSource, Manifest, Template, load_manifest, resolve_path};
 use crate::migrations;
-use crate::output::{step, Step};
+use crate::output::{Step, step};
 use crate::services::IpfsClient;
 use crate::validation::{
     format_manifest_errors, format_schema_errors, validate_manifest_files, validate_schema,
@@ -209,7 +209,7 @@ fn generate_schema_types(
     step(Step::Generate, "Generate types for GraphQL schema");
 
     let generator = match SchemaCodeGenerator::new(&ast) {
-        Ok(gen) => gen,
+        Ok(generator) => generator,
         Err(e) => {
             // Schema validation failed - skip schema.ts generation but don't fail
             eprintln!("Warning: {}", e);
@@ -277,14 +277,13 @@ fn preprocess_abi_json(abi_str: &str) -> Result<String> {
 fn add_default_event_param_names(params: &mut serde_json::Value) {
     if let Some(params_arr) = params.as_array_mut() {
         for (index, param) in params_arr.iter_mut().enumerate() {
-            if let Some(obj) = param.as_object_mut() {
-                if !obj.contains_key("name") {
+            if let Some(obj) = param.as_object_mut()
+                && !obj.contains_key("name") {
                     obj.insert(
                         "name".to_string(),
                         serde_json::Value::String(format!("param{}", index)),
                     );
                 }
-            }
         }
     }
 }
@@ -407,7 +406,7 @@ async fn generate_subgraph_source_types(
 
         // Generate entity types WITHOUT store methods (false = no store methods)
         let generator = match SchemaCodeGenerator::new(&ast) {
-            Ok(gen) => gen,
+            Ok(generator) => generator,
             Err(e) => {
                 eprintln!(
                     "Warning: Failed to create schema generator for subgraph {} ({}): {}",

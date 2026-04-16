@@ -10,12 +10,11 @@
 use serde_json::Value;
 
 pub fn patch_type_field(obj: &mut Value) -> bool {
-    if let Value::Object(map) = obj {
-        if !map.contains_key("type") {
+    if let Value::Object(map) = obj
+        && !map.contains_key("type") {
             map.insert("type".to_string(), Value::String("0x0".to_string()));
             return true;
         }
-    }
     false
 }
 

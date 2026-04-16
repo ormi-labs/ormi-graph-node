@@ -178,9 +178,7 @@ impl HostExports {
             });
 
             if has_invalid_fields {
-                let mut invalid_fields: Vec<Word> = data
-                    .iter()
-                    .filter_map(|(field_name, _)| {
+                let mut invalid_fields: Vec<Word> = data.keys().filter_map(|field_name| {
                         if !state
                             .entity_cache
                             .schema

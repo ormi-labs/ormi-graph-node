@@ -21,20 +21,17 @@ pub fn normalize_abi_json(abi_str: &str) -> Result<serde_json::Value> {
     }
 
     // Case 2: Object with "abi" field (Foundry/Hardhat format)
-    if let Some(abi) = value.get("abi") {
-        if abi.is_array() {
+    if let Some(abi) = value.get("abi")
+        && abi.is_array() {
             return Ok(abi.clone());
         }
-    }
 
     // Case 3: Object with "compilerOutput.abi" field (Truffle format)
-    if let Some(compiler_output) = value.get("compilerOutput") {
-        if let Some(abi) = compiler_output.get("abi") {
-            if abi.is_array() {
+    if let Some(compiler_output) = value.get("compilerOutput")
+        && let Some(abi) = compiler_output.get("abi")
+            && abi.is_array() {
                 return Ok(abi.clone());
             }
-        }
-    }
 
     Err(anyhow!(
         "Invalid ABI format: expected an array or an object with 'abi' field"

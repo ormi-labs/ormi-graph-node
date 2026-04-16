@@ -3,16 +3,16 @@ use std::{collections::HashMap, ops::RangeInclusive, sync::Arc};
 use alloy::primitives::BlockNumber;
 use anyhow::anyhow;
 use futures::{
-    stream::{self, BoxStream},
     StreamExt, TryStreamExt,
+    stream::{self, BoxStream},
 };
 use graph::{
     amp::{
+        Client,
         client::ResponseBatch,
         error::IsDeterministic,
         manifest::DataSource,
         stream_aggregator::{RecordBatchGroups, StreamAggregator},
-        Client,
     },
     cheap_clone::CheapClone,
     prelude::StopwatchMetrics,
@@ -152,10 +152,10 @@ where
             match result {
                 Ok(response) => {
                     if !start_block_checked {
-                        if let Some(((first_block, _), _)) = response.0.first_key_value() {
-                            if *first_block < start_block {
-                                return Err(Error::NonDeterministic(anyhow!("chain reorg")));
-                            }
+                        if let Some(((first_block, _), _)) = response.0.first_key_value()
+                            && *first_block < start_block
+                        {
+                            return Err(Error::NonDeterministic(anyhow!("chain reorg")));
                         }
 
                         start_block_checked = true;

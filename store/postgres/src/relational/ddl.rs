@@ -343,13 +343,13 @@ impl Table {
                 && [ColumnType::BigDecimal, ColumnType::BigInt, ColumnType::Int]
                     .contains(&col.column_type))
         };
-        let columns = self
+        
+        self
             .columns
             .iter()
             .filter(not_enum_list)
             .filter(not_immutable_pk)
-            .filter(not_numeric_list);
-        columns
+            .filter(not_numeric_list)
     }
 
     /// If `self` is an aggregation and has cumulative aggregates, create an

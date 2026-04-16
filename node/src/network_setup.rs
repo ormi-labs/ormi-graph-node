@@ -181,7 +181,7 @@ impl Networks {
             endpoint_metrics.cheap_clone(),
             chain_filter,
         );
-        let adapters: Vec<_> = eth.into_iter().chain(firehose.into_iter()).collect();
+        let adapters: Vec<_> = eth.into_iter().chain(firehose).collect();
 
         Ok(Networks::new(&logger, adapters, provider_checks))
     }
@@ -260,7 +260,9 @@ impl Networks {
             )
             .collect_vec();
 
-        let s = Self {
+        
+
+        Self {
             adapters: adapters2,
             rpc_provider_manager: ProviderManager::new(
                 logger.clone(),
@@ -272,9 +274,7 @@ impl Networks {
                 firehose_adapters,
                 ProviderCheckStrategy::RequireAll(provider_checks),
             ),
-        };
-
-        s
+        }
     }
 
     pub async fn block_ingestors(

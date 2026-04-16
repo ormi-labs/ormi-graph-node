@@ -464,9 +464,9 @@ impl SyncStore {
             // Handle on_sync actions. They only apply to copies (not
             // grafts) so we make sure that the source, if it exists, has
             // the same hash as `self.site`
-            if let Some(src) = self.writable.source_of_copy(&self.site).await? {
-                if let Some(src) = self.maybe_find_site(src).await? {
-                    if src.deployment == self.site.deployment {
+            if let Some(src) = self.writable.source_of_copy(&self.site).await?
+                && let Some(src) = self.maybe_find_site(src).await?
+                    && src.deployment == self.site.deployment {
                         let on_sync = self.writable.on_sync(&self.site).await?;
                         if on_sync.activate() {
                             let mut pconn = self.store.primary_conn().await?;
@@ -476,8 +476,6 @@ impl SyncStore {
                             self.unassign_subgraph(&src).await?;
                         }
                     }
-                }
-            }
 
             self.writable
                 .deployment_synced(&self.site.deployment, block_ptr.clone())
@@ -1820,15 +1818,14 @@ impl WritableStoreTrait for WritableStore {
             self.writer.start_batching();
         }
 
-        if let Some(block_ptr) = self.block_ptr.lock().unwrap().as_ref() {
-            if block_ptr_to.number <= block_ptr.number {
+        if let Some(block_ptr) = self.block_ptr.lock().unwrap().as_ref()
+            && block_ptr_to.number <= block_ptr.number {
                 return Err(internal_error!(
                     "transact_block_operations called for block {} but its head is already at {}",
                     block_ptr_to,
                     block_ptr
                 ));
             }
-        }
 
         let batch = Batch::new(
             block_ptr_to.clone(),

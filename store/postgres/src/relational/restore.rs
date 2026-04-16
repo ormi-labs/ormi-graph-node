@@ -428,8 +428,8 @@ pub async fn finalize(
     }
 
     // 2. Reset data_sources$ vid sequence if present
-    if let Some(ds_info) = metadata.tables.get(DATA_SOURCES_TABLE) {
-        if ds_info.max_vid >= 0 {
+    if let Some(ds_info) = metadata.tables.get(DATA_SOURCES_TABLE)
+        && ds_info.max_vid >= 0 {
             let qualified = format!("\"{nsp}\".\"{DATA_SOURCES_TABLE}\"");
             let query = format!(
                 "SELECT setval(pg_get_serial_sequence('{qualified}', 'vid'), {})",
@@ -439,7 +439,6 @@ pub async fn finalize(
                 StoreError::InternalError(format!("reset data_sources$ vid seq: {e}"))
             })?;
         }
-    }
 
     // 3. Update earliest_block_number (may differ from start_block after
     //    pruning) and set the head block pointer. Setting the head block

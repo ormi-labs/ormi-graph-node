@@ -7,10 +7,10 @@ use std::{
     task::{self, Poll},
 };
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use arrow::array::RecordBatch;
-use futures03::{stream::BoxStream, Stream, StreamExt, TryStreamExt};
-use slog::{debug, info, Logger};
+use futures03::{Stream, StreamExt, TryStreamExt, stream::BoxStream};
+use slog::{Logger, debug, info};
 
 use self::record_batch::Buffer;
 use crate::{
@@ -195,16 +195,15 @@ impl StreamAggregator {
             }
         }
 
-        if made_progress {
-            if let Some(completed_groups) =
+        if made_progress
+            && let Some(completed_groups) =
                 self.buffer.completed_groups().map_err(Error::Aggregation)?
-            {
-                debug!(self.logger, "Sending completed record batch groups";
-                    "num_completed_groups" => completed_groups.len()
-                );
+        {
+            debug!(self.logger, "Sending completed record batch groups";
+                "num_completed_groups" => completed_groups.len()
+            );
 
-                return Poll::Ready(Some(Ok(completed_groups)));
-            }
+            return Poll::Ready(Some(Ok(completed_groups)));
         }
 
         if self.is_finalized {

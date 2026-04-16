@@ -104,11 +104,10 @@ where
 
         if let Some(query) = request.uri().query() {
             let potential_version_requirement = query.split('&').find_map(|pair| {
-                if pair.starts_with("api-version=") {
-                    if let Some(version_requirement) = pair.split('=').nth(1) {
+                if pair.starts_with("api-version=")
+                    && let Some(version_requirement) = pair.split('=').nth(1) {
                         return Some(version_requirement);
                     }
-                }
                 None
             });
 
@@ -298,13 +297,11 @@ where
     }
 
     fn has_request_body<T>(&self, req: &Request<T>) -> bool {
-        if let Some(length) = req.headers().get(CONTENT_LENGTH) {
-            if let Ok(length) = length.to_str() {
-                if let Ok(length) = length.parse::<usize>() {
+        if let Some(length) = req.headers().get(CONTENT_LENGTH)
+            && let Ok(length) = length.to_str()
+                && let Ok(length) = length.parse::<usize>() {
                     return length > 0;
                 }
-            }
-        }
         false
     }
 

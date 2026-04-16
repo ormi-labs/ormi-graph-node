@@ -132,14 +132,13 @@ impl<C: Blockchain, T: RuntimeHostBuilder<C>> IndexingContext<C, T> {
             .map(|ds| (ds.source.clone(), ds.is_processed()));
         let host = self.instance.add_dynamic_data_source(logger, data_source)?;
 
-        if host.is_some() {
-            if let Some((source, is_processed)) = offchain_fields {
+        if host.is_some()
+            && let Some((source, is_processed)) = offchain_fields {
                 // monitor data source only if it has not yet been processed.
                 if !is_processed {
                     self.offchain_monitor.add_source(source);
                 }
             }
-        }
 
         Ok(host)
     }

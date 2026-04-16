@@ -2,16 +2,16 @@ use std::io;
 
 use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
-use clap_complete::{generate, Shell};
+use clap_complete::{Shell, generate};
 use git_testament::{git_testament, render_testament};
 use graph::log::logger;
 use lazy_static::lazy_static;
 use tokio_util::sync::CancellationToken;
 
 use gnd::commands::{
-    run_add, run_auth, run_build, run_clean, run_codegen, run_create, run_deploy, run_dev,
-    run_init, run_publish, run_remove, run_test, AddOpt, AuthOpt, BuildOpt, CleanOpt, CodegenOpt,
-    CreateOpt, DeployOpt, DevOpt, InitOpt, PublishOpt, RemoveOpt, TestOpt,
+    AddOpt, AuthOpt, BuildOpt, CleanOpt, CodegenOpt, CreateOpt, DeployOpt, DevOpt, InitOpt,
+    PublishOpt, RemoveOpt, TestOpt, run_add, run_auth, run_build, run_clean, run_codegen,
+    run_create, run_deploy, run_dev, run_init, run_publish, run_remove, run_test,
 };
 
 git_testament!(TESTAMENT);
@@ -155,8 +155,10 @@ fn generate_completions(completions_opt: CompletionsOpt) -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    std::env::set_var("ETHEREUM_REORG_THRESHOLD", "10");
-    std::env::set_var("GRAPH_NODE_DISABLE_DEPLOYMENT_HASH_VALIDATION", "true");
+    unsafe {
+        std::env::set_var("ETHEREUM_REORG_THRESHOLD", "10");
+        std::env::set_var("GRAPH_NODE_DISABLE_DEPLOYMENT_HASH_VALIDATION", "true");
+    }
     env_logger::init();
 
     let cli = Cli::parse();

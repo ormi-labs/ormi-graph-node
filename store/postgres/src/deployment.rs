@@ -478,14 +478,13 @@ pub async fn transact_block(
     // `where` clause of the `update` statement, but that caused Postgres to use bitmap scans instead
     // of a simple primary key lookup. So a separate query it is.
     let block_ptr = block_ptr(conn, site).await?;
-    if let Some(block_ptr_from) = block_ptr {
-        if block_ptr_from.number >= ptr.number {
+    if let Some(block_ptr_from) = block_ptr
+        && block_ptr_from.number >= ptr.number {
             return Err(StoreError::DuplicateBlockProcessing(
                 site.deployment.clone(),
                 ptr.number,
             ));
         }
-    }
 
     reset_reorg_count(conn, site).await?;
 
@@ -579,13 +578,13 @@ pub async fn get_subgraph_firehose_cursor(
 ) -> Result<Option<String>, StoreError> {
     use head as h;
 
-    let res = h::table
+    
+    h::table
         .filter(h::id.eq(site.id))
         .select(h::firehose_cursor)
         .first::<Option<String>>(conn)
         .await
-        .map_err(StoreError::from);
-    res
+        .map_err(StoreError::from)
 }
 
 pub async fn revert_block_ptr(

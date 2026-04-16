@@ -136,12 +136,11 @@ fn json_similarity(a: &serde_json::Value, b: &serde_json::Value) -> usize {
         (serde_json::Value::Object(a_obj), serde_json::Value::Object(b_obj)) => {
             let mut score = 0;
             for (k, v) in a_obj {
-                if let Some(bv) = b_obj.get(k) {
-                    if json_equal(v, bv) {
+                if let Some(bv) = b_obj.get(k)
+                    && json_equal(v, bv) {
                         // `id` match is a strong signal for entity identity.
                         score += if k == "id" { 100 } else { 1 };
                     }
-                }
             }
             score
         }

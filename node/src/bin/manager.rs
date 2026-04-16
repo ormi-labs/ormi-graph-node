@@ -8,12 +8,13 @@ use graph::components::network_provider::ChainName;
 use graph::endpoint::EndpointMetrics;
 use graph::env::ENV_VARS;
 use graph::log::logger_with_levels;
-use graph::prelude::{BlockNumber, MetricsRegistry, BLOCK_NUMBER_MAX};
+use graph::prelude::{BLOCK_NUMBER_MAX, BlockNumber, MetricsRegistry};
 use graph::{data::graphql::load_manager::LoadManager, prelude::chrono, prometheus::Registry};
 use graph::{
     prelude::{
-        anyhow::{self, anyhow, Context as AnyhowContextTrait},
-        info, tokio, Logger, NodeId,
+        Logger, NodeId,
+        anyhow::{self, Context as AnyhowContextTrait, anyhow},
+        info, tokio,
     },
     url::Url,
 };
@@ -24,11 +25,11 @@ use graph_node::manager::color::Terminal;
 use graph_node::manager::commands;
 use graph_node::network_setup::Networks;
 use graph_node::{
-    manager::deployment::DeploymentSearch, store_builder::StoreBuilder, MetricsContext,
+    MetricsContext, manager::deployment::DeploymentSearch, store_builder::StoreBuilder,
 };
 use graph_store_postgres::{
-    BlockStore, ChainStore, ConnectionPool, NotificationSender, PoolCoordinator, Shard, Store,
-    SubgraphStore, SubscriptionManager, PRIMARY_SHARD,
+    BlockStore, ChainStore, ConnectionPool, NotificationSender, PRIMARY_SHARD, PoolCoordinator,
+    Shard, Store, SubgraphStore, SubscriptionManager,
 };
 use itertools::Itertools;
 use lazy_static::lazy_static;
@@ -1133,7 +1134,9 @@ impl Context {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Disable load management for graphman commands
-    env::set_var("GRAPH_LOAD_THRESHOLD", "0");
+    unsafe {
+        env::set_var("GRAPH_LOAD_THRESHOLD", "0");
+    }
 
     let opt = Opt::parse();
 
@@ -1499,8 +1502,8 @@ async fn main() -> anyhow::Result<()> {
                 }
 
                 CheckBlocks { method, chain_name } => {
-                    use commands::check_blocks::{by_hash, by_number, by_range};
                     use CheckBlockMethod::*;
+                    use commands::check_blocks::{by_hash, by_number, by_range};
                     let logger = ctx.logger.clone();
                     let (chain_store, ethereum_adapter) =
                         ctx.chain_store_and_adapter(&chain_name).await?;
@@ -1563,7 +1566,9 @@ async fn main() -> anyhow::Result<()> {
                             }
 
                             if !remove_entire_cache && from.is_none() && to.is_none() {
-                                bail!("you must specify either --from and --to or --remove-entire-cache");
+                                bail!(
+                                    "you must specify either --from and --to or --remove-entire-cache"
+                                );
                             }
                             let (from, to) = if remove_entire_cache {
                                 (0, BLOCK_NUMBER_MAX)

@@ -2235,12 +2235,11 @@ impl ChainHeadPtrCache {
             return None;
         }
         let guard = self.entry.read();
-        if let Some((value, expires)) = guard.as_ref() {
-            if Instant::now() < *expires {
+        if let Some((value, expires)) = guard.as_ref()
+            && Instant::now() < *expires {
                 self.metrics.record_chain_head_ptr_cache_hit(&self.chain);
                 return Some(value.clone());
             }
-        }
         self.metrics.record_chain_head_ptr_cache_miss(&self.chain);
         None
     }
@@ -2273,8 +2272,8 @@ impl ChainHeadPtrCache {
 
         // Only update estimate if we have a previous value and block number advanced
         // (skip reorgs where new block number <= old)
-        if let Some(old_ptr) = old_value.as_ref() {
-            if new_value.number > old_ptr.number {
+        if let Some(old_ptr) = old_value.as_ref()
+            && new_value.number > old_ptr.number {
                 let mut last_change = self.last_change.write();
                 let delta_ms = now.duration_since(*last_change).as_millis() as u64;
                 *last_change = now;
@@ -2307,7 +2306,6 @@ impl ChainHeadPtrCache {
                         .set_chain_head_ptr_block_time(&self.chain, new_estimate);
                 }
             }
-        }
 
         // Compute TTL and store with expiry
         let ttl = self.current_ttl();

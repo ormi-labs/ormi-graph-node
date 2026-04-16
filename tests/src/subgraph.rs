@@ -155,11 +155,10 @@ impl Subgraph {
     pub async fn wait_ready(name: &str) -> anyhow::Result<Subgraph> {
         let start = Instant::now();
         while start.elapsed() <= CONFIG.timeout {
-            if let Some(subgraph) = Self::status(name).await? {
-                if subgraph.synced || !subgraph.healthy {
+            if let Some(subgraph) = Self::status(name).await?
+                && (subgraph.synced || !subgraph.healthy) {
                     return Ok(subgraph);
                 }
-            }
             sleep(Duration::from_millis(2000)).await;
         }
         Err(anyhow!("Subgraph {} never synced or failed", name))

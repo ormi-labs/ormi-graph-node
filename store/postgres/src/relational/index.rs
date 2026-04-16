@@ -796,14 +796,12 @@ impl IndexList {
                     // that are not to be postponed we want to create during initial creation of
                     // the copied subgraph
                     && postponed == ci.to_postpone()
-                {
-                    if let Ok(sql) = ci
+                    && let Ok(sql) = ci
                         .with_nsp(namespace.to_string())?
                         .to_sql(concurrent, if_not_exists)
                     {
                         arr.push((ci.name(), sql))
                     }
-                }
             }
         }
         Ok(arr)

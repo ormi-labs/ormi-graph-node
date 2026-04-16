@@ -118,7 +118,7 @@ impl EthereumNetworkAdapters {
 
         let provider = ProviderManager::new(
             Logger::root(Discard, o!()),
-            vec![(chain_id.clone(), adapters)].into_iter(),
+            vec![(chain_id.clone(), adapters)],
             ProviderCheckStrategy::MarkAsValid,
         );
 

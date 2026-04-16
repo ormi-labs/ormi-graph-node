@@ -93,11 +93,10 @@ pub fn interpret_eth_call_error(
         Ok(call::Retval::Null)
     }
 
-    if let RpcError::ErrorResp(rpc_error) = &err {
-        if is_rpc_revert_message(&rpc_error.message) {
+    if let RpcError::ErrorResp(rpc_error) = &err
+        && is_rpc_revert_message(&rpc_error.message) {
             return reverted(logger, &rpc_error.message);
         }
-    }
 
     if let RpcError::ErrorResp(rpc_error) = &err {
         let code = rpc_error.code;
@@ -106,13 +105,11 @@ pub fn interpret_eth_call_error(
             .as_ref()
             .and_then(|d| serde_json::from_str(d.get()).ok());
 
-        if code == PARITY_VM_EXECUTION_ERROR {
-            if let Some(data) = data {
-                if is_parity_revert(&data) {
+        if code == PARITY_VM_EXECUTION_ERROR
+            && let Some(data) = data
+                && is_parity_revert(&data) {
                     return reverted(logger, &parity_revert_reason(&data));
                 }
-            }
-        }
     }
 
     Err(ContractCallError::AlloyError(err))

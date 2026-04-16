@@ -55,13 +55,11 @@ fn normalize_abi_json(json_bytes: &[u8]) -> Result<Vec<u8>, anyhow::Error> {
 
         for (index, item) in array.iter_mut().enumerate() {
             if let Some(obj) = item.as_object_mut() {
-                if let Some(state_mutability) = obj.get_mut("stateMutability") {
-                    if let Some(s) = state_mutability.as_str() {
-                        if s == "undefined" {
+                if let Some(state_mutability) = obj.get_mut("stateMutability")
+                    && let Some(s) = state_mutability.as_str()
+                        && s == "undefined" {
                             *state_mutability = serde_json::Value::String("nonpayable".to_string());
                         }
-                    }
-                }
 
                 let item_type = obj.get("type").and_then(|t| t.as_str());
 
@@ -183,22 +181,20 @@ impl AbiJson {
 
         for item in abi_array {
             // Only process events
-            if item.get("type").and_then(|t| t.as_str()) == Some("event") {
-                if let Some(item_event_name) = item.get("name").and_then(|n| n.as_str()) {
-                    if item_event_name == event_name {
+            if item.get("type").and_then(|t| t.as_str()) == Some("event")
+                && let Some(item_event_name) = item.get("name").and_then(|n| n.as_str())
+                    && item_event_name == event_name {
                         // Found the event, now look for the parameter
                         if let Some(inputs) = item.get("inputs").and_then(|i| i.as_array()) {
                             for input in inputs {
                                 if let Some(input_param_name) =
                                     input.get("name").and_then(|n| n.as_str())
-                                {
-                                    if input_param_name == param_name {
+                                    && input_param_name == param_name {
                                         // Found the parameter, check if it's a struct
                                         if let Some(param_type) =
                                             input.get("type").and_then(|t| t.as_str())
-                                        {
-                                            if param_type == "tuple" {
-                                                if let Some(components) = input.get("components") {
+                                            && param_type == "tuple"
+                                                && let Some(components) = input.get("components") {
                                                     // Parse the ParamType from the JSON (simplified for now)
                                                     let param_type = abi::DynSolType::Tuple(vec![]);
                                                     return StructFieldInfo::from_components(
@@ -208,19 +204,14 @@ impl AbiJson {
                                                     )
                                                     .map(Some);
                                                 }
-                                            }
-                                        }
                                         // Parameter found but not a struct
                                         return Ok(None);
                                     }
-                                }
                             }
                         }
                         // Event found but parameter not found
                         return Ok(None);
                     }
-                }
-            }
         }
 
         // Event not found
@@ -249,22 +240,20 @@ impl AbiJson {
 
         for item in abi_array {
             // Only process events
-            if item.get("type").and_then(|t| t.as_str()) == Some("event") {
-                if let Some(item_event_name) = item.get("name").and_then(|n| n.as_str()) {
-                    if item_event_name == event_name {
+            if item.get("type").and_then(|t| t.as_str()) == Some("event")
+                && let Some(item_event_name) = item.get("name").and_then(|n| n.as_str())
+                    && item_event_name == event_name {
                         // Found the event, now look for the parameter
                         if let Some(inputs) = item.get("inputs").and_then(|i| i.as_array()) {
                             for input in inputs {
                                 if let Some(input_param_name) =
                                     input.get("name").and_then(|n| n.as_str())
-                                {
-                                    if input_param_name == param_name {
+                                    && input_param_name == param_name {
                                         // Found the parameter, check if it's a struct
                                         if let Some(param_type) =
                                             input.get("type").and_then(|t| t.as_str())
-                                        {
-                                            if param_type == "tuple" {
-                                                if let Some(components) = input.get("components") {
+                                            && param_type == "tuple"
+                                                && let Some(components) = input.get("components") {
                                                     // If no nested path, this is the end
                                                     if nested_path.is_empty() {
                                                         return Ok(Some(vec![]));
@@ -276,19 +265,14 @@ impl AbiJson {
                                                     )
                                                     .map(Some);
                                                 }
-                                            }
-                                        }
                                         // Parameter found but not a struct
                                         return Ok(None);
                                     }
-                                }
                             }
                         }
                         // Event found but parameter not found
                         return Ok(None);
                     }
-                }
-            }
         }
 
         // Event not found
@@ -361,8 +345,8 @@ impl AbiJson {
 
         // It's a field name - find it in the current level
         for (index, component) in components_array.iter().enumerate() {
-            if let Some(component_name) = component.get("name").and_then(|n| n.as_str()) {
-                if component_name == field_accessor {
+            if let Some(component_name) = component.get("name").and_then(|n| n.as_str())
+                && component_name == field_accessor {
                     // Found the field
                     if remaining_path.is_empty() {
                         // This is the final field, return its index
@@ -398,7 +382,6 @@ impl AbiJson {
                         }
                     }
                 }
-            }
         }
 
         // Field not found at this level
@@ -1187,11 +1170,10 @@ impl CallArg {
         spec_version: &semver::Version,
     ) -> Result<Self, anyhow::Error> {
         // Handle hex addresses first
-        if ADDR_RE.is_match(s) {
-            if let Ok(parsed_address) = Address::from_str(s) {
+        if ADDR_RE.is_match(s)
+            && let Ok(parsed_address) = Address::from_str(s) {
                 return Ok(CallArg::HexAddress(parsed_address));
             }
-        }
 
         // Context validation
         let starts_with_event = s.starts_with("event.");
@@ -2401,8 +2383,8 @@ mod tests {
             }
         ]"#;
 
-        let abi_json_helper = AbiJson::new(ABI_JSON.as_bytes()).unwrap();
+        
 
-        abi_json_helper
+        AbiJson::new(ABI_JSON.as_bytes()).unwrap()
     }
 }

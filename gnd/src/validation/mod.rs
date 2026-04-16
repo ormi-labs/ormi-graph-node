@@ -307,11 +307,10 @@ pub(crate) fn validate_manifest(
         .collect();
 
     // Only validate networks if there are data sources
-    if !manifest.data_sources.is_empty() {
-        if let Err(e) = manifest_validation::validate_single_network(&networks) {
+    if !manifest.data_sources.is_empty()
+        && let Err(e) = manifest_validation::validate_single_network(&networks) {
             errors.push(e.into());
         }
-    }
 
     // Collect API versions from data sources and templates
     let api_versions: Vec<Version> = manifest
@@ -492,27 +491,25 @@ fn validate_source_abi_references(manifest: &Manifest) -> Vec<ManifestValidation
     let mut errors = Vec::new();
 
     for ds in &manifest.data_sources {
-        if let Some(source_abi) = &ds.source_abi {
-            if !ds.abis.iter().any(|a| a.name == *source_abi) {
+        if let Some(source_abi) = &ds.source_abi
+            && !ds.abis.iter().any(|a| a.name == *source_abi) {
                 errors.push(ManifestValidationError::SourceAbiNotInMappingAbis {
                     data_source: ds.name.clone(),
                     source_abi: source_abi.clone(),
                     available: ds.abis.iter().map(|a| a.name.clone()).collect(),
                 });
             }
-        }
     }
 
     for t in &manifest.templates {
-        if let Some(source_abi) = &t.source_abi {
-            if !t.abis.iter().any(|a| a.name == *source_abi) {
+        if let Some(source_abi) = &t.source_abi
+            && !t.abis.iter().any(|a| a.name == *source_abi) {
                 errors.push(ManifestValidationError::SourceAbiNotInMappingAbis {
                     data_source: t.name.clone(),
                     source_abi: source_abi.clone(),
                     available: t.abis.iter().map(|a| a.name.clone()).collect(),
                 });
             }
-        }
     }
 
     errors
@@ -772,8 +769,8 @@ fn validate_handler_signatures(
     let mut errors = Vec::new();
 
     for ds in &manifest.data_sources {
-        if let Some(source_abi) = &ds.source_abi {
-            if let Some(abi_entry) = ds.abis.iter().find(|a| a.name == *source_abi) {
+        if let Some(source_abi) = &ds.source_abi
+            && let Some(abi_entry) = ds.abis.iter().find(|a| a.name == *source_abi) {
                 let abi_path = manifest_dir.join(&abi_entry.file);
                 if let Some(contract) = load_abi(&abi_path) {
                     errors.extend(validate_event_signatures(
@@ -790,12 +787,11 @@ fn validate_handler_signatures(
                     ));
                 }
             }
-        }
     }
 
     for t in &manifest.templates {
-        if let Some(source_abi) = &t.source_abi {
-            if let Some(abi_entry) = t.abis.iter().find(|a| a.name == *source_abi) {
+        if let Some(source_abi) = &t.source_abi
+            && let Some(abi_entry) = t.abis.iter().find(|a| a.name == *source_abi) {
                 let abi_path = manifest_dir.join(&abi_entry.file);
                 if let Some(contract) = load_abi(&abi_path) {
                     errors.extend(validate_event_signatures(
@@ -812,7 +808,6 @@ fn validate_handler_signatures(
                     ));
                 }
             }
-        }
     }
 
     errors

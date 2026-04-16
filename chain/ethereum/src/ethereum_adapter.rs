@@ -3,24 +3,24 @@ use futures03::{future::BoxFuture, stream::FuturesUnordered};
 use graph::abi;
 use graph::abi::DynSolValueExt;
 use graph::abi::FunctionExt;
-use graph::blockchain::client::ChainClient;
 use graph::blockchain::BlockHash;
 use graph::blockchain::ChainIdentifier;
 use graph::blockchain::ExtendedBlockPtr;
+use graph::blockchain::client::ChainClient;
 use graph::components::ethereum::*;
 use graph::components::transaction_receipt::LightTransactionReceipt;
 use graph::data::store::ethereum::call;
 use graph::data::store::scalar;
-use graph::data::subgraph::UnifiedMappingApiVersion;
 use graph::data::subgraph::API_VERSION_0_0_7;
+use graph::data::subgraph::UnifiedMappingApiVersion;
 use graph::data_source::common::ContractCall;
 use graph::derive::CheapClone;
-use graph::futures01::stream;
 use graph::futures01::Future;
 use graph::futures01::Stream;
+use graph::futures01::stream;
 use graph::futures03::future::try_join_all;
 use graph::futures03::{
-    self, compat::Future01CompatExt, FutureExt, StreamExt, TryFutureExt, TryStreamExt,
+    self, FutureExt, StreamExt, TryFutureExt, TryStreamExt, compat::Future01CompatExt,
 };
 use graph::prelude::{
     alloy::{
@@ -28,15 +28,15 @@ use graph::prelude::{
         network::TransactionResponse,
         primitives::{Address, B256},
         providers::{
+            Identity, Provider, RootProvider,
             ext::TraceApi,
             fillers::{
                 BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller,
             },
-            Identity, Provider, RootProvider,
         },
         rpc::types::{
-            trace::{filter::TraceFilter as AlloyTraceFilter, parity::LocalizedTransactionTrace},
             TransactionInput, TransactionRequest,
+            trace::{filter::TraceFilter as AlloyTraceFilter, parity::LocalizedTransactionTrace},
         },
         transports::{RpcError, TransportErrorKind},
     },
@@ -44,11 +44,12 @@ use graph::prelude::{
 };
 use graph::slog::o;
 use graph::{
-    blockchain::{block_stream::BlockWithTriggers, BlockPtr, IngestorError},
+    blockchain::{BlockPtr, IngestorError, block_stream::BlockWithTriggers},
     prelude::{
-        anyhow::{self, anyhow, bail, ensure, Context},
-        debug, error, hex, info, retry, trace, warn, BlockNumber, ChainStore, CheapClone,
-        DynTryFuture, Error, EthereumCallCache, Logger, TimeoutError,
+        BlockNumber, ChainStore, CheapClone, DynTryFuture, Error, EthereumCallCache, Logger,
+        TimeoutError,
+        anyhow::{self, Context, anyhow, bail, ensure},
+        debug, error, hex, info, retry, trace, warn,
     },
 };
 use itertools::Itertools;
@@ -61,6 +62,9 @@ use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tokio::time::timeout;
 
+use crate::Chain;
+use crate::NodeCapabilities;
+use crate::TriggerFilter;
 use crate::adapter::EthGetLogsFilter;
 use crate::adapter::EthereumRpcError;
 use crate::adapter::ProviderStatus;
@@ -68,17 +72,14 @@ use crate::call_helper::interpret_eth_call_error;
 use crate::chain::BlockFinality;
 use crate::chain::ChainSettings;
 use crate::trigger::{LogPosition, LogRef};
-use crate::Chain;
-use crate::NodeCapabilities;
-use crate::TriggerFilter;
 use crate::{
+    ENV_VARS,
     adapter::{
         ContractCallError, EthereumAdapter as EthereumAdapterTrait, EthereumBlockFilter,
         EthereumCallFilter, EthereumLogFilter, ProviderEthRpcMetrics, SubgraphEthRpcMetrics,
     },
     transport::Transport,
     trigger::{EthereumBlockTriggerType, EthereumTrigger},
-    ENV_VARS,
 };
 
 type AlloyProvider = FillProvider<
@@ -1014,7 +1015,8 @@ impl EthereumAdapter {
     ) -> Pin<
         Box<
             dyn std::future::Future<Output = Result<Vec<EthereumTrigger>, anyhow::Error>>
-                + std::marker::Send,
+                + std::marker::Send
+                + '_,
         >,
     > {
         // Create a HashMap of block numbers to Vec<EthereumBlockTriggerType>
@@ -1053,15 +1055,13 @@ impl EthereumAdapter {
         let block_futures = blocks_matching_polling_filter.map(move |ptrs| {
             ptrs.into_iter()
                 .flat_map(|ptr| {
-                    let triggers = matching_blocks
+                    matching_blocks
                         .get(&ptr.number)
                         // Safe to unwrap since we are iterating over ptrs which was created from
                         // the keys of matching_blocks
                         .unwrap()
                         .iter()
-                        .map(move |trigger| EthereumTrigger::Block(ptr.clone(), trigger.clone()));
-
-                    triggers
+                        .map(move |trigger| EthereumTrigger::Block(ptr.clone(), trigger.clone()))
                 })
                 .collect::<Vec<_>>()
         });
@@ -1126,7 +1126,7 @@ impl EthereumAdapter {
         logger: Logger,
         from: BlockNumber,
         to: BlockNumber,
-    ) -> Box<dyn Future<Item = Vec<BlockPtr>, Error = Error> + Send> {
+    ) -> Box<dyn Future<Item = Vec<BlockPtr>, Error = Error> + Send + '_> {
         // Currently we can't go to the DB for this because there might be duplicate entries for
         // the same block number.
         debug!(&logger, "Requesting hashes for blocks [{}, {}]", from, to);
@@ -1140,7 +1140,7 @@ impl EthereumAdapter {
         &self,
         logger: Logger,
         blocks: Vec<BlockNumber>,
-    ) -> Box<dyn Future<Item = Vec<BlockPtr>, Error = Error> + Send> {
+    ) -> Box<dyn Future<Item = Vec<BlockPtr>, Error = Error> + Send + '_> {
         // Currently we can't go to the DB for this because there might be duplicate entries for
         // the same block number.
         debug!(&logger, "Requesting hashes for blocks {:?}", blocks);
@@ -1587,15 +1587,26 @@ impl EthereumAdapterTrait for EthereumAdapter {
 
         fn log_call_error(logger: &ProviderLogger, e: &ContractCallError, call: &ContractCall) {
             match e {
-                ContractCallError::AlloyError(e) => error!(logger,
+                ContractCallError::AlloyError(e) => error!(
+                    logger,
                     "Ethereum node returned an error when calling function \"{}\" of contract \"{}\": {}",
-                    call.function.name, call.contract_name, e),
-                ContractCallError::Timeout => error!(logger,
+                    call.function.name,
+                    call.contract_name,
+                    e
+                ),
+                ContractCallError::Timeout => error!(
+                    logger,
                     "Ethereum node did not respond when calling function \"{}\" of contract \"{}\"",
-                    call.function.name, call.contract_name),
-                _ => error!(logger,
+                    call.function.name,
+                    call.contract_name
+                ),
+                _ => error!(
+                    logger,
                     "Failed to call function \"{}\" of contract \"{}\": {}",
-                    call.function.name, call.contract_name, e),
+                    call.function.name,
+                    call.contract_name,
+                    e
+                ),
             }
         }
 
@@ -2125,7 +2136,7 @@ async fn filter_call_triggers_from_unsuccessful_transactions(
     // And obtain all Transaction values for the calls in this block.
     let transactions: Vec<&AnyTransaction> = {
         match &block.block {
-            BlockFinality::Final(ref block) => block
+            BlockFinality::Final(block) => block
                 .transactions()
                 .ok_or_else(|| anyhow!("Block transactions not available"))?
                 .iter()
@@ -2696,15 +2707,15 @@ mod tests {
     use crate::trigger::{EthereumBlockTriggerType, EthereumTrigger};
 
     use super::{
-        check_block_receipt_support, parse_block_triggers, EthereumBlock, EthereumBlockFilter,
-        EthereumBlockWithCalls,
+        EthereumBlock, EthereumBlockFilter, EthereumBlockWithCalls, check_block_receipt_support,
+        parse_block_triggers,
     };
     use graph::blockchain::BlockPtr;
     use graph::components::ethereum::AnyNetworkBare;
-    use graph::prelude::alloy::primitives::{Address, Bytes, B256};
-    use graph::prelude::alloy::providers::mock::Asserter;
+    use graph::prelude::alloy::primitives::{Address, B256, Bytes};
     use graph::prelude::alloy::providers::ProviderBuilder;
-    use graph::prelude::{create_minimal_block_for_test, EthereumCall, LightEthereumBlock};
+    use graph::prelude::alloy::providers::mock::Asserter;
+    use graph::prelude::{EthereumCall, LightEthereumBlock, create_minimal_block_for_test};
     use jsonrpc_core::serde_json::{self, Value};
     use std::collections::HashSet;
     use std::iter::FromIterator;

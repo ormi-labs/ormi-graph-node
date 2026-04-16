@@ -415,8 +415,8 @@ impl RowGroup {
     pub fn last_op(&self, key: &EntityKey, at: BlockNumber) -> Option<EntityOp<'_>> {
         // If we have `key` in `last_mod`, use that and return the
         // corresponding op. If not, fall through to a more expensive search
-        if let Some(&idx) = self.last_mod.get(&key.entity_id) {
-            if let Some(op) = self.rows.get(idx).and_then(|emod| {
+        if let Some(&idx) = self.last_mod.get(&key.entity_id)
+            && let Some(op) = self.rows.get(idx).and_then(|emod| {
                 if emod.block() <= at {
                     Some(emod.as_entity_op(at))
                 } else {
@@ -425,7 +425,6 @@ impl RowGroup {
             }) {
                 return Some(op);
             }
-        }
         // We are looking for the change at a block `at` that is before the
         // change we remember in `last_mod`, and therefore have to scan
         // through all changes

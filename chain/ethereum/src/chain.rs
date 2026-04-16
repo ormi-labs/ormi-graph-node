@@ -396,11 +396,10 @@ where
     for _ in 0..offset {
         match parent_getter(current_ptr.clone()).await? {
             Some(parent) => {
-                if let Some(root_hash) = &root {
-                    if parent.hash == *root_hash {
+                if let Some(root_hash) = &root
+                    && parent.hash == *root_hash {
                         break;
                     }
-                }
                 current_ptr = parent;
             }
             None => return Ok(None),
@@ -814,9 +813,7 @@ async fn fetch_unique_blocks_from_cache(
         .unwrap_or_default();
 
     // Collect blocks and filter out ones with multiple entries
-    let blocks: Vec<Arc<ExtendedBlockPtr>> = blocks_map
-        .into_iter()
-        .filter_map(|(_, values)| {
+    let blocks: Vec<Arc<ExtendedBlockPtr>> = blocks_map.into_values().filter_map(|values| {
             if values.len() == 1 {
                 Some(Arc::new(values[0].clone()))
             } else {

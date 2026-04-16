@@ -1,11 +1,11 @@
 use crate::{
     derive::CacheWeight,
-    prelude::{lazy_static, q, r, s, CacheWeight, QueryExecutionError},
+    prelude::{CacheWeight, QueryExecutionError, lazy_static, q, r, s},
     runtime::gas::{Gas, GasSizeOf},
-    schema::{input::VID_FIELD, EntityKey},
+    schema::{EntityKey, input::VID_FIELD},
     util::intern::{self, AtomPool, Error as InternError, NullValue, Object},
 };
-use anyhow::{anyhow, Error};
+use anyhow::{Error, anyhow};
 use itertools::Itertools;
 use serde::de;
 use serde::{Deserialize, Serialize};
@@ -228,8 +228,8 @@ impl stable_hash_legacy::StableHash for Value {
         mut sequence_number: H::Seq,
         state: &mut H,
     ) {
-        use stable_hash_legacy::prelude::*;
         use Value::*;
+        use stable_hash_legacy::prelude::*;
 
         // This is the default, so write nothing.
         if self == &Null {
@@ -525,10 +525,10 @@ impl fmt::Display for Value {
                 Value::BigDecimal(d) => d.to_string(),
                 Value::Bool(b) => b.to_string(),
                 Value::Null => "null".to_string(),
-                Value::List(ref values) =>
+                Value::List(values) =>
                     format!("[{}]", values.iter().map(ToString::to_string).join(", ")),
-                Value::Bytes(ref bytes) => bytes.to_string(),
-                Value::BigInt(ref number) => number.to_string(),
+                Value::Bytes(bytes) => bytes.to_string(),
+                Value::BigInt(number) => number.to_string(),
             }
         )
     }
@@ -833,7 +833,9 @@ pub enum EntityValidationErrorInner {
     #[error("Entity {entity}[{id}]: unknown entity type `{entity}`")]
     UnknownEntityType { entity: String, id: String },
 
-    #[error("Entity {entity}[{entity_id}]: field `{field}` is of type {expected_type}, but the value `{value}` contains a {actual_type} at index {index}")]
+    #[error(
+        "Entity {entity}[{entity_id}]: field `{field}` is of type {expected_type}, but the value `{value}` contains a {actual_type} at index {index}"
+    )]
     MismatchedElementTypeInList {
         entity: String,
         entity_id: String,
@@ -844,7 +846,9 @@ pub enum EntityValidationErrorInner {
         index: usize,
     },
 
-    #[error("Entity {entity}[{entity_id}]: the value `{value}` for field `{field}` must have type {expected_type} but has type {actual_type}")]
+    #[error(
+        "Entity {entity}[{entity_id}]: the value `{value}` for field `{field}` must have type {expected_type} but has type {actual_type}"
+    )]
     InvalidFieldType {
         entity: String,
         entity_id: String,
@@ -968,7 +972,7 @@ impl Entity {
 
     pub fn sorted_ref(&self) -> Vec<(&str, &Value)> {
         let mut v: Vec<_> = self.0.iter().filter(|(k, _)| !k.eq(&VID_FIELD)).collect();
-        v.sort_by(|(k1, _), (k2, _)| k1.cmp(k2));
+        v.sort_by_key(|(k1, _)| *k1);
         v
     }
 
@@ -1208,7 +1212,9 @@ fn value_bytes() {
     assert_eq!(
         from_query,
         Value::Bytes(scalar::Bytes::from(
-            &[143, 73, 76, 102, 175, 193, 211, 248, 172, 27, 69, 223, 33, 240, 42, 70][..]
+            &[
+                143, 73, 76, 102, 175, 193, 211, 248, 172, 27, 69, 223, 33, 240, 42, 70
+            ][..]
         ))
     );
     assert_eq!(r::Value::from(from_query), graphql_value);
