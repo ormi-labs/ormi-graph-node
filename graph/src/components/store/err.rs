@@ -2,7 +2,7 @@ use super::{BlockNumber, DeploymentSchemaVersion};
 use crate::prelude::DeploymentHash;
 use crate::prelude::QueryExecutionError;
 
-use anyhow::{anyhow, Error};
+use anyhow::{Error, anyhow};
 use diesel::result::Error as DieselError;
 use thiserror::Error;
 use tokio::task::JoinError;

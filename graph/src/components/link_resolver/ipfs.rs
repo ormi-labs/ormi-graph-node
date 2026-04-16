@@ -12,11 +12,11 @@ use serde_json::Value;
 
 use crate::derive::CheapClone;
 use crate::env::EnvVars;
-use crate::futures01::stream::poll_fn;
-use crate::futures01::stream::Stream;
-use crate::futures01::try_ready;
 use crate::futures01::Async;
 use crate::futures01::Poll;
+use crate::futures01::stream::Stream;
+use crate::futures01::stream::poll_fn;
+use crate::futures01::try_ready;
 use crate::ipfs::{ContentPath, IpfsClient, IpfsContext, RetryPolicy};
 use crate::prelude::*;
 

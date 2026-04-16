@@ -1,9 +1,9 @@
-use crate::{chain::BlockFinality, ENV_VARS};
+use crate::{ENV_VARS, chain::BlockFinality};
 use crate::{EthereumAdapter, EthereumAdapterTrait as _};
 use async_trait::async_trait;
 use futures::future::select_ok;
-use graph::blockchain::client::ChainClient;
 use graph::blockchain::BlockchainKind;
+use graph::blockchain::client::ChainClient;
 use graph::components::network_provider::ChainName;
 use graph::prelude::alloy::primitives::B256;
 use graph::slog::o;
@@ -12,8 +12,8 @@ use graph::{
     blockchain::{BlockHash, BlockIngestor, BlockPtr, IngestorError},
     cheap_clone::CheapClone,
     prelude::{
-        debug, error, info, tokio, trace, warn, ChainStore, Error, EthereumBlockWithCalls, LogCode,
-        Logger,
+        ChainStore, Error, EthereumBlockWithCalls, LogCode, Logger, debug, error, info, tokio,
+        trace, warn,
     },
 };
 use std::{sync::Arc, time::Duration};
@@ -282,9 +282,10 @@ async fn on_poll_failure<A: crate::EthereumAdapterTrait>(
     // failure was not caused by provider unavailability — switching cannot help.
     let current = providers.iter().find(|p| p.provider() == current_name);
     if let Some(current) = current
-        && current.is_reachable().await {
-            return;
-        }
+        && current.is_reachable().await
+    {
+        return;
+    }
 
     // Probe all alternatives in parallel; switch to the first that responds.
     let futs = providers
@@ -377,7 +378,7 @@ mod tests {
     use graph::components::ethereum::LightEthereumBlock;
     use graph::data::store::ethereum::call;
     use graph::data_source::common::ContractCall;
-    use graph::prelude::alloy::primitives::{Address, Bytes, B256, U256};
+    use graph::prelude::alloy::primitives::{Address, B256, Bytes, U256};
     use graph::prelude::{BlockNumber, Error, EthereumCallCache, Logger};
     use graph::slog::Discard;
     use std::collections::HashSet;

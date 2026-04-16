@@ -42,12 +42,12 @@ mod runner;
 mod schema;
 mod trigger;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use clap::Parser;
 use console::style;
 use std::path::PathBuf;
 
-use crate::output::{step, Step};
+use crate::output::{Step, step};
 
 const DEFAULT_TEST_DIR: &str = "tests";
 

@@ -8,7 +8,7 @@ use graph::{
     },
     prelude::{
         alloy::primitives::B256,
-        anyhow::{self, anyhow, Context},
+        anyhow::{self, Context, anyhow},
     },
     slog::Logger,
 };
@@ -165,7 +165,7 @@ mod steps {
             serde_json::{self, Value},
         },
     };
-    use json_structural_diff::{colorize as diff_to_string, JsonDiff};
+    use json_structural_diff::{JsonDiff, colorize as diff_to_string};
 
     /// Queries the [`ChainStore`] about the block hash for the given block number.
     ///

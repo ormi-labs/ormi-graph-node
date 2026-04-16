@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use futures03::prelude::Stream;
 use reqwest::Client;
 use serde_json::Value;
-use slog::{debug, Logger};
+use slog::{Logger, debug};
 use thiserror::Error;
 
 use crate::data_source::offchain::Base64;
@@ -106,7 +106,7 @@ impl ArweaveResolver for ArweaveClient {
         match (&limit, rsp.content_length()) {
             (_, None) => return Err(ArweaveClientError::UnableToCheckFileSize),
             (FileSizeLimit::MaxBytes(max), Some(cl)) if cl > *max => {
-                return Err(ArweaveClientError::FileTooLarge { got: cl, max: *max })
+                return Err(ArweaveClientError::FileTooLarge { got: cl, max: *max });
             }
             _ => {}
         };

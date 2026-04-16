@@ -9,13 +9,13 @@ use graph::futures01::{Future as _, Stream as _};
 use graph::futures03::channel::oneshot::Sender;
 use graph::parking_lot::RwLock;
 use graph::prelude::*;
-use graph::runtime::gas::Gas;
 use graph::runtime::IndexForAscTypeId;
+use graph::runtime::gas::Gas;
 use parity_wasm::elements::ExportEntry;
 use std::collections::{BTreeMap, HashMap};
 use std::panic::AssertUnwindSafe;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{panic, thread};
 
 /// Spawn a wasm module in its own thread.

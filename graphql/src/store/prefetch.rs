@@ -9,7 +9,7 @@ use graph::data::store::IdList;
 use graph::data::store::IdType;
 use graph::data::store::QueryObject;
 use graph::data::value::{Object, Word};
-use graph::prelude::{r, CacheWeight, CheapClone};
+use graph::prelude::{CacheWeight, CheapClone, r};
 use graph::schema::AggregationInterval;
 use graph::schema::Field;
 use graph::slog::warn;
@@ -20,15 +20,16 @@ use std::time::Instant;
 
 use graph::data::graphql::TypeExt;
 use graph::prelude::{
-    AttributeNames, ChildMultiplicity, EntityCollection, EntityFilter, EntityLink, EntityOrder,
-    EntityWindow, ParentLink, QueryExecutionError, Value as StoreValue, WindowAttribute, ENV_VARS,
+    AttributeNames, ChildMultiplicity, ENV_VARS, EntityCollection, EntityFilter, EntityLink,
+    EntityOrder, EntityWindow, ParentLink, QueryExecutionError, Value as StoreValue,
+    WindowAttribute,
 };
 use graph::schema::{EntityType, InputSchema, ObjectOrInterface};
 
 use crate::execution::ast as a;
 use crate::metrics::GraphQLMetrics;
-use crate::store::query::build_query;
 use crate::store::StoreResolver;
+use crate::store::query::build_query;
 
 pub const ARG_ID: &str = "id";
 
@@ -598,10 +599,11 @@ impl<'a> Loader<'a> {
         // Process all field groups in order
         for (object_type, fields) in selection_set.interior_fields() {
             if let Some(deadline) = self.ctx.deadline
-                && deadline < Instant::now() {
-                    errors.push(QueryExecutionError::Timeout);
-                    break;
-                }
+                && deadline < Instant::now()
+            {
+                errors.push(QueryExecutionError::Timeout);
+                break;
+            }
 
             // Filter out parents that do not match the type condition.
             let mut parents: Vec<&mut Node> = if at_root {

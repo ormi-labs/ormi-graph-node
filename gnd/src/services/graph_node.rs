@@ -3,7 +3,7 @@
 //! This client is used by the `create`, `remove`, and `deploy` commands to
 //! interact with a Graph Node instance.
 
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, USER_AGENT};
+use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue, USER_AGENT};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use url::Url;
@@ -48,7 +48,7 @@ impl GraphNodeClient {
             other => {
                 return Err(GraphNodeError::UnsupportedProtocol {
                     protocol: other.to_string(),
-                })
+                });
             }
         }
 

@@ -5,29 +5,28 @@ use diesel::{
     sql_types::{BigInt, Integer},
 };
 use diesel_async::{
-    scoped_futures::{ScopedBoxFuture, ScopedFutureExt},
     AsyncConnection, RunQueryDsl, SimpleAsyncConnection,
+    scoped_futures::{ScopedBoxFuture, ScopedFutureExt},
 };
 use graph::{
     components::store::{PrunePhase, PruneReporter, PruneRequest, PruningStrategy, VersionStats},
-    prelude::{BlockNumber, CancelableError, CheapClone, StoreError, BLOCK_NUMBER_MAX},
+    prelude::{BLOCK_NUMBER_MAX, BlockNumber, CancelableError, CheapClone, StoreError},
     schema::InputSchema,
-    slog::{warn, Logger},
+    slog::{Logger, warn},
 };
 use itertools::Itertools;
 
 use crate::{
-    catalog,
+    AsyncPgConnection, catalog,
     copy::BATCH_STATEMENT_TIMEOUT,
     deployment,
     relational::{Table, VID_COLUMN},
     vid_batcher::{VidBatcher, VidRange},
-    AsyncPgConnection,
 };
 
 use super::{
-    index::{load_indexes_from_table, CreateIndex, IndexList},
     Catalog, Layout, Namespace,
+    index::{CreateIndex, IndexList, load_indexes_from_table},
 };
 
 pub use status::{Phase, PruneState, PruneTableState, Viewer};
@@ -580,16 +579,17 @@ mod status {
 
     use chrono::{DateTime, Utc};
     use diesel::{
+        AsChangeset, ExpressionMethods as _, OptionalExtension, QueryDsl as _,
         deserialize::FromSql,
         dsl::insert_into,
         pg::{Pg, PgValue},
         query_builder::QueryFragment,
         serialize::{Output, ToSql},
         sql_types::Text,
-        table, update, AsChangeset, ExpressionMethods as _, OptionalExtension, QueryDsl as _,
+        table, update,
     };
     use diesel_async::RunQueryDsl as _;
-    use diesel_async::{scoped_futures::ScopedFutureExt, AsyncConnection};
+    use diesel_async::{AsyncConnection, scoped_futures::ScopedFutureExt};
     use graph::{
         components::store::{PruneRequest, PruningStrategy, StoreResult},
         env::ENV_VARS,
@@ -597,9 +597,9 @@ mod status {
     };
 
     use crate::{
+        AsyncPgConnection, ConnectionPool,
         relational::{Layout, Table},
         vid_batcher::{VidBatcher, VidRange},
-        AsyncPgConnection, ConnectionPool,
     };
 
     table! {

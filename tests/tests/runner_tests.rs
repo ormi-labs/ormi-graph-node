@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::str::FromStr;
-use std::sync::atomic::{self, AtomicBool};
 use std::sync::Arc;
+use std::sync::atomic::{self, AtomicBool};
 use std::time::Duration;
 
 use assert_json_diff::assert_json_eq;
@@ -17,7 +17,7 @@ use graph::env::{EnvVars, TEST_WITH_NO_REORG};
 use graph::ipfs::test_utils::add_files_to_local_ipfs_node_for_testing;
 use graph::object;
 use graph::prelude::alloy::primitives::{Address, B256, U256};
-use graph::prelude::{hex, CheapClone, SubgraphName, SubgraphStore};
+use graph::prelude::{CheapClone, SubgraphName, SubgraphStore, hex};
 use graph_tests::fixture::ethereum::{
     chain, empty_block, generate_empty_blocks_for_range, genesis, push_test_command, push_test_log,
     push_test_polling_trigger,
@@ -25,18 +25,18 @@ use graph_tests::fixture::ethereum::{
 
 use graph::blockchain::Trigger;
 use graph::prelude::alloy::rpc::types::BlockTransactions;
-use graph::prelude::{create_dummy_transaction, create_minimal_block_for_test, LightEthereumBlock};
+use graph::prelude::{LightEthereumBlock, create_dummy_transaction, create_minimal_block_for_test};
 use graph_chain_ethereum::{
     chain::BlockFinality,
     trigger::{EthereumBlockTriggerType, EthereumTrigger},
 };
 
 use graph_tests::fixture::{
-    self, test_ptr, test_ptr_reorged, MockAdapterSelector, NoopAdapterSelector,
-    StaticArweaveResolver, TestChainTrait, TestContext, TestInfo,
+    self, MockAdapterSelector, NoopAdapterSelector, StaticArweaveResolver, TestChainTrait,
+    TestContext, TestInfo, test_ptr, test_ptr_reorged,
 };
-use graph_tests::recipe::{build_subgraph_with_pnpm_cmd_and_arg, RunnerTestRecipe};
-use slog::{o, Discard, Logger};
+use graph_tests::recipe::{RunnerTestRecipe, build_subgraph_with_pnpm_cmd_and_arg};
+use slog::{Discard, Logger, o};
 
 fn assert_eq_ignore_backtrace(err: &SubgraphError, expected: &SubgraphError) {
     let equal = {

@@ -4,12 +4,12 @@
 //! This is the legacy path for projects that haven't migrated to the new
 //! JSON-based test format yet.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::output::{step, Step};
+use crate::output::{Step, step};
 
 use super::TestOpt;
 

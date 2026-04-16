@@ -9,9 +9,9 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use graph::abi::{Event, Function, JsonAbi};
+use graph::data::subgraph::SubgraphManifestValidationError;
 use graph::data::subgraph::api_version::{LATEST_VERSION, MIN_SPEC_VERSION};
 use graph::data::subgraph::manifest_validation;
-use graph::data::subgraph::SubgraphManifestValidationError;
 use graph::prelude::DeploymentHash;
 use graph::schema::{InputSchema, SchemaValidationError};
 use semver::Version;
@@ -308,9 +308,10 @@ pub(crate) fn validate_manifest(
 
     // Only validate networks if there are data sources
     if !manifest.data_sources.is_empty()
-        && let Err(e) = manifest_validation::validate_single_network(&networks) {
-            errors.push(e.into());
-        }
+        && let Err(e) = manifest_validation::validate_single_network(&networks)
+    {
+        errors.push(e.into());
+    }
 
     // Collect API versions from data sources and templates
     let api_versions: Vec<Version> = manifest
@@ -492,24 +493,26 @@ fn validate_source_abi_references(manifest: &Manifest) -> Vec<ManifestValidation
 
     for ds in &manifest.data_sources {
         if let Some(source_abi) = &ds.source_abi
-            && !ds.abis.iter().any(|a| a.name == *source_abi) {
-                errors.push(ManifestValidationError::SourceAbiNotInMappingAbis {
-                    data_source: ds.name.clone(),
-                    source_abi: source_abi.clone(),
-                    available: ds.abis.iter().map(|a| a.name.clone()).collect(),
-                });
-            }
+            && !ds.abis.iter().any(|a| a.name == *source_abi)
+        {
+            errors.push(ManifestValidationError::SourceAbiNotInMappingAbis {
+                data_source: ds.name.clone(),
+                source_abi: source_abi.clone(),
+                available: ds.abis.iter().map(|a| a.name.clone()).collect(),
+            });
+        }
     }
 
     for t in &manifest.templates {
         if let Some(source_abi) = &t.source_abi
-            && !t.abis.iter().any(|a| a.name == *source_abi) {
-                errors.push(ManifestValidationError::SourceAbiNotInMappingAbis {
-                    data_source: t.name.clone(),
-                    source_abi: source_abi.clone(),
-                    available: t.abis.iter().map(|a| a.name.clone()).collect(),
-                });
-            }
+            && !t.abis.iter().any(|a| a.name == *source_abi)
+        {
+            errors.push(ManifestValidationError::SourceAbiNotInMappingAbis {
+                data_source: t.name.clone(),
+                source_abi: source_abi.clone(),
+                available: t.abis.iter().map(|a| a.name.clone()).collect(),
+            });
+        }
     }
 
     errors
@@ -770,44 +773,46 @@ fn validate_handler_signatures(
 
     for ds in &manifest.data_sources {
         if let Some(source_abi) = &ds.source_abi
-            && let Some(abi_entry) = ds.abis.iter().find(|a| a.name == *source_abi) {
-                let abi_path = manifest_dir.join(&abi_entry.file);
-                if let Some(contract) = load_abi(&abi_path) {
-                    errors.extend(validate_event_signatures(
-                        &ds.name,
-                        source_abi,
-                        &ds.event_handlers,
-                        &contract,
-                    ));
-                    errors.extend(validate_function_signatures(
-                        &ds.name,
-                        source_abi,
-                        &ds.call_handlers,
-                        &contract,
-                    ));
-                }
+            && let Some(abi_entry) = ds.abis.iter().find(|a| a.name == *source_abi)
+        {
+            let abi_path = manifest_dir.join(&abi_entry.file);
+            if let Some(contract) = load_abi(&abi_path) {
+                errors.extend(validate_event_signatures(
+                    &ds.name,
+                    source_abi,
+                    &ds.event_handlers,
+                    &contract,
+                ));
+                errors.extend(validate_function_signatures(
+                    &ds.name,
+                    source_abi,
+                    &ds.call_handlers,
+                    &contract,
+                ));
             }
+        }
     }
 
     for t in &manifest.templates {
         if let Some(source_abi) = &t.source_abi
-            && let Some(abi_entry) = t.abis.iter().find(|a| a.name == *source_abi) {
-                let abi_path = manifest_dir.join(&abi_entry.file);
-                if let Some(contract) = load_abi(&abi_path) {
-                    errors.extend(validate_event_signatures(
-                        &t.name,
-                        source_abi,
-                        &t.event_handlers,
-                        &contract,
-                    ));
-                    errors.extend(validate_function_signatures(
-                        &t.name,
-                        source_abi,
-                        &t.call_handlers,
-                        &contract,
-                    ));
-                }
+            && let Some(abi_entry) = t.abis.iter().find(|a| a.name == *source_abi)
+        {
+            let abi_path = manifest_dir.join(&abi_entry.file);
+            if let Some(contract) = load_abi(&abi_path) {
+                errors.extend(validate_event_signatures(
+                    &t.name,
+                    source_abi,
+                    &t.event_handlers,
+                    &contract,
+                ));
+                errors.extend(validate_function_signatures(
+                    &t.name,
+                    source_abi,
+                    &t.call_handlers,
+                    &contract,
+                ));
             }
+        }
     }
 
     errors

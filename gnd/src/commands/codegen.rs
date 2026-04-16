@@ -278,12 +278,13 @@ fn add_default_event_param_names(params: &mut serde_json::Value) {
     if let Some(params_arr) = params.as_array_mut() {
         for (index, param) in params_arr.iter_mut().enumerate() {
             if let Some(obj) = param.as_object_mut()
-                && !obj.contains_key("name") {
-                    obj.insert(
-                        "name".to_string(),
-                        serde_json::Value::String(format!("param{}", index)),
-                    );
-                }
+                && !obj.contains_key("name")
+            {
+                obj.insert(
+                    "name".to_string(),
+                    serde_json::Value::String(format!("param{}", index)),
+                );
+            }
         }
     }
 }

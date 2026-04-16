@@ -95,7 +95,7 @@ mod tests {
     use graph::prelude::DeploymentHash;
     use graph::schema::InputSchema;
 
-    use crate::layout_for_tests::{make_dummy_site, Catalog, Layout, Namespace};
+    use crate::layout_for_tests::{Catalog, Layout, Namespace, make_dummy_site};
 
     use super::*;
 
@@ -188,10 +188,12 @@ mod tests {
                 .data_type(),
             &DataType::Int32
         );
-        assert!(!schema
-            .field_with_name("block_range_start")
-            .unwrap()
-            .is_nullable());
+        assert!(
+            !schema
+                .field_with_name("block_range_start")
+                .unwrap()
+                .is_nullable()
+        );
 
         assert_eq!(
             schema
@@ -200,10 +202,12 @@ mod tests {
                 .data_type(),
             &DataType::Int32
         );
-        assert!(schema
-            .field_with_name("block_range_end")
-            .unwrap()
-            .is_nullable());
+        assert!(
+            schema
+                .field_with_name("block_range_end")
+                .unwrap()
+                .is_nullable()
+        );
 
         assert_eq!(
             schema
@@ -333,22 +337,30 @@ mod tests {
 
         // Check nullability
         assert!(!schema.field_with_name("vid").unwrap().is_nullable());
-        assert!(!schema
-            .field_with_name("block_range_start")
-            .unwrap()
-            .is_nullable());
-        assert!(schema
-            .field_with_name("block_range_end")
-            .unwrap()
-            .is_nullable());
-        assert!(!schema
-            .field_with_name("causality_region")
-            .unwrap()
-            .is_nullable());
-        assert!(!schema
-            .field_with_name("manifest_idx")
-            .unwrap()
-            .is_nullable());
+        assert!(
+            !schema
+                .field_with_name("block_range_start")
+                .unwrap()
+                .is_nullable()
+        );
+        assert!(
+            schema
+                .field_with_name("block_range_end")
+                .unwrap()
+                .is_nullable()
+        );
+        assert!(
+            !schema
+                .field_with_name("causality_region")
+                .unwrap()
+                .is_nullable()
+        );
+        assert!(
+            !schema
+                .field_with_name("manifest_idx")
+                .unwrap()
+                .is_nullable()
+        );
         assert!(schema.field_with_name("parent").unwrap().is_nullable());
         assert!(schema.field_with_name("id").unwrap().is_nullable());
         assert!(schema.field_with_name("param").unwrap().is_nullable());
@@ -389,10 +401,12 @@ mod tests {
                 .data_type(),
             &DataType::Int32
         );
-        assert!(!schema
-            .field_with_name("block_range_end")
-            .unwrap()
-            .is_nullable());
+        assert!(
+            !schema
+                .field_with_name("block_range_end")
+                .unwrap()
+                .is_nullable()
+        );
     }
 
     #[test]

@@ -4,7 +4,7 @@
 
 use anyhow::Result;
 
-use super::{load_manifest, replace_in_file, Migration, MigrationCheck, MigrationContext};
+use super::{Migration, MigrationCheck, MigrationContext, load_manifest, replace_in_file};
 
 /// Migration: specVersion 0.0.1 -> 0.0.2
 ///

@@ -12,7 +12,7 @@ use graph::{
     schema::{EntityType, InputSchema},
 };
 use lazy_static::lazy_static;
-use rand::{rng, Rng};
+use rand::{Rng, rng};
 
 #[derive(Parser)]
 #[clap(

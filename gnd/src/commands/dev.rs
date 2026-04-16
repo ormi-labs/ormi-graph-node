@@ -6,7 +6,7 @@ use graph::{
     components::link_resolver::FileLinkResolver,
     env::EnvVars,
     prelude::{CheapClone, DeploymentHash, LinkResolver, SubgraphName},
-    slog::{error, info, Logger},
+    slog::{Logger, error, info},
 };
 use graph_core::polling_monitor::ipfs_service;
 use graph_node::{launcher, opt::Opt};

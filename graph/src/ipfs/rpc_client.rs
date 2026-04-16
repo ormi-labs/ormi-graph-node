@@ -140,11 +140,11 @@ mod tests {
 
     use bytes::BytesMut;
     use futures03::TryStreamExt;
-    use wiremock::matchers as m;
     use wiremock::Mock;
     use wiremock::MockBuilder;
     use wiremock::MockServer;
     use wiremock::ResponseTemplate;
+    use wiremock::matchers as m;
 
     use super::*;
     use crate::ipfs::{ContentPath, IpfsContext, IpfsMetrics};

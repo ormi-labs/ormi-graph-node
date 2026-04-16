@@ -7,7 +7,7 @@ pub mod manifest;
 mod mapping;
 mod schema;
 
-pub use manifest::{extract_events_from_abi, generate_manifest, EventInfo, EventInput};
+pub use manifest::{EventInfo, EventInput, extract_events_from_abi, generate_manifest};
 pub use mapping::generate_mapping;
 pub use schema::generate_schema;
 
@@ -15,12 +15,12 @@ use std::fs;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use inflector::Inflector;
 use serde_json::Value as JsonValue;
 
 use crate::formatter::format_typescript;
-use crate::output::{step, with_spinner, Step};
+use crate::output::{Step, step, with_spinner};
 
 /// Options for scaffold generation.
 #[derive(Debug, Clone)]

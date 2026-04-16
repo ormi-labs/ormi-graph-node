@@ -1,6 +1,6 @@
 mod spinner;
 
-pub use spinner::{step as spinner_step, with_spinner, Spinner, SpinnerResult};
+pub use spinner::{Spinner, SpinnerResult, step as spinner_step, with_spinner};
 
 use console::style;
 

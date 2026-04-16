@@ -17,7 +17,7 @@ use graph::prelude::DeploymentHash;
 use graph_chain_ethereum::{BlockHandlerFilter, Chain};
 use semver::Version;
 
-use crate::output::{step, Step};
+use crate::output::{Step, step};
 
 /// Type alias for the graph-node unresolved manifest parameterized on Ethereum.
 type GraphManifest = UnresolvedSubgraphManifest<Chain>;

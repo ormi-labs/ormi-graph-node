@@ -1,8 +1,8 @@
 //! Block pointer utilities for mock chains.
 
 use graph::blockchain::block_stream::BlockWithTriggers;
-use graph::prelude::alloy::primitives::B256;
 use graph::prelude::BlockPtr;
+use graph::prelude::alloy::primitives::B256;
 use graph_chain_ethereum::Chain;
 
 /// Last block pointer — used as the indexer's stop target.

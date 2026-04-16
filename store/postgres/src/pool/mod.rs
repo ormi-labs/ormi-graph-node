@@ -1,5 +1,5 @@
-use deadpool::managed::{PoolError, Timeouts};
 use deadpool::Runtime;
+use deadpool::managed::{PoolError, Timeouts};
 use diesel::sql_query;
 use diesel_async::async_connection_wrapper::AsyncConnectionWrapper;
 use diesel_async::{AsyncConnection as _, RunQueryDsl, SimpleAsyncConnection};
@@ -11,10 +11,10 @@ use graph::derive::CheapClone;
 use graph::internal_error;
 use graph::prelude::tokio::time::Instant;
 use graph::prelude::{
-    anyhow::anyhow, crit, debug, error, info, o, AtomicMovingStats, Gauge, Logger, PoolWaitStats,
-    StoreError, ENV_VARS,
+    AtomicMovingStats, ENV_VARS, Gauge, Logger, PoolWaitStats, StoreError, anyhow::anyhow, crit,
+    debug, error, info, o,
 };
-use graph::prelude::{tokio, MetricsRegistry};
+use graph::prelude::{MetricsRegistry, tokio};
 use graph::slog::warn;
 use graph::util::timed_rw_lock::TimedMutex;
 use tokio::sync::OwnedSemaphorePermit;
@@ -29,7 +29,7 @@ use std::time::Duration;
 use crate::catalog;
 use crate::pool::manager::{ConnectionManager, WaitMeter};
 use crate::primary::{self, Mirror, Namespace};
-use crate::{Shard, PRIMARY_SHARD};
+use crate::{PRIMARY_SHARD, Shard};
 
 mod coordinator;
 mod foreign_server;
@@ -816,7 +816,11 @@ impl PoolInner {
                 crit!(logger, "{}: {}", MSG, msg);
                 panic!("{}: {}", MSG, msg);
             } else {
-                warn!(logger, "{}.\nPlease check the graph-node documentation for how to set up the database locale", msg);
+                warn!(
+                    logger,
+                    "{}.\nPlease check the graph-node documentation for how to set up the database locale",
+                    msg
+                );
             }
         };
         Ok(())

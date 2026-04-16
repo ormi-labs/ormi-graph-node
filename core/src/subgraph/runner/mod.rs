@@ -29,19 +29,19 @@ use graph::components::{
 use graph::data::store::scalar::Bytes;
 use graph::data::subgraph::schema::SubgraphError;
 use graph::data_source::{
-    offchain, CausalityRegion, DataSource, DataSourceCreationError, TriggerData,
+    CausalityRegion, DataSource, DataSourceCreationError, TriggerData, offchain,
 };
 use graph::env::EnvVars;
 use graph::ext::futures::Cancelable;
 use graph::futures03::stream::StreamExt;
 use graph::prelude::{
-    anyhow, hex, retry, thiserror, BlockNumber, BlockPtr, BlockState, CancelGuard, CancelHandle,
-    CancelToken as _, CheapClone as _, EntityCache, EntityModification, Error,
-    InstanceDSTemplateInfo, LogCode, RunnerMetrics, RuntimeHostBuilder, StopwatchMetrics,
-    StoreError, StreamExtension, UnfailOutcome, Value, ENV_VARS,
+    BlockNumber, BlockPtr, BlockState, CancelGuard, CancelHandle, CancelToken as _,
+    CheapClone as _, ENV_VARS, EntityCache, EntityModification, Error, InstanceDSTemplateInfo,
+    LogCode, RunnerMetrics, RuntimeHostBuilder, StopwatchMetrics, StoreError, StreamExtension,
+    UnfailOutcome, Value, anyhow, hex, retry, thiserror,
 };
 use graph::schema::EntityKey;
-use graph::slog::{debug, error, info, o, trace, warn, Logger};
+use graph::slog::{Logger, debug, error, info, o, trace, warn};
 use graph::util::lfu_cache::EvictStats;
 use graph::util::{backoff::ExponentialBackoff, lfu_cache::LfuCache};
 use std::sync::Arc;
@@ -291,15 +291,16 @@ where
 
             // Stop subgraph when we reach maximum endblock.
             if let Some(max_end_block) = self.inputs.max_end_block
-                && max_end_block <= current_ptr.block_number() {
-                    info!(self.logger, "Stopping subgraph as we reached maximum endBlock";
+                && max_end_block <= current_ptr.block_number()
+            {
+                info!(self.logger, "Stopping subgraph as we reached maximum endBlock";
                                 "max_end_block" => max_end_block,
                                 "current_block" => current_ptr.block_number());
-                    self.inputs.store.flush().await?;
-                    return Ok(RunnerState::Stopped {
-                        reason: StopReason::MaxEndBlockReached,
-                    });
-                }
+                self.inputs.store.flush().await?;
+                return Ok(RunnerState::Stopped {
+                    reason: StopReason::MaxEndBlockReached,
+                });
+            }
         }
 
         // Normal case: proceed to start the block stream
@@ -1312,21 +1313,23 @@ where
                 }
 
                 if let Some(stop_block) = self.inputs.stop_block
-                    && block_ptr.number >= stop_block {
-                        info!(self.logger, "Stop block reached for subgraph");
-                        return Ok(Action::Stop);
-                    }
+                    && block_ptr.number >= stop_block
+                {
+                    info!(self.logger, "Stop block reached for subgraph");
+                    return Ok(Action::Stop);
+                }
 
                 if let Some(max_end_block) = self.inputs.max_end_block
-                    && block_ptr.number >= max_end_block {
-                        info!(
-                            self.logger,
-                            "Stopping subgraph as maximum endBlock reached";
-                            "max_end_block" => max_end_block,
-                            "current_block" => block_ptr.number
-                        );
-                        return Ok(Action::Stop);
-                    }
+                    && block_ptr.number >= max_end_block
+                {
+                    info!(
+                        self.logger,
+                        "Stopping subgraph as maximum endBlock reached";
+                        "max_end_block" => max_end_block,
+                        "current_block" => block_ptr.number
+                    );
+                    return Ok(Action::Stop);
+                }
 
                 Ok(action)
             }

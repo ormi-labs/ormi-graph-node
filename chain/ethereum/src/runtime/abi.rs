@@ -12,8 +12,8 @@ use graph::prelude::alloy::rpc::types::{Log, TransactionReceipt};
 use graph::{
     prelude::BigInt,
     runtime::{
-        asc_get, asc_new, asc_new_or_null, gas::GasCounter, AscHeap, AscIndexId, AscPtr, AscType,
-        DeterministicHostError, FromAscObj, HostExportError, IndexForAscTypeId, ToAscObj,
+        AscHeap, AscIndexId, AscPtr, AscType, DeterministicHostError, FromAscObj, HostExportError,
+        IndexForAscTypeId, ToAscObj, asc_get, asc_new, asc_new_or_null, gas::GasCounter,
     },
 };
 use graph_runtime_derive::AscType;

@@ -5,9 +5,9 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use bytes::Bytes;
 use bytes::BytesMut;
-use futures03::stream::BoxStream;
 use futures03::StreamExt;
 use futures03::TryStreamExt;
+use futures03::stream::BoxStream;
 use slog::Logger;
 
 use crate::cheap_clone::CheapClone as _;

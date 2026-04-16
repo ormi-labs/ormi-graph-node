@@ -36,21 +36,21 @@ use graph::env::EnvVars;
 use graph::firehose::{FirehoseEndpoint, FirehoseEndpoints, SubgraphLimit};
 use graph::futures03::{Stream, StreamExt};
 use graph::http_body_util::Full;
-use graph::hyper::body::Bytes;
 use graph::hyper::Request;
+use graph::hyper::body::Bytes;
 use graph::ipfs::{IpfsClient, IpfsMetrics};
 use graph::prelude::alloy::primitives::B256;
 use graph::prelude::alloy::primitives::U256;
 use graph::prelude::serde_json::{self, json};
 use graph::prelude::{
-    lazy_static, q, r, ApiVersion, BigInt, BlockNumber, DeploymentHash, GraphQlRunner as _,
-    IpfsResolver, LinkResolver, LoggerFactory, NodeId, QueryError, SubgraphCountMetric,
-    SubgraphName, SubgraphRegistrar, SubgraphStore as _, SubgraphVersionSwitchingMode,
-    TriggerProcessor,
+    ApiVersion, BigInt, BlockNumber, DeploymentHash, GraphQlRunner as _, IpfsResolver,
+    LinkResolver, LoggerFactory, NodeId, QueryError, SubgraphCountMetric, SubgraphName,
+    SubgraphRegistrar, SubgraphStore as _, SubgraphVersionSwitchingMode, TriggerProcessor,
+    lazy_static, q, r,
 };
+use graph_chain_ethereum::Chain;
 use graph_chain_ethereum::chain::RuntimeAdapterBuilder;
 use graph_chain_ethereum::network::EthereumNetworkAdapters;
-use graph_chain_ethereum::Chain;
 use graph_core::polling_monitor::{arweave_service, ipfs_service};
 use graph_node::config::Opt;
 use graph_node::manager::PanicSubscriptionManager;
@@ -59,7 +59,7 @@ use graph_runtime_wasm::RuntimeHostBuilder;
 use graph_server_index_node::IndexNodeService;
 use graph_store_postgres::{ChainHeadUpdateListener, ChainStore, Store, SubgraphStore};
 use serde::Deserialize;
-use slog::{crit, debug, info, o, Discard, Logger};
+use slog::{Discard, Logger, crit, debug, info, o};
 use std::env::VarError;
 use std::pin::Pin;
 use std::sync::Arc;

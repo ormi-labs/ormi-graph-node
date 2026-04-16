@@ -18,7 +18,7 @@ use std::path::Path;
 use anyhow::Result;
 use regex::Regex;
 
-use crate::output::{step, Step};
+use crate::output::{Step, step};
 
 pub use versions::get_graph_ts_version;
 
@@ -139,9 +139,10 @@ fn manifest_has_api_version(manifest: &serde_json::Value, version: &str) -> bool
                 .get("mapping")
                 .and_then(|m| m.get("apiVersion"))
                 .and_then(|v| v.as_str())
-                && api_version == version {
-                    return true;
-                }
+                && api_version == version
+            {
+                return true;
+            }
         }
     }
 
@@ -152,9 +153,10 @@ fn manifest_has_api_version(manifest: &serde_json::Value, version: &str) -> bool
                 .get("mapping")
                 .and_then(|m| m.get("apiVersion"))
                 .and_then(|v| v.as_str())
-                && api_version == version {
-                    return true;
-                }
+                && api_version == version
+            {
+                return true;
+            }
         }
     }
 

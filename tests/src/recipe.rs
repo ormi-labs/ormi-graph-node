@@ -1,5 +1,5 @@
 use crate::{
-    fixture::{stores, Stores, TestInfo},
+    fixture::{Stores, TestInfo, stores},
     helpers::run_cmd,
 };
 use graph::prelude::{DeploymentHash, SubgraphName};

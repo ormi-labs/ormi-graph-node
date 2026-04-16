@@ -1,7 +1,7 @@
 use ethereum::{
+    BlockIngestor,
     chain::ChainSettings,
     network::{EthereumNetworkAdapter, EthereumNetworkAdapters},
-    BlockIngestor,
 };
 use graph::components::network_provider::ChainName;
 use graph::components::network_provider::NetworkDetails;
@@ -20,10 +20,11 @@ use graph::{
     itertools::Itertools,
     log::factory::LoggerFactory,
     prelude::{
-        anyhow::{anyhow, Result},
-        info, Logger,
+        Logger,
+        anyhow::{Result, anyhow},
+        info,
     },
-    slog::{o, warn, Discard},
+    slog::{Discard, o, warn},
 };
 use graph_chain_ethereum as ethereum;
 use graph_store_postgres::{BlockStore, ChainHeadUpdateListener};
@@ -31,8 +32,8 @@ use graph_store_postgres::{BlockStore, ChainHeadUpdateListener};
 use std::{any::Any, cmp::Ordering, sync::Arc};
 
 use crate::chain::{
-    create_ethereum_networks, create_firehose_networks, networks_as_chains, AnyChainFilter,
-    ChainFilter, OneChainFilter,
+    AnyChainFilter, ChainFilter, OneChainFilter, create_ethereum_networks,
+    create_firehose_networks, networks_as_chains,
 };
 
 #[derive(Debug, Clone)]
@@ -129,13 +130,13 @@ impl Networks {
                     Ok(ident) => return Ok(ident),
                     Err(err) => {
                         warn!(
-                        logger,
-                        "unable to get chain identification from {} provider {} for chain {}, err: {}",
-                        provider_type,
-                        adapter.provider_name(),
-                        chain_id,
-                        err.to_string(),
-                    );
+                            logger,
+                            "unable to get chain identification from {} provider {} for chain {}, err: {}",
+                            provider_type,
+                            adapter.provider_name(),
+                            chain_id,
+                            err.to_string(),
+                        );
                     }
                 }
             }
@@ -259,8 +260,6 @@ impl Networks {
                  }| { (chain_id, adapters) },
             )
             .collect_vec();
-
-        
 
         Self {
             adapters: adapters2,

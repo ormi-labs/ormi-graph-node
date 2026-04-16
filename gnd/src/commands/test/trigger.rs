@@ -7,19 +7,19 @@
 //! - data = ABI-encoded `value` (non-indexed)
 
 use super::schema::{LogEvent, TestFile};
-use anyhow::{anyhow, ensure, Context, Result};
+use anyhow::{Context, Result, anyhow, ensure};
 use graph::blockchain::block_stream::BlockWithTriggers;
 use graph::components::ethereum::AnyTransactionReceiptBare;
 use graph::prelude::alloy::consensus::{Eip658Value, Receipt, ReceiptWithBloom};
 use graph::prelude::alloy::dyn_abi::{DynSolType, DynSolValue};
 use graph::prelude::alloy::json_abi::Event;
 use graph::prelude::alloy::network::AnyReceiptEnvelope;
-use graph::prelude::alloy::primitives::{keccak256, Address, Bloom, Bytes, B256, I256, U256};
+use graph::prelude::alloy::primitives::{Address, B256, Bloom, Bytes, I256, U256, keccak256};
 use graph::prelude::alloy::rpc::types::{Log, TransactionReceipt};
 use graph::prelude::{BlockPtr, LightEthereumBlock};
+use graph_chain_ethereum::Chain;
 use graph_chain_ethereum::chain::BlockFinality;
 use graph_chain_ethereum::trigger::{EthereumBlockTriggerType, EthereumTrigger, LogRef};
-use graph_chain_ethereum::Chain;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -293,11 +293,7 @@ pub fn json_to_sol_value(sol_type: &DynSolType, value: &serde_json::Value) -> Re
                         None => (s_abs, 10),
                     };
                     let abs = U256::from_str_radix(digits, radix).context("Invalid int")?;
-                    if is_neg {
-                        !abs + U256::from(1)
-                    } else {
-                        abs
-                    }
+                    if is_neg { !abs + U256::from(1) } else { abs }
                 }
                 serde_json::Value::Number(n) => {
                     if let Some(i) = n.as_i64() {
@@ -471,9 +467,10 @@ fn create_block_with_triggers(
     let mut tx_hashes: HashSet<B256> = HashSet::new();
     for trigger in &triggers {
         if let EthereumTrigger::Log(LogRef::FullLog(log, _)) = trigger
-            && let Some(tx_hash) = log.transaction_hash {
-                tx_hashes.insert(tx_hash);
-            }
+            && let Some(tx_hash) = log.transaction_hash
+        {
+            tx_hashes.insert(tx_hash);
+        }
     }
 
     let transactions: Vec<_> = tx_hashes

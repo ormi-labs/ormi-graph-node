@@ -3,8 +3,8 @@
 //! This module defines the explicit state machine that controls the runner's lifecycle,
 //! replacing the previous nested loop structure with clear state transitions.
 
-use graph::blockchain::block_stream::{BlockStream, BlockWithTriggers, FirehoseCursor};
 use graph::blockchain::Blockchain;
+use graph::blockchain::block_stream::{BlockStream, BlockWithTriggers, FirehoseCursor};
 use graph::ext::futures::Cancelable;
 use graph::prelude::BlockPtr;
 

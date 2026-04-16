@@ -9,10 +9,10 @@ use arrow_flight::{
 };
 use async_stream::try_stream;
 use bytes::Bytes;
-use futures03::{future::BoxFuture, stream::BoxStream, StreamExt};
+use futures03::{StreamExt, future::BoxFuture, stream::BoxStream};
 use http::Uri;
 use serde::{Deserialize, Serialize};
-use slog::{debug, trace, Logger};
+use slog::{Logger, debug, trace};
 use thiserror::Error;
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 
@@ -22,7 +22,7 @@ use crate::{
             Client, LatestBlockBeforeReorg, RequestMetadata, ResponseBatch, ResumeStreamingQuery,
         },
         error,
-        log::{one_line, Logger as _},
+        log::{Logger as _, one_line},
     },
     prelude::CheapClone,
 };

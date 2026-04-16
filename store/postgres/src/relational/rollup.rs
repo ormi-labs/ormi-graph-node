@@ -73,8 +73,8 @@ use graph::sqlparser::ast as p;
 use graph::sqlparser::parser::ParserError;
 use itertools::Itertools;
 
-use crate::relational::Table;
 use crate::AsyncPgConnection;
+use crate::relational::Table;
 
 use super::{Column, SqlName};
 
@@ -739,8 +739,8 @@ mod tests {
     use itertools::Itertools as _;
 
     use crate::{
-        layout_for_tests::{make_dummy_site, Namespace},
-        relational::{rollup::Rollup, Catalog, Layout},
+        layout_for_tests::{Namespace, make_dummy_site},
+        relational::{Catalog, Layout, rollup::Rollup},
     };
 
     // Check that the two strings are the same after replacing runs of

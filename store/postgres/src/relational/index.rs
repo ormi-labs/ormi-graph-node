@@ -1,5 +1,5 @@
 //! Parse Postgres index definition into a form that is meaningful for us.
-use anyhow::{anyhow, Error};
+use anyhow::{Error, anyhow};
 use std::collections::HashMap;
 use std::fmt::{Display, Write};
 use std::sync::Arc;
@@ -10,9 +10,8 @@ use diesel_async::RunQueryDsl;
 use graph::components::store::StoreError;
 use graph::itertools::Itertools;
 use graph::prelude::{
-    lazy_static,
+    BlockNumber, lazy_static,
     regex::{Captures, Regex},
-    BlockNumber,
 };
 
 use crate::block_range::{BLOCK_COLUMN, BLOCK_RANGE_COLUMN};
@@ -20,7 +19,7 @@ use crate::command_support::catalog::Site;
 use crate::deployment_store::DeploymentStore;
 use crate::primary::Namespace;
 use crate::relational::{BYTE_ARRAY_PREFIX_SIZE, STRING_PREFIX_SIZE};
-use crate::{catalog, AsyncPgConnection};
+use crate::{AsyncPgConnection, catalog};
 
 use super::{Layout, Table, VID_COLUMN};
 
@@ -725,7 +724,9 @@ impl CreateIndex {
                 let if_not_exists = if if_not_exists { "if not exists " } else { "" };
                 let columns = columns.iter().map(|c| c.to_sql()).join(", ");
 
-                let mut sql = format!("create {unique}index {concurrent}{if_not_exists}{name} on {nsp}.{table} using {method} ({columns})");
+                let mut sql = format!(
+                    "create {unique}index {concurrent}{if_not_exists}{name} on {nsp}.{table} using {method} ({columns})"
+                );
                 if let Some(with) = with {
                     write!(sql, " with ({with})")?;
                 }
@@ -799,9 +800,9 @@ impl IndexList {
                     && let Ok(sql) = ci
                         .with_nsp(namespace.to_string())?
                         .to_sql(concurrent, if_not_exists)
-                    {
-                        arr.push((ci.name(), sql))
-                    }
+                {
+                    arr.push((ci.name(), sql))
+                }
             }
         }
         Ok(arr)
@@ -869,7 +870,7 @@ mod tests {
     use graph::prelude::{BlockNumber, DeploymentHash};
     use graph::schema::InputSchema;
 
-    use crate::layout_for_tests::{make_dummy_site, Namespace};
+    use crate::layout_for_tests::{Namespace, make_dummy_site};
     use crate::relational::Catalog;
 
     use super::*;

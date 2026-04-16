@@ -1,11 +1,11 @@
 use diesel::select;
 use diesel::sql_query;
 use diesel::sql_types::{Bool, Integer};
-use diesel::{insert_into, OptionalExtension};
 use diesel::{
-    sql_types::{Array, BigInt, Double, Nullable, Text},
     ExpressionMethods, QueryDsl,
+    sql_types::{Array, BigInt, Double, Nullable, Text},
 };
+use diesel::{OptionalExtension, insert_into};
 use diesel_async::{RunQueryDsl, SimpleAsyncConnection};
 use graph::components::store::VersionStats;
 use graph::prelude::BlockNumber;
@@ -20,14 +20,14 @@ use std::time::Duration;
 use graph::prelude::anyhow::anyhow;
 use graph::{
     data::subgraph::schema::POI_TABLE,
-    prelude::{lazy_static, StoreError, BLOCK_NUMBER_MAX},
+    prelude::{BLOCK_NUMBER_MAX, StoreError, lazy_static},
 };
 
 use crate::AsyncPgConnection;
 use crate::{
     block_range::BLOCK_RANGE_COLUMN,
     pool::ForeignServer,
-    primary::{Namespace, Site, NAMESPACE_PUBLIC},
+    primary::{NAMESPACE_PUBLIC, Namespace, Site},
     relational::SqlName,
 };
 

@@ -322,7 +322,7 @@ impl EnvVars {
             lock_contention_log_threshold: Duration::from_millis(
                 inner.lock_contention_log_threshold_in_ms,
             ),
-            max_gas_per_handler: inner.max_gas_per_handler.0 .0,
+            max_gas_per_handler: inner.max_gas_per_handler.0.0,
             log_query_timing: inner
                 .log_query_timing
                 .split(',')

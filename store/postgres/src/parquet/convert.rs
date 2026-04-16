@@ -11,8 +11,8 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Schema};
 
 use graph::components::store::StoreError;
-use graph::data::store::scalar;
 use graph::data::store::Value;
+use graph::data::store::scalar;
 use graph::data::value::Word;
 use graph::prelude::BlockNumber;
 
@@ -593,7 +593,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::layout_for_tests::{make_dummy_site, Catalog, Layout, Namespace};
+    use crate::layout_for_tests::{Catalog, Layout, Namespace, make_dummy_site};
     use crate::parquet::schema::arrow_schema;
 
     fn make_row(values: Vec<OidValue>) -> OidRow {

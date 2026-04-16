@@ -13,21 +13,21 @@ use anyhow::Error;
 use graph::components::store::{GetScope, SeqGenerator};
 use never::Never;
 
-use crate::asc_abi::class::*;
 use crate::HostExports;
+use crate::asc_abi::class::*;
 use graph::data::store;
 
+use crate::ExperimentalFeatures;
 use crate::asc_abi::class::AscEntity;
 use crate::asc_abi::class::AscString;
 use crate::mapping::MappingContext;
 use crate::mapping::ValidModule;
-use crate::ExperimentalFeatures;
 use graph::prelude::*;
 use graph::runtime::AscPtr;
-use graph::runtime::{asc_new, gas::GasCounter, DeterministicHostError, HostExportError};
+use graph::runtime::{DeterministicHostError, HostExportError, asc_new, gas::GasCounter};
 
-use super::asc_get;
 use super::AscHeapCtx;
+use super::asc_get;
 
 pub(crate) struct WasmInstanceContext<'a> {
     inner: StoreContextMut<'a, WasmInstanceData>,

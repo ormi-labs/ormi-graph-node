@@ -7,11 +7,11 @@
 //! `subgraph instance` - A background task that executes the subgraph runner future.
 
 use std::{
-    collections::{hash_map::Entry, HashMap},
+    collections::{HashMap, hash_map::Entry},
     fmt,
     sync::{
-        atomic::{AtomicU32, Ordering::SeqCst},
         Arc,
+        atomic::{AtomicU32, Ordering::SeqCst},
     },
     time::Duration,
 };
@@ -21,7 +21,7 @@ use futures::future::BoxFuture;
 use graph::{
     cheap_clone::CheapClone, components::store::DeploymentLocator, log::factory::LoggerFactory,
 };
-use slog::{debug, error, info, warn, Logger};
+use slog::{Logger, debug, error, info, warn};
 use tokio::{
     sync::mpsc::{self, error::SendError},
     task::JoinHandle,

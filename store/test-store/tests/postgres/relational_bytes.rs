@@ -15,12 +15,11 @@ use std::collections::BTreeSet;
 use std::str::FromStr;
 use std::{collections::BTreeMap, sync::Arc};
 
-use graph::data::store::scalar::{BigDecimal, BigInt};
 use graph::data::store::IdList;
+use graph::data::store::scalar::{BigDecimal, BigInt};
 use graph::prelude::{
-    o, slog, AttributeNames, ChildMultiplicity, DeploymentHash, Entity, EntityCollection,
-    EntityLink, EntityWindow, Logger, ParentLink, StopwatchMetrics, WindowAttribute,
-    BLOCK_NUMBER_MAX,
+    AttributeNames, BLOCK_NUMBER_MAX, ChildMultiplicity, DeploymentHash, Entity, EntityCollection,
+    EntityLink, EntityWindow, Logger, ParentLink, StopwatchMetrics, WindowAttribute, o, slog,
 };
 use graph_store_postgres::{
     layout_for_tests::make_dummy_site,

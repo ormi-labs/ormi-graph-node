@@ -35,7 +35,7 @@ const COMBINED_FILTER_TYPE_URL: &str =
 
 use crate::capabilities::NodeCapabilities;
 use crate::data_source::{BlockHandlerFilter, DataSource};
-use crate::{Chain, Mapping, ENV_VARS};
+use crate::{Chain, ENV_VARS, Mapping};
 
 pub type EventSignature = B256;
 pub type FunctionSelector = [u8; 4];
@@ -1186,7 +1186,7 @@ pub trait EthereumAdapter: Send + Sync + 'static {
 
 #[cfg(test)]
 mod tests {
-    use crate::adapter::{FunctionSelector, COMBINED_FILTER_TYPE_URL};
+    use crate::adapter::{COMBINED_FILTER_TYPE_URL, FunctionSelector};
 
     use super::{EthereumBlockFilter, LogFilterNode};
     use super::{EthereumCallFilter, EthereumLogFilter, TriggerFilter};
@@ -1195,8 +1195,8 @@ mod tests {
     use graph::blockchain::TriggerFilter as _;
     use graph::firehose::{CallToFilter, CombinedFilter, LogFilter, MultiLogFilter};
     use graph::petgraph::graphmap::GraphMap;
-    use graph::prelude::alloy::primitives::{Address, Bytes, B256, U256};
     use graph::prelude::EthereumCall;
+    use graph::prelude::alloy::primitives::{Address, B256, Bytes, U256};
     use hex::ToHex;
     use itertools::Itertools;
     use prost::Message;
@@ -1264,9 +1264,11 @@ mod tests {
         assert_eq!(sig, actual_sig);
 
         let filter = LogFilter {
-            addresses: vec![Address::from_str(hex_addr)
-                .expect("failed to parse address")
-                .to_vec()],
+            addresses: vec![
+                Address::from_str(hex_addr)
+                    .expect("failed to parse address")
+                    .to_vec(),
+            ],
             event_signatures: vec![fs.to_vec()],
         };
 
@@ -1651,8 +1653,8 @@ mod tests {
     }
 
     #[test]
-    fn extending_ethereum_block_filter_every_block_in_base_and_merge_contract_addresses_and_polling_intervals(
-    ) {
+    fn extending_ethereum_block_filter_every_block_in_base_and_merge_contract_addresses_and_polling_intervals()
+     {
         let mut base = EthereumBlockFilter {
             polling_intervals: HashSet::from_iter(vec![(10, 3)]),
             contract_addresses: HashSet::from_iter(vec![(10, address(2))]),

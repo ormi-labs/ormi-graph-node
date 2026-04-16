@@ -1,7 +1,7 @@
 //! ABI encoding helpers for mock Ethereum call data.
 
 use super::trigger::json_to_sol_value;
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use graph::abi::FunctionExt as GraphFunctionExt;
 use graph::prelude::alloy::dyn_abi::{DynSolType, FunctionExt as AlloyFunctionExt};
 use graph::prelude::alloy::json_abi::Function;

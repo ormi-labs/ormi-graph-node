@@ -10,12 +10,12 @@ use graph::components::{
     subgraph::Settings,
 };
 use graph::data::{
-    subgraph::{schema::DeploymentCreate, Graft},
+    subgraph::{Graft, schema::DeploymentCreate},
     value::Word,
 };
-use graph::futures03::{self, future::TryFutureExt, Stream, StreamExt};
+use graph::futures03::{self, Stream, StreamExt, future::TryFutureExt};
 use graph::prelude::{CreateSubgraphResult, SubgraphRegistrar as SubgraphRegistrarTrait, *};
-use graph::util::futures::{retry_strategy, RETRY_DEFAULT_LIMIT};
+use graph::util::futures::{RETRY_DEFAULT_LIMIT, retry_strategy};
 use tokio_retry::Retry;
 
 pub struct SubgraphRegistrar<P, S, SM, AC> {

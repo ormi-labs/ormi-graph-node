@@ -8,16 +8,16 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 use sha1::{Digest, Sha1};
 
 use crate::abi::normalize_abi_json;
-use crate::compiler::{compile_mapping, find_graph_ts, AscCompileOptions};
+use crate::compiler::{AscCompileOptions, compile_mapping, find_graph_ts};
 use crate::config::{apply_network_config, get_network_config, load_networks_config};
-use crate::manifest::{load_manifest, resolve_path, DataSource, Manifest, Template};
+use crate::manifest::{DataSource, Manifest, Template, load_manifest, resolve_path};
 use crate::migrations;
-use crate::output::{step, Step};
+use crate::output::{Step, step};
 use crate::services::IpfsClient;
 use crate::validation::{
     collect_handler_names, collect_template_handler_names, format_manifest_errors,
@@ -498,32 +498,35 @@ fn create_ipfs_manifest(
         // Find the hash for this file
         if let Some(hash) = uploaded.path_to_ipfs.get(schema_name)
             && let Some(schema) = value.get_mut("schema")
-                && let Some(file) = schema.get_mut("file") {
-                    *file = create_ipfs_link(hash);
-                }
+            && let Some(file) = schema.get_mut("file")
+        {
+            *file = create_ipfs_link(hash);
+        }
     }
 
     // Update data source paths
     if let Some(data_sources) = value.get_mut("dataSources")
-        && let Some(arr) = data_sources.as_sequence_mut() {
-            for (i, ds_value) in arr.iter_mut().enumerate() {
-                if i < manifest.data_sources.len() {
-                    let ds = &manifest.data_sources[i];
-                    update_data_source_ipfs_paths(ds_value, ds, uploaded);
-                }
+        && let Some(arr) = data_sources.as_sequence_mut()
+    {
+        for (i, ds_value) in arr.iter_mut().enumerate() {
+            if i < manifest.data_sources.len() {
+                let ds = &manifest.data_sources[i];
+                update_data_source_ipfs_paths(ds_value, ds, uploaded);
             }
         }
+    }
 
     // Update template paths
     if let Some(templates) = value.get_mut("templates")
-        && let Some(arr) = templates.as_sequence_mut() {
-            for (i, template_value) in arr.iter_mut().enumerate() {
-                if i < manifest.templates.len() {
-                    let template = &manifest.templates[i];
-                    update_template_ipfs_paths(template_value, template, uploaded);
-                }
+        && let Some(arr) = templates.as_sequence_mut()
+    {
+        for (i, template_value) in arr.iter_mut().enumerate() {
+            if i < manifest.templates.len() {
+                let template = &manifest.templates[i];
+                update_template_ipfs_paths(template_value, template, uploaded);
             }
         }
+    }
 
     serde_yaml::to_string(&value).context("Failed to serialize IPFS manifest")
 }
@@ -555,19 +558,20 @@ fn update_data_source_ipfs_paths(
 
         // Update ABIs
         if let Some(abis) = mapping.get_mut("abis")
-            && let Some(arr) = abis.as_sequence_mut() {
-                for (j, abi_value) in arr.iter_mut().enumerate() {
-                    if j < ds.abis.len() {
-                        let abi = &ds.abis[j];
-                        if let Some(file) = abi_value.get_mut("file") {
-                            let abi_path = format!("{}/{}.json", ds.name, abi.name);
-                            if let Some(hash) = uploaded.path_to_ipfs.get(&abi_path) {
-                                *file = create_ipfs_link(hash);
-                            }
+            && let Some(arr) = abis.as_sequence_mut()
+        {
+            for (j, abi_value) in arr.iter_mut().enumerate() {
+                if j < ds.abis.len() {
+                    let abi = &ds.abis[j];
+                    if let Some(file) = abi_value.get_mut("file") {
+                        let abi_path = format!("{}/{}.json", ds.name, abi.name);
+                        if let Some(hash) = uploaded.path_to_ipfs.get(&abi_path) {
+                            *file = create_ipfs_link(hash);
                         }
                     }
                 }
             }
+        }
     }
 }
 
@@ -588,19 +592,20 @@ fn update_template_ipfs_paths(
 
         // Update ABIs
         if let Some(abis) = mapping.get_mut("abis")
-            && let Some(arr) = abis.as_sequence_mut() {
-                for (j, abi_value) in arr.iter_mut().enumerate() {
-                    if j < template.abis.len() {
-                        let abi = &template.abis[j];
-                        if let Some(file) = abi_value.get_mut("file") {
-                            let abi_path = format!("templates/{}/{}.json", template.name, abi.name);
-                            if let Some(hash) = uploaded.path_to_ipfs.get(&abi_path) {
-                                *file = create_ipfs_link(hash);
-                            }
+            && let Some(arr) = abis.as_sequence_mut()
+        {
+            for (j, abi_value) in arr.iter_mut().enumerate() {
+                if j < template.abis.len() {
+                    let abi = &template.abis[j];
+                    if let Some(file) = abi_value.get_mut("file") {
+                        let abi_path = format!("templates/{}/{}.json", template.name, abi.name);
+                        if let Some(hash) = uploaded.path_to_ipfs.get(&abi_path) {
+                            *file = create_ipfs_link(hash);
                         }
                     }
                 }
             }
+        }
     }
 }
 
@@ -747,35 +752,38 @@ fn write_output_manifest(
     // Update schema path
     if let Some(schema) = value.get_mut("schema")
         && let Some(file) = schema.get_mut("file")
-            && let Some(schema_path) = manifest.schema.as_ref() {
-                let schema_name = Path::new(schema_path)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("schema.graphql");
-                *file = serde_yaml::Value::String(schema_name.to_string());
-            }
+        && let Some(schema_path) = manifest.schema.as_ref()
+    {
+        let schema_name = Path::new(schema_path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("schema.graphql");
+        *file = serde_yaml::Value::String(schema_name.to_string());
+    }
 
     // Update data source paths
     if let Some(data_sources) = value.get_mut("dataSources")
-        && let Some(arr) = data_sources.as_sequence_mut() {
-            for (i, ds) in arr.iter_mut().enumerate() {
-                if i < manifest.data_sources.len() {
-                    let ds_name = &manifest.data_sources[i].name;
-                    update_data_source_paths(ds, ds_name, output_format);
-                }
+        && let Some(arr) = data_sources.as_sequence_mut()
+    {
+        for (i, ds) in arr.iter_mut().enumerate() {
+            if i < manifest.data_sources.len() {
+                let ds_name = &manifest.data_sources[i].name;
+                update_data_source_paths(ds, ds_name, output_format);
             }
         }
+    }
 
     // Update template paths
     if let Some(templates) = value.get_mut("templates")
-        && let Some(arr) = templates.as_sequence_mut() {
-            for (i, template) in arr.iter_mut().enumerate() {
-                if i < manifest.templates.len() {
-                    let template_name = &manifest.templates[i].name;
-                    update_template_paths(template, template_name, output_format);
-                }
+        && let Some(arr) = templates.as_sequence_mut()
+    {
+        for (i, template) in arr.iter_mut().enumerate() {
+            if i < manifest.templates.len() {
+                let template_name = &manifest.templates[i].name;
+                update_template_paths(template, template_name, output_format);
             }
         }
+    }
 
     // Write output manifest
     let output_str = serde_yaml::to_string(&value)?;
@@ -795,19 +803,21 @@ fn update_data_source_paths(ds: &mut serde_yaml::Value, ds_name: &str, output_fo
 
         // Update ABI paths
         if let Some(abis) = mapping.get_mut("abis")
-            && let Some(arr) = abis.as_sequence_mut() {
-                for abi in arr.iter_mut() {
-                    // Extract name first to avoid borrow conflicts
-                    let abi_name = abi
-                        .get("name")
-                        .and_then(|n| n.as_str())
-                        .map(|s| s.to_string());
-                    if let Some(name) = abi_name
-                        && let Some(file) = abi.get_mut("file") {
-                            *file = serde_yaml::Value::String(format!("{}/{}.json", ds_name, name));
-                        }
+            && let Some(arr) = abis.as_sequence_mut()
+        {
+            for abi in arr.iter_mut() {
+                // Extract name first to avoid borrow conflicts
+                let abi_name = abi
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .map(|s| s.to_string());
+                if let Some(name) = abi_name
+                    && let Some(file) = abi.get_mut("file")
+                {
+                    *file = serde_yaml::Value::String(format!("{}/{}.json", ds_name, name));
                 }
             }
+        }
     }
 }
 
@@ -829,22 +839,24 @@ fn update_template_paths(
 
         // Update ABI paths
         if let Some(abis) = mapping.get_mut("abis")
-            && let Some(arr) = abis.as_sequence_mut() {
-                for abi in arr.iter_mut() {
-                    // Extract name first to avoid borrow conflicts
-                    let abi_name = abi
-                        .get("name")
-                        .and_then(|n| n.as_str())
-                        .map(|s| s.to_string());
-                    if let Some(name) = abi_name
-                        && let Some(file) = abi.get_mut("file") {
-                            *file = serde_yaml::Value::String(format!(
-                                "templates/{}/{}.json",
-                                template_name, name
-                            ));
-                        }
+            && let Some(arr) = abis.as_sequence_mut()
+        {
+            for abi in arr.iter_mut() {
+                // Extract name first to avoid borrow conflicts
+                let abi_name = abi
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .map(|s| s.to_string());
+                if let Some(name) = abi_name
+                    && let Some(file) = abi.get_mut("file")
+                {
+                    *file = serde_yaml::Value::String(format!(
+                        "templates/{}/{}.json",
+                        template_name, name
+                    ));
                 }
             }
+        }
     }
 }
 

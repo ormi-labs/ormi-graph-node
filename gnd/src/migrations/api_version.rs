@@ -6,8 +6,8 @@
 use anyhow::Result;
 
 use super::{
-    load_manifest, manifest_has_api_version, replace_in_file, versions, Migration, MigrationCheck,
-    MigrationContext,
+    Migration, MigrationCheck, MigrationContext, load_manifest, manifest_has_api_version,
+    replace_in_file, versions,
 };
 
 /// Helper to create an API version migration check.

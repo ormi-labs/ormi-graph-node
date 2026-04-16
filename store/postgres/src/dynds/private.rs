@@ -1,25 +1,25 @@
 use std::{collections::HashMap, ops::Bound};
 
 use diesel::{
-    pg::{sql_types, Pg},
+    ExpressionMethods, OptionalExtension, QueryDsl, QueryResult,
+    pg::{Pg, sql_types},
     query_builder::{AstPass, QueryFragment, QueryId},
     sql_query,
     sql_types::{BigInt, Binary, Bool, Integer, Jsonb, Nullable, Text},
-    ExpressionMethods, OptionalExtension, QueryDsl, QueryResult,
 };
 use diesel_async::RunQueryDsl;
 
 use graph::{
-    anyhow::{anyhow, Context},
-    components::store::{write, StoredDynamicDataSource},
+    anyhow::{Context, anyhow},
+    components::store::{StoredDynamicDataSource, write},
     data_source::CausalityRegion,
     internal_error,
-    prelude::{serde_json, BlockNumber, StoreError},
+    prelude::{BlockNumber, StoreError, serde_json},
 };
 
 use crate::parquet::convert::DataSourceRestoreRow;
 
-use crate::{primary::Namespace, relational_queries::POSTGRES_MAX_PARAMETERS, AsyncPgConnection};
+use crate::{AsyncPgConnection, primary::Namespace, relational_queries::POSTGRES_MAX_PARAMETERS};
 
 type DynTable = diesel_dynamic_schema::Table<String, Namespace>;
 type DynColumn<ST> = diesel_dynamic_schema::Column<DynTable, &'static str, ST>;
@@ -181,10 +181,10 @@ impl DataSourcesTable {
                 // Offchain data sources have a unique causality region assigned from a sequence in the
                 // database, while onchain data sources always have causality region 0.
                 let query = format!(
-                "insert into {}(block_range, manifest_idx, param, context, causality_region, done_at) \
+                    "insert into {}(block_range, manifest_idx, param, context, causality_region, done_at) \
                             values (int4range($1, null), $2, $3, $4, $5, $6)",
-                self.qname
-            );
+                    self.qname
+                );
 
                 let query = sql_query(query)
                     .bind::<Nullable<Integer>, _>(creation_block)
@@ -311,10 +311,10 @@ impl DataSourcesTable {
 
                 if count > 1 {
                     return Err(internal_error!(
-                    "expected to remove at most one offchain data source but would remove {}, causality region: {}",
-                    count,
-                    ds.causality_region
-                ));
+                        "expected to remove at most one offchain data source but would remove {}, causality region: {}",
+                        count,
+                        ds.causality_region
+                    ));
                 }
             }
         }

@@ -3,7 +3,7 @@
 //! Handles extraction of bare ABI arrays from various artifact formats
 //! (raw arrays, Hardhat/Foundry, Truffle).
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 
 /// Normalize ABI JSON to extract the actual ABI array from various artifact formats.
 ///
@@ -22,16 +22,18 @@ pub fn normalize_abi_json(abi_str: &str) -> Result<serde_json::Value> {
 
     // Case 2: Object with "abi" field (Foundry/Hardhat format)
     if let Some(abi) = value.get("abi")
-        && abi.is_array() {
-            return Ok(abi.clone());
-        }
+        && abi.is_array()
+    {
+        return Ok(abi.clone());
+    }
 
     // Case 3: Object with "compilerOutput.abi" field (Truffle format)
     if let Some(compiler_output) = value.get("compilerOutput")
         && let Some(abi) = compiler_output.get("abi")
-            && abi.is_array() {
-                return Ok(abi.clone());
-            }
+        && abi.is_array()
+    {
+        return Ok(abi.clone());
+    }
 
     Err(anyhow!(
         "Invalid ABI format: expected an array or an object with 'abi' field"
@@ -89,9 +91,11 @@ mod tests {
         let invalid_abi = r#"{"contractName": "MyContract"}"#;
         let result = normalize_abi_json(invalid_abi);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Invalid ABI format"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Invalid ABI format")
+        );
     }
 }

@@ -1,13 +1,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::anyhow;
 use anyhow::Error;
+use anyhow::anyhow;
 use bytes::Bytes;
 use graph::futures03::future::BoxFuture;
 use graph::ipfs::{ContentPath, IpfsClient, IpfsContext, RetryPolicy};
 use graph::{derive::CheapClone, prelude::CheapClone};
-use tower::{buffer::Buffer, ServiceBuilder, ServiceExt};
+use tower::{ServiceBuilder, ServiceExt, buffer::Buffer};
 
 pub type IpfsService = Buffer<IpfsRequest, BoxFuture<'static, Result<Option<Bytes>, Error>>>;
 
@@ -109,10 +109,10 @@ mod test {
     use graph::ipfs::{IpfsContext, IpfsMetrics, IpfsRpcClient, ServerAddress};
     use graph::log::discard;
     use tower::ServiceExt;
-    use wiremock::matchers as m;
     use wiremock::Mock;
     use wiremock::MockServer;
     use wiremock::ResponseTemplate;
+    use wiremock::matchers as m;
 
     use super::*;
 

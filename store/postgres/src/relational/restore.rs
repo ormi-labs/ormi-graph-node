@@ -20,6 +20,7 @@ use graph::prelude::{BlockPtr as GraphBlockPtr, StoreError};
 use graph::schema::{EntityType, InputSchema};
 use graph::semver::Version;
 
+use crate::AsyncPgConnection;
 use crate::catalog;
 use crate::deployment::create_deployment;
 use crate::dynds::DataSourcesTable;
@@ -32,7 +33,6 @@ use crate::relational::dump::{Metadata, TableInfo};
 use crate::relational::{Layout, Table, VID_COLUMN};
 use crate::relational_queries::InsertQuery;
 use crate::vid_batcher::VidRange;
-use crate::AsyncPgConnection;
 
 const DATA_SOURCES_TABLE: &str = "data_sources$";
 
@@ -429,16 +429,17 @@ pub async fn finalize(
 
     // 2. Reset data_sources$ vid sequence if present
     if let Some(ds_info) = metadata.tables.get(DATA_SOURCES_TABLE)
-        && ds_info.max_vid >= 0 {
-            let qualified = format!("\"{nsp}\".\"{DATA_SOURCES_TABLE}\"");
-            let query = format!(
-                "SELECT setval(pg_get_serial_sequence('{qualified}', 'vid'), {})",
-                ds_info.max_vid
-            );
-            conn.batch_execute(&query).await.map_err(|e| {
-                StoreError::InternalError(format!("reset data_sources$ vid seq: {e}"))
-            })?;
-        }
+        && ds_info.max_vid >= 0
+    {
+        let qualified = format!("\"{nsp}\".\"{DATA_SOURCES_TABLE}\"");
+        let query = format!(
+            "SELECT setval(pg_get_serial_sequence('{qualified}', 'vid'), {})",
+            ds_info.max_vid
+        );
+        conn.batch_execute(&query)
+            .await
+            .map_err(|e| StoreError::InternalError(format!("reset data_sources$ vid seq: {e}")))?;
+    }
 
     // 3. Update earliest_block_number (may differ from start_block after
     //    pruning) and set the head block pointer. Setting the head block

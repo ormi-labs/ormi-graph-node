@@ -92,8 +92,8 @@ impl UnifiedMappingApiVersion {
     pub(super) fn try_from_versions(
         versions: impl Iterator<Item = Version>,
     ) -> Result<Self, DifferentMappingApiVersions> {
-        use super::manifest_validation::validate_api_versions;
         use super::SubgraphManifestValidationError;
+        use super::manifest_validation::validate_api_versions;
 
         let versions_vec: Vec<Version> = versions.collect();
 

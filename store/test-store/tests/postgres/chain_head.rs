@@ -13,20 +13,20 @@ use std::sync::Arc;
 
 use graph::cheap_clone::CheapClone;
 use graph::prelude::alloy;
-use graph::prelude::{anyhow::anyhow, anyhow::Error};
 use graph::prelude::{BlockNumber, QueryStoreManager, QueryTarget};
+use graph::prelude::{anyhow::Error, anyhow::anyhow};
 use graph::{components::store::BlockStore as _, prelude::DeploymentHash};
 use graph::{
     components::store::ChainHeadStore as _, components::store::ChainStore as _,
     prelude::EthereumCallCache as _,
 };
 use graph_store_postgres::Store as DieselStore;
-use graph_store_postgres::{layout_for_tests::FAKE_NETWORK_SHARED, ChainStore as DieselChainStore};
+use graph_store_postgres::{ChainStore as DieselChainStore, layout_for_tests::FAKE_NETWORK_SHARED};
 
 use test_store::block_store::{
-    FakeBlock, FakeBlockList, BLOCK_FIVE, BLOCK_FIVE_AFTER_SKIP, BLOCK_FOUR,
-    BLOCK_FOUR_SKIPPED_2_AND_3, BLOCK_ONE, BLOCK_ONE_NO_PARENT, BLOCK_ONE_SIBLING, BLOCK_THREE,
-    BLOCK_THREE_NO_PARENT, BLOCK_TWO, BLOCK_TWO_NO_PARENT, GENESIS_BLOCK, NO_PARENT,
+    BLOCK_FIVE, BLOCK_FIVE_AFTER_SKIP, BLOCK_FOUR, BLOCK_FOUR_SKIPPED_2_AND_3, BLOCK_ONE,
+    BLOCK_ONE_NO_PARENT, BLOCK_ONE_SIBLING, BLOCK_THREE, BLOCK_THREE_NO_PARENT, BLOCK_TWO,
+    BLOCK_TWO_NO_PARENT, FakeBlock, FakeBlockList, GENESIS_BLOCK, NO_PARENT,
 };
 use test_store::*;
 

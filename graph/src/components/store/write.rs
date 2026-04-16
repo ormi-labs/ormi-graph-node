@@ -7,7 +7,7 @@ use std::{
 use slog::Logger;
 
 use crate::{
-    blockchain::{block_stream::FirehoseCursor, BlockPtr, BlockTime},
+    blockchain::{BlockPtr, BlockTime, block_stream::FirehoseCursor},
     cheap_clone::CheapClone,
     components::subgraph::Entity,
     data::{store::Id, subgraph::schema::SubgraphError},
@@ -202,7 +202,7 @@ impl EntityModification {
                     "can not clamp block range for removal of {:?} to {}",
                     self,
                     block
-                ))
+                ));
             }
         }
         Ok(())
@@ -422,9 +422,10 @@ impl RowGroup {
                 } else {
                     None
                 }
-            }) {
-                return Some(op);
-            }
+            })
+        {
+            return Some(op);
+        }
         // We are looking for the change at a block `at` that is before the
         // change we remember in `last_mod`, and therefore have to scan
         // through all changes
@@ -490,9 +491,12 @@ impl RowGroup {
                             if self.entity_type.skip_duplicates() {
                                 return Ok(());
                             }
-                            return Err(StoreError::Input(
-                                format!("entity {} is immutable; inserting it at block {} is not possible as it was already inserted at block {}",
-                                        row.key(), row.block(), prev.block())));
+                            return Err(StoreError::Input(format!(
+                                "entity {} is immutable; inserting it at block {} is not possible as it was already inserted at block {}",
+                                row.key(),
+                                row.block(),
+                                prev.block()
+                            )));
                         }
                         _ => { /* nothing to check */ }
                     }
@@ -547,7 +551,7 @@ impl RowGroup {
                         "impossible combination of entity operations: {:?} and then {:?}",
                         prev_row,
                         row
-                    ))
+                    ));
                 }
                 (Remove { .. }, Remove { .. }) => {
                     // Ignore the new row, since prev_row is already a
@@ -834,7 +838,11 @@ impl Batch {
 
     fn append_inner(&mut self, mut batch: Batch) -> Result<(), StoreError> {
         if batch.block_ptr.number <= self.block_ptr.number {
-            return Err(internal_error!("Batches must go forward. Can't append a batch with block pointer {} to one with block pointer {}", batch.block_ptr, self.block_ptr));
+            return Err(internal_error!(
+                "Batches must go forward. Can't append a batch with block pointer {} to one with block pointer {}",
+                batch.block_ptr,
+                self.block_ptr
+            ));
         }
 
         self.block_ptr = batch.block_ptr;
@@ -1047,7 +1055,7 @@ mod test {
 
     use crate::{
         components::store::{
-            write::EntityModification, write::EntityOp, BlockNumber, EntityType, StoreError,
+            BlockNumber, EntityType, StoreError, write::EntityModification, write::EntityOp,
         },
         data::{store::Id, value::Word},
         entity,

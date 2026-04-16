@@ -5,7 +5,7 @@
 
 use std::path::Path;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use semver::Version;
 
 /// Get the installed graph-ts version by searching node_modules.

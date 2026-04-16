@@ -5,13 +5,13 @@
 
 use std::path::PathBuf;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 use url::Url;
 
 use crate::commands::auth::get_deploy_key;
-use crate::commands::build::{run_build, BuildOpt};
-use crate::output::{step, Step};
+use crate::commands::build::{BuildOpt, run_build};
+use crate::output::{Step, step};
 use crate::services::GraphNodeClient;
 
 /// Default IPFS URL used by The Graph

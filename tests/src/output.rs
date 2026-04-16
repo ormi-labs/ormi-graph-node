@@ -4,7 +4,7 @@
 //! to `tests/runner-tests.log` while progress messages appear on the console.
 //! In CI (detected via `GITHUB_ACTIONS` env var), all output goes to the console.
 
-use slog::{o, Drain, Logger};
+use slog::{Drain, Logger, o};
 use std::fs::File;
 use std::io::{self, Write};
 use std::path::PathBuf;

@@ -2,11 +2,11 @@
 //! shard. Anything in this module can only be used with a database connection
 //! for the primary shard.
 use crate::{
+    AsyncPgConnection, ConnectionPool, ForeignServer, NotificationSender,
     block_range::UNVERSIONED_RANGE,
     detail::DeploymentDetail,
-    pool::{PermittedConnection, PRIMARY_PUBLIC},
-    subgraph_store::{unused, Shard, PRIMARY_SHARD},
-    AsyncPgConnection, ConnectionPool, ForeignServer, NotificationSender,
+    pool::{PRIMARY_PUBLIC, PermittedConnection},
+    subgraph_store::{PRIMARY_SHARD, Shard, unused},
 };
 use diesel::dsl::{delete, insert_into, sql, update};
 use diesel::prelude::{
@@ -22,23 +22,23 @@ use diesel::{
     sql_types::{Array, BigInt, Bool, Integer, Text},
 };
 use diesel_async::{
-    scoped_futures::{ScopedBoxFuture, ScopedFutureExt},
     RunQueryDsl, SimpleAsyncConnection as _, TransactionManager,
+    scoped_futures::{ScopedBoxFuture, ScopedFutureExt},
 };
 use graph::{
     components::store::DeploymentLocator,
     data::{
         store::scalar::ToPrimitive,
-        subgraph::{status, DeploymentFeatures},
+        subgraph::{DeploymentFeatures, status},
     },
     derive::CheapClone,
-    futures03::{future::BoxFuture, FutureExt},
+    futures03::{FutureExt, future::BoxFuture},
     internal_error,
     prelude::{
-        anyhow,
+        AssignmentChange, DeploymentHash, NodeId, StoreError, SubgraphName,
+        SubgraphVersionSwitchingMode, anyhow,
         chrono::{DateTime, Utc},
-        serde_json, AssignmentChange, DeploymentHash, NodeId, StoreError, SubgraphName,
-        SubgraphVersionSwitchingMode,
+        serde_json,
     },
 };
 use graph::{
@@ -1006,10 +1006,10 @@ impl Connection {
     where
         F: AsyncFn(&DeploymentHash) -> Result<bool, StoreError>,
     {
+        use SubgraphVersionSwitchingMode::*;
         use subgraph as s;
         use subgraph_deployment_assignment as a;
         use subgraph_version as v;
-        use SubgraphVersionSwitchingMode::*;
 
         let created_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)

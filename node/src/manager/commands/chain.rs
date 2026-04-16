@@ -19,18 +19,18 @@ use graph::{
     components::store::BlockStore as _, components::store::ChainHeadStore as _,
     prelude::anyhow::Error,
 };
-use graph_chain_ethereum::chain::BlockFinality;
 use graph_chain_ethereum::EthereumAdapter;
 use graph_chain_ethereum::EthereumAdapterTrait as _;
-use graph_store_postgres::add_chain;
-use graph_store_postgres::find_chain;
-use graph_store_postgres::update_chain_name;
+use graph_chain_ethereum::chain::BlockFinality;
 use graph_store_postgres::BlockStore;
 use graph_store_postgres::ChainStore;
 use graph_store_postgres::PoolCoordinator;
 use graph_store_postgres::ScopedFutureExt;
 use graph_store_postgres::Shard;
-use graph_store_postgres::{command_support::catalog::block_store, ConnectionPool};
+use graph_store_postgres::add_chain;
+use graph_store_postgres::find_chain;
+use graph_store_postgres::update_chain_name;
+use graph_store_postgres::{ConnectionPool, command_support::catalog::block_store};
 
 use crate::network_setup::Networks;
 

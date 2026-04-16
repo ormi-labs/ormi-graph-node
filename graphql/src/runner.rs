@@ -9,11 +9,11 @@ use crate::query::execute_query;
 use graph::data::query::{CacheStatus, SqlQueryReq};
 use graph::data::store::SqlQueryObject;
 use graph::futures03::future;
-use graph::prelude::{
-    o, CheapClone, DeploymentState, GraphQLMetrics as GraphQLMetricsTrait,
-    GraphQlRunner as GraphQlRunnerTrait, Logger, Query, QueryExecutionError, ENV_VARS,
-};
 use graph::prelude::{ApiVersion, MetricsRegistry};
+use graph::prelude::{
+    CheapClone, DeploymentState, ENV_VARS, GraphQLMetrics as GraphQLMetricsTrait,
+    GraphQlRunner as GraphQlRunnerTrait, Logger, Query, QueryExecutionError, o,
+};
 use graph::{data::graphql::load_manager::LoadManager, prelude::QueryStoreManager};
 use graph::{
     data::query::{LatestBlockInfo, QueryResults, QueryTarget},

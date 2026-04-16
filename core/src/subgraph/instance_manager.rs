@@ -2,10 +2,10 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
 use crate::polling_monitor::{ArweaveService, IpfsService};
+use crate::subgraph::Decoder;
 use crate::subgraph::context::{IndexingContext, SubgraphKeepAlive};
 use crate::subgraph::inputs::IndexingInputs;
 use crate::subgraph::loader::load_dynamic_data_sources;
-use crate::subgraph::Decoder;
 use std::collections::BTreeSet;
 
 use crate::subgraph::runner::SubgraphRunner;
@@ -17,18 +17,18 @@ use graph::components::metrics::gas::GasMetrics;
 use graph::components::metrics::subgraph::DeploymentStatusMetric;
 use graph::components::store::SourceableStore;
 use graph::components::subgraph::ProofOfIndexingVersion;
-use graph::data::subgraph::{UnresolvedSubgraphManifest, SPEC_VERSION_0_0_6};
+use graph::data::subgraph::{SPEC_VERSION_0_0_6, UnresolvedSubgraphManifest};
 use graph::data::value::Word;
 use graph::data_source::causality_region::CausalityRegionSeq;
 use graph::env::EnvVars;
 use graph::prelude::{SubgraphInstanceManager as SubgraphInstanceManagerTrait, *};
 use graph::{blockchain::BlockchainMap, components::store::DeploymentLocator};
-use graph_runtime_wasm::module::ToAscPtr;
 use graph_runtime_wasm::RuntimeHostBuilder;
+use graph_runtime_wasm::module::ToAscPtr;
 use tokio::task;
 
-use super::context::OffchainMonitor;
 use super::SubgraphTriggerProcessor;
+use super::context::OffchainMonitor;
 use crate::{subgraph::runner::SubgraphRunnerError, subgraph_manifest};
 
 #[derive(Clone)]
@@ -279,16 +279,17 @@ impl<S: SubgraphStore, AC: amp::Client> SubgraphInstanceManager<S, AC> {
         );
 
         if let Some(graft) = &manifest.graft
-            && self.subgraph_store.is_deployed(&graft.base).await? {
-                // Makes sure the raw manifest is cached in the subgraph store
-                let _raw_manifest = subgraph_manifest::load_raw_subgraph_manifest(
-                    &logger,
-                    &*self.subgraph_store,
-                    &*self.link_resolver,
-                    &graft.base,
-                )
-                .await?;
-            }
+            && self.subgraph_store.is_deployed(&graft.base).await?
+        {
+            // Makes sure the raw manifest is cached in the subgraph store
+            let _raw_manifest = subgraph_manifest::load_raw_subgraph_manifest(
+                &logger,
+                &*self.subgraph_store,
+                &*self.link_resolver,
+                &graft.base,
+            )
+            .await?;
+        }
 
         info!(logger, "Resolve subgraph files using IPFS";
             "n_data_sources" => manifest.data_sources.len(),

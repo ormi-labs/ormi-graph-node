@@ -211,48 +211,50 @@ impl SchemaCodeGenerator {
         // First pass: collect entity names and their ID types
         for def in &document.definitions {
             if let Definition::TypeDefinition(TypeDefinition::Object(obj)) = def
-                && is_entity_type(obj) {
-                    entity_names.insert(obj.name.clone());
-                    let id_field = obj.fields.iter().find(|f| f.name == "id");
-                    let id_kind = id_field
-                        .map(|f| IdFieldKind::from_type_name(&get_base_type_name(&f.field_type)))
-                        .unwrap_or(IdFieldKind::String);
-                    entity_id_kinds.insert(obj.name.clone(), id_kind);
-                }
+                && is_entity_type(obj)
+            {
+                entity_names.insert(obj.name.clone());
+                let id_field = obj.fields.iter().find(|f| f.name == "id");
+                let id_kind = id_field
+                    .map(|f| IdFieldKind::from_type_name(&get_base_type_name(&f.field_type)))
+                    .unwrap_or(IdFieldKind::String);
+                entity_id_kinds.insert(obj.name.clone(), id_kind);
+            }
         }
 
         // Second pass: collect entity info
         for def in &document.definitions {
             if let Definition::TypeDefinition(TypeDefinition::Object(obj)) = def
-                && is_entity_type(obj) {
-                    let name = obj.name.clone();
+                && is_entity_type(obj)
+            {
+                let name = obj.name.clone();
 
-                    // Find ID field
-                    let id_field = obj.fields.iter().find(|f| f.name == "id");
-                    let id_kind = id_field
-                        .map(|f| IdFieldKind::from_type_name(&get_base_type_name(&f.field_type)))
-                        .unwrap_or(IdFieldKind::String);
+                // Find ID field
+                let id_field = obj.fields.iter().find(|f| f.name == "id");
+                let id_kind = id_field
+                    .map(|f| IdFieldKind::from_type_name(&get_base_type_name(&f.field_type)))
+                    .unwrap_or(IdFieldKind::String);
 
-                    // Collect field info
-                    let fields: Vec<_> = obj
-                        .fields
-                        .iter()
-                        .map(|f| FieldInfo {
-                            name: f.name.clone(),
-                            is_derived: is_derived_field(f),
-                            base_type: get_base_type_name(&f.field_type),
-                            is_nullable: is_nullable(&f.field_type),
-                            list_depth: list_depth(&f.field_type),
-                            member_nullable: is_list_member_nullable(&f.field_type),
-                        })
-                        .collect();
+                // Collect field info
+                let fields: Vec<_> = obj
+                    .fields
+                    .iter()
+                    .map(|f| FieldInfo {
+                        name: f.name.clone(),
+                        is_derived: is_derived_field(f),
+                        base_type: get_base_type_name(&f.field_type),
+                        is_nullable: is_nullable(&f.field_type),
+                        list_depth: list_depth(&f.field_type),
+                        member_nullable: is_list_member_nullable(&f.field_type),
+                    })
+                    .collect();
 
-                    entities.push(EntityInfo {
-                        name,
-                        id_kind,
-                        fields,
-                    });
-                }
+                entities.push(EntityInfo {
+                    name,
+                    id_kind,
+                    fields,
+                });
+            }
         }
 
         // Validate: non-nullable lists must have non-nullable members
@@ -711,7 +713,7 @@ enum StoreMethod {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     use graphql_tools::parser::parse_schema;
 
     #[test]

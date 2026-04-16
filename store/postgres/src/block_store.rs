@@ -4,13 +4,13 @@ use graph::{components::store::BLOCK_CACHE_SIZE, parking_lot::RwLock};
 
 use anyhow::anyhow;
 use async_trait::async_trait;
-use diesel::{sql_query, ExpressionMethods as _, QueryDsl};
-use diesel_async::{scoped_futures::ScopedFutureExt, RunQueryDsl};
+use diesel::{ExpressionMethods as _, QueryDsl, sql_query};
+use diesel_async::{RunQueryDsl, scoped_futures::ScopedFutureExt};
 use graph::{
     blockchain::ChainIdentifier,
     components::store::{BlockStore as BlockStoreTrait, QueryPermit},
     derive::CheapClone,
-    prelude::{error, info, warn, BlockNumber, BlockPtr, Logger, ENV_VARS},
+    prelude::{BlockNumber, BlockPtr, ENV_VARS, Logger, error, info, warn},
     slog::o,
 };
 use graph::{
@@ -21,11 +21,11 @@ use graph::{internal_error, prelude::CheapClone};
 use graph::{prelude::StoreError, util::timed_cache::TimedCache};
 
 use crate::{
+    AsyncPgConnection, ChainStore, NotificationSender, PRIMARY_SHARD, Shard,
     chain_head_listener::ChainHeadUpdateSender,
     chain_store::{ChainStoreMetrics, Storage},
     pool::ConnectionPool,
     primary::Mirror as PrimaryMirror,
-    AsyncPgConnection, ChainStore, NotificationSender, Shard, PRIMARY_SHARD,
 };
 
 use self::primary::Chain;
@@ -40,7 +40,7 @@ const SUPPORTED_DB_VERSION: i64 = 3;
 pub mod primary {
     use std::convert::TryFrom;
 
-    use diesel::{delete, insert_into, update, ExpressionMethods, OptionalExtension, QueryDsl};
+    use diesel::{ExpressionMethods, OptionalExtension, QueryDsl, delete, insert_into, update};
     use diesel_async::RunQueryDsl;
     use graph::{
         blockchain::{BlockHash, ChainIdentifier},
@@ -48,7 +48,7 @@ pub mod primary {
         prelude::StoreError,
     };
 
-    use crate::{chain_store::Storage, AsyncPgConnection};
+    use crate::{AsyncPgConnection, chain_store::Storage};
     use crate::{ConnectionPool, Shard};
 
     table! {

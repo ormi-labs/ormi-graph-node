@@ -3,8 +3,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use super::{
-    test_ptr, CommonChainConfig, MutexBlockStreamBuilder, NoopAdapterSelector,
-    NoopRuntimeAdapterBuilder, StaticBlockRefetcher, StaticStreamBuilder, Stores, TestChain,
+    CommonChainConfig, MutexBlockStreamBuilder, NoopAdapterSelector, NoopRuntimeAdapterBuilder,
+    StaticBlockRefetcher, StaticStreamBuilder, Stores, TestChain, test_ptr,
 };
 use graph::abi;
 use graph::blockchain::block_stream::BlockWithTriggers;
@@ -16,17 +16,17 @@ use graph::data_source::subgraph;
 use graph::prelude::alloy::primitives::{Address, B256, U256};
 use graph::prelude::alloy::rpc::types::BlockTransactions;
 use graph::prelude::{
-    create_dummy_transaction, create_minimal_block_for_test, tiny_keccak, DeploymentHash, Entity,
-    LightEthereumBlock, ENV_VARS,
+    DeploymentHash, ENV_VARS, Entity, LightEthereumBlock, create_dummy_transaction,
+    create_minimal_block_for_test, tiny_keccak,
 };
 use graph::schema::EntityType;
 use graph_chain_ethereum::network::EthereumNetworkAdapters;
 use graph_chain_ethereum::trigger::LogRef;
+use graph_chain_ethereum::{Chain, chain::ChainSettings};
 use graph_chain_ethereum::{
     chain::BlockFinality,
     trigger::{EthereumBlockTriggerType, EthereumTrigger},
 };
-use graph_chain_ethereum::{chain::ChainSettings, Chain};
 
 pub async fn chain(
     test_name: &str,

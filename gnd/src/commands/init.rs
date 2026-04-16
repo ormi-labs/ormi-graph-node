@@ -13,20 +13,20 @@ use std::fs;
 use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use clap::{Parser, ValueEnum};
 use graphql_tools::parser::schema as gql;
 
-use crate::commands::add::{run_add, AddOpt};
-use crate::commands::codegen::{run_codegen, CodegenOpt};
+use crate::commands::add::{AddOpt, run_add};
+use crate::commands::codegen::{CodegenOpt, run_codegen};
 use crate::config::networks::update_networks_file;
-use crate::output::{step, with_spinner, Step};
+use crate::output::{Step, step, with_spinner};
 use crate::prompt::{
-    get_subgraph_basename, prompt_add_another_contract, prompt_contract_address,
-    prompt_contract_name, prompt_directory_with_confirm, prompt_start_block,
-    prompt_subgraph_slug_with_confirm, resolve_directory_collision, InitForm, SourceType,
+    InitForm, SourceType, get_subgraph_basename, prompt_add_another_contract,
+    prompt_contract_address, prompt_contract_name, prompt_directory_with_confirm,
+    prompt_start_block, prompt_subgraph_slug_with_confirm, resolve_directory_collision,
 };
-use crate::scaffold::{generate_scaffold, init_git, install_dependencies, ScaffoldOptions};
+use crate::scaffold::{ScaffoldOptions, generate_scaffold, init_git, install_dependencies};
 use crate::services::{ContractInfo, ContractService, IpfsClient, NetworksRegistry};
 
 /// Available protocols for subgraph development.
@@ -386,9 +386,10 @@ async fn init_from_contract(opt: &InitOpt, prefetched: Option<ContractInfo>) -> 
 
     // Install dependencies unless skipped
     if !opt.skip_install
-        && let Err(e) = install_dependencies(&directory) {
-            eprintln!("Warning: {}", e);
-        }
+        && let Err(e) = install_dependencies(&directory)
+    {
+        eprintln!("Warning: {}", e);
+    }
 
     // Run codegen to generate types (requires dependencies to be installed)
     if !opt.skip_install {
@@ -573,9 +574,10 @@ fn init_from_example(opt: &InitOpt) -> Result<()> {
 
     // Install dependencies unless skipped
     if !opt.skip_install
-        && let Err(e) = install_dependencies(&directory) {
-            eprintln!("Warning: {}", e);
-        }
+        && let Err(e) = install_dependencies(&directory)
+    {
+        eprintln!("Warning: {}", e);
+    }
 
     // Run codegen unless install was skipped (codegen requires dependencies)
     if !opt.skip_install {
@@ -867,7 +869,9 @@ fn print_next_steps(subgraph_name: &str, directory: &Path) {
     println!();
     println!("  3. Run `yarn deploy` to deploy the subgraph.");
     println!();
-    println!("Make sure to visit the documentation on https://thegraph.com/docs/ for further information.");
+    println!(
+        "Make sure to visit the documentation on https://thegraph.com/docs/ for further information."
+    );
 }
 
 /// Initialize a subgraph from an existing deployed subgraph.
@@ -907,14 +911,15 @@ async fn init_from_subgraph(opt: &InitOpt) -> Result<()> {
 
     // Validate network matches
     if let Some(manifest_network) = extract_network(&manifest)
-        && manifest_network != network {
-            return Err(anyhow!(
-                "Network mismatch: The source subgraph is indexing '{}', but you specified '{}'.\n\
+        && manifest_network != network
+    {
+        return Err(anyhow!(
+            "Network mismatch: The source subgraph is indexing '{}', but you specified '{}'.\n\
                  When composing subgraphs, they must index the same network.",
-                manifest_network,
-                network
-            ));
-        }
+            manifest_network,
+            network
+        ));
+    }
 
     // Get start block from manifest if not provided
     let start_block = opt
@@ -997,9 +1002,10 @@ async fn init_from_subgraph(opt: &InitOpt) -> Result<()> {
 
     // Install dependencies unless skipped
     if !opt.skip_install
-        && let Err(e) = install_dependencies(&directory) {
-            eprintln!("Warning: {}", e);
-        }
+        && let Err(e) = install_dependencies(&directory)
+    {
+        eprintln!("Warning: {}", e);
+    }
 
     step(
         Step::Done,
@@ -1094,9 +1100,10 @@ fn is_immutable_entity(obj: &gql::ObjectType<String>) -> bool {
         if directive.name == "entity" {
             for (name, value) in &directive.arguments {
                 if name == "immutable"
-                    && let gql::Value::Boolean(true) = value {
-                        return true;
-                    }
+                    && let gql::Value::Boolean(true) = value
+                {
+                    return true;
+                }
             }
         }
     }
@@ -1418,9 +1425,10 @@ mod tests {
         let ast = gql::parse_schema::<String>(schema).unwrap();
         for def in ast.definitions {
             if let gql::Definition::TypeDefinition(gql::TypeDefinition::Object(obj)) = def
-                && obj.name == "Transfer" {
-                    assert!(is_immutable_entity(&obj));
-                }
+                && obj.name == "Transfer"
+            {
+                assert!(is_immutable_entity(&obj));
+            }
         }
 
         // Non-immutable entity
@@ -1433,9 +1441,10 @@ mod tests {
         let ast = gql::parse_schema::<String>(schema).unwrap();
         for def in ast.definitions {
             if let gql::Definition::TypeDefinition(gql::TypeDefinition::Object(obj)) = def
-                && obj.name == "Account" {
-                    assert!(!is_immutable_entity(&obj));
-                }
+                && obj.name == "Account"
+            {
+                assert!(!is_immutable_entity(&obj));
+            }
         }
     }
 }

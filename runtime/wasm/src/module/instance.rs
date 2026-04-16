@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 use std::time::Instant;
 
 use anyhow::Error;
-use graph::futures03::future::BoxFuture;
 use graph::futures03::FutureExt as _;
+use graph::futures03::future::BoxFuture;
 use graph::slog::SendSyncRefUnwindSafeKV;
 
 use semver::Version;
@@ -15,21 +15,20 @@ use graph::data::subgraph::schema::SubgraphError;
 use graph::data_source::{MappingTrigger, TriggerWithHandler};
 use graph::prelude::*;
 use graph::runtime::{
-    asc_new,
+    HostExportError, asc_new,
     gas::{Gas, GasCounter, SaturatingInto},
-    HostExportError,
 };
 use graph::{components::subgraph::MappingError, runtime::AscPtr};
 
 use super::IntoWasmRet;
 use super::{IntoTrap, WasmInstanceContext};
+use crate::ExperimentalFeatures;
 use crate::error::DeterminismLevel;
 use crate::mapping::MappingContext;
 use crate::mapping::ValidModule;
 use crate::module::WasmInstanceData;
-use crate::ExperimentalFeatures;
 
-use super::{is_trap_deterministic, AscHeapCtx, ToAscPtr};
+use super::{AscHeapCtx, ToAscPtr, is_trap_deterministic};
 
 /// Handle to a WASM instance, which is terminated if and only if this is dropped.
 pub struct WasmInstance {
@@ -43,11 +42,11 @@ pub struct WasmInstance {
 #[cfg(debug_assertions)]
 mod impl_for_tests {
     use graph::runtime::{
-        asc_new, AscIndexId, AscPtr, AscType, DeterministicHostError, FromAscObj, HostExportError,
-        ToAscObj,
+        AscIndexId, AscPtr, AscType, DeterministicHostError, FromAscObj, HostExportError, ToAscObj,
+        asc_new,
     };
 
-    use crate::module::{asc_get, WasmInstanceContext};
+    use crate::module::{WasmInstanceContext, asc_get};
 
     impl super::WasmInstance {
         pub fn asc_get<T, P>(&mut self, asc_ptr: AscPtr<P>) -> Result<T, DeterministicHostError>

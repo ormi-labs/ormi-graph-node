@@ -27,8 +27,8 @@ use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt;
 use std::fmt::Display;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -43,8 +43,8 @@ use crate::data_source::CausalityRegion;
 use crate::derive::CheapClone;
 use crate::env::ENV_VARS;
 use crate::internal_error;
-use crate::prelude::{s, Attribute, DeploymentHash, ValueType};
-use crate::schema::{ast as sast, EntityKey, EntityType, InputSchema};
+use crate::prelude::{Attribute, DeploymentHash, ValueType, s};
+use crate::schema::{EntityKey, EntityType, InputSchema, ast as sast};
 use crate::util::stats::AtomicMovingStats;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -522,27 +522,28 @@ impl EntityQuery {
         // entities, we can simplify the query by changing the filter and
         // getting rid of the window
         if let EntityCollection::Window(windows) = &self.collection
-            && windows.len() == 1 {
-                let window = windows.first().expect("we just checked");
-                if window.ids.len() == 1 {
-                    let id = window.ids.first().expect("we just checked").to_value();
-                    if let EntityLink::Direct(attribute, _) = &window.link {
-                        let filter = match attribute {
-                            WindowAttribute::Scalar(name) => {
-                                EntityFilter::Equal(name.clone(), id.into())
-                            }
-                            WindowAttribute::List(name) => {
-                                EntityFilter::Contains(name.clone(), Value::from(vec![id]))
-                            }
-                        };
-                        self.filter = Some(filter.and_maybe(self.filter));
-                        self.collection = EntityCollection::All(vec![(
-                            window.child_type.clone(),
-                            window.column_names.clone(),
-                        )]);
-                    }
+            && windows.len() == 1
+        {
+            let window = windows.first().expect("we just checked");
+            if window.ids.len() == 1 {
+                let id = window.ids.first().expect("we just checked").to_value();
+                if let EntityLink::Direct(attribute, _) = &window.link {
+                    let filter = match attribute {
+                        WindowAttribute::Scalar(name) => {
+                            EntityFilter::Equal(name.clone(), id.into())
+                        }
+                        WindowAttribute::List(name) => {
+                            EntityFilter::Contains(name.clone(), Value::from(vec![id]))
+                        }
+                    };
+                    self.filter = Some(filter.and_maybe(self.filter));
+                    self.collection = EntityCollection::All(vec![(
+                        window.child_type.clone(),
+                        window.column_names.clone(),
+                    )]);
                 }
             }
+        }
         self
     }
 }

@@ -2,13 +2,13 @@ use crate::config::{ChainSettings as ConfigChainSettings, Config, ProviderDetail
 use crate::network_setup::{
     AdapterConfiguration, EthAdapterConfig, FirehoseAdapterConfig, Networks,
 };
+use ethereum::ProviderEthRpcMetrics;
 use ethereum::chain::ChainSettings;
 use ethereum::chain::{
     EthereumAdapterSelector, EthereumBlockRefetcher, EthereumRuntimeAdapterBuilder,
     EthereumStreamBuilder,
 };
 use ethereum::network::EthereumNetworkAdapter;
-use ethereum::ProviderEthRpcMetrics;
 use graph::anyhow::bail;
 use graph::blockchain::client::ChainClient;
 use graph::blockchain::{BlockchainKind, BlockchainMap, ChainIdentifier};
@@ -16,14 +16,14 @@ use graph::cheap_clone::CheapClone;
 use graph::components::network_provider::ChainName;
 use graph::components::store::BlockStore as _;
 use graph::endpoint::EndpointMetrics;
-use graph::env::{EnvVars, ENV_VARS};
+use graph::env::{ENV_VARS, EnvVars};
 use graph::firehose::FirehoseEndpoint;
 use graph::futures03::future::try_join_all;
 use graph::itertools::Itertools;
 use graph::log::factory::LoggerFactory;
-use graph::prelude::anyhow;
 use graph::prelude::MetricsRegistry;
-use graph::slog::{debug, info, o, warn, Logger};
+use graph::prelude::anyhow;
+use graph::slog::{Logger, debug, info, o, warn};
 use graph::url::Url;
 use graph_chain_ethereum::{self as ethereum, Transport};
 use graph_store_postgres::{BlockStore, ChainHeadUpdateListener};
@@ -356,7 +356,12 @@ pub async fn networks_as_chains(
                 {
                     Ok(Ok(ident)) => ident,
                     err => {
-                        warn!(&logger, "unable to fetch genesis for {}. Err: {:?}.falling back to the default value", chain_id, err);
+                        warn!(
+                            &logger,
+                            "unable to fetch genesis for {}. Err: {:?}.falling back to the default value",
+                            chain_id,
+                            err
+                        );
                         ChainIdentifier::default()
                     }
                 };

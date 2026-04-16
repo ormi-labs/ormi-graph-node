@@ -5,4 +5,4 @@
 
 pub mod sanitize;
 
-pub use sanitize::{capitalize, handle_reserved_word, RESERVED_WORDS};
+pub use sanitize::{RESERVED_WORDS, capitalize, handle_reserved_word};

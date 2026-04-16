@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use anyhow::anyhow;
-use http::uri::Scheme;
 use http::Uri;
+use http::uri::Scheme;
 
 use crate::derive::CheapClone;
 use crate::ipfs::IpfsError;

@@ -5,8 +5,8 @@ use diesel_async::{AsyncConnection as _, RunQueryDsl, SimpleAsyncConnection};
 use tokio::task::JoinHandle;
 
 use graph::anyhow::Context;
-use graph::blockchain::block_stream::{EntitySourceOperation, FirehoseCursor};
 use graph::blockchain::BlockTime;
+use graph::blockchain::block_stream::{EntitySourceOperation, FirehoseCursor};
 use graph::components::store::write::RowGroup;
 use graph::components::store::{
     Batch, DeploymentLocator, DerivedEntityQuery, DumpReporter, PrunePhase, PruneReporter,
@@ -17,7 +17,7 @@ use graph::components::versions::VERSIONS;
 use graph::data::graphql::IntoValue;
 use graph::data::query::Trace;
 use graph::data::store::{IdList, SqlQueryObject};
-use graph::data::subgraph::{status, SPEC_VERSION_0_0_6};
+use graph::data::subgraph::{SPEC_VERSION_0_0_6, status};
 use graph::data_source::CausalityRegion;
 use graph::derive::CheapClone;
 use graph::futures03::FutureExt;
@@ -33,7 +33,7 @@ use std::ops::Bound;
 use std::ops::{Deref, Range};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::{atomic::AtomicUsize, Arc, Mutex};
+use std::sync::{Arc, Mutex, atomic::AtomicUsize};
 use std::time::{Duration, Instant};
 
 use graph::components::store::EntityCollection;
@@ -41,9 +41,9 @@ use graph::components::subgraph::{ProofOfIndexingFinisher, ProofOfIndexingVersio
 use graph::data::subgraph::schema::{DeploymentCreate, SubgraphError};
 use graph::internal_error;
 use graph::prelude::{
-    anyhow, debug, info, o, warn, AttributeNames, BlockNumber, BlockPtr, CheapClone,
-    DeploymentHash, DeploymentState, Entity, EntityQuery, Error, Logger, QueryExecutionError,
-    StopwatchMetrics, StoreError, UnfailOutcome, Value, ENV_VARS,
+    AttributeNames, BlockNumber, BlockPtr, CheapClone, DeploymentHash, DeploymentState, ENV_VARS,
+    Entity, EntityQuery, Error, Logger, QueryExecutionError, StopwatchMetrics, StoreError,
+    UnfailOutcome, Value, anyhow, debug, info, o, warn,
 };
 use graph::schema::{ApiSchema, EntityKey, EntityType, InputSchema};
 
@@ -53,10 +53,10 @@ use crate::detail::ErrorDetail;
 use crate::dynds::DataSourcesTable;
 use crate::primary::{DeploymentId, Primary};
 use crate::relational::index::{CreateIndex, IndexList, Method};
-use crate::relational::{self, Layout, LayoutCache, SqlName, Table, STATEMENT_TIMEOUT};
+use crate::relational::{self, Layout, LayoutCache, STATEMENT_TIMEOUT, SqlName, Table};
 use crate::relational_queries::{FromEntityData, JSONData};
-use crate::{advisory_lock, catalog, retry, AsyncPgConnection};
-use crate::{detail, ConnectionPool};
+use crate::{AsyncPgConnection, advisory_lock, catalog, retry};
+use crate::{ConnectionPool, detail};
 use crate::{dynds, primary::Site};
 
 /// When connected to read replicas, this allows choosing which DB server to use for an operation.
@@ -1476,7 +1476,10 @@ impl DeploymentStore {
 
         // Confidence check on revert to ensure we go backward only
         if block_ptr_to.number >= deployment_head.number {
-            panic!("revert_block_operations must revert only backward, you are trying to revert forward going from subgraph block {} to new block {}", deployment_head, block_ptr_to);
+            panic!(
+                "revert_block_operations must revert only backward, you are trying to revert forward going from subgraph block {} to new block {}",
+                deployment_head, block_ptr_to
+            );
         }
 
         // Don't revert past a graft point
@@ -1484,16 +1487,17 @@ impl DeploymentStore {
             .subgraph_info_with_conn(&mut conn, site.cheap_clone())
             .await?;
         if let Some(graft_block) = info.graft_block
-            && graft_block > block_ptr_to.number {
-                return Err(internal_error!(
-                    "Can not revert subgraph `{}` to block {} as it was \
+            && graft_block > block_ptr_to.number
+        {
+            return Err(internal_error!(
+                "Can not revert subgraph `{}` to block {} as it was \
                         grafted at block {} and reverting past a graft point \
                         is not possible",
-                    site.deployment.clone(),
-                    block_ptr_to.number,
-                    graft_block
-                ));
-            }
+                site.deployment.clone(),
+                block_ptr_to.number,
+                graft_block
+            ));
+        }
 
         self.rewind_or_truncate_with_conn(&mut conn, site, block_ptr_to, firehose_cursor, false)
             .await

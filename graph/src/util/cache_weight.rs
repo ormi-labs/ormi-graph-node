@@ -2,7 +2,7 @@ use chrono::{DateTime, TimeZone};
 
 use crate::{
     data::value::Word,
-    prelude::{q, BigDecimal, BigInt, Value},
+    prelude::{BigDecimal, BigInt, Value, q},
     schema::EntityType,
 };
 use std::{

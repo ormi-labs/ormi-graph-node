@@ -2,18 +2,18 @@ use std::iter::FromIterator;
 use std::{collections::HashMap, sync::Arc};
 
 use graph::components::store::BLOCK_CACHE_SIZE;
-use graph::prelude::{o, MetricsRegistry, NodeId};
+use graph::prelude::{MetricsRegistry, NodeId, o};
 use graph::slog::warn;
 use graph::url::Url;
 use graph::{
-    prelude::{info, CheapClone, Logger},
+    prelude::{CheapClone, Logger, info},
     util::security::SafeDisplay,
 };
 use graph_store_postgres::{
     BlockStore as DieselBlockStore, ChainHeadUpdateListener as PostgresChainHeadUpdateListener,
-    ChainStoreMetrics, ConnectionPool, ForeignServer, NotificationSender, PoolCoordinator,
-    PoolRole, Shard as ShardName, Store as DieselStore, SubgraphStore, SubscriptionManager,
-    PRIMARY_SHARD,
+    ChainStoreMetrics, ConnectionPool, ForeignServer, NotificationSender, PRIMARY_SHARD,
+    PoolCoordinator, PoolRole, Shard as ShardName, Store as DieselStore, SubgraphStore,
+    SubscriptionManager,
 };
 
 use crate::config::{Config, Shard};

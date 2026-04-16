@@ -10,11 +10,11 @@ use graph::{
 
 use crate::block_range::CAUSALITY_REGION_COLUMN;
 use crate::relational::{
-    ColumnType, BLOCK_COLUMN, BLOCK_RANGE_COLUMN, BYTE_ARRAY_PREFIX_SIZE, STRING_PREFIX_SIZE,
+    BLOCK_COLUMN, BLOCK_RANGE_COLUMN, BYTE_ARRAY_PREFIX_SIZE, ColumnType, STRING_PREFIX_SIZE,
     VID_COLUMN,
 };
 
-use super::{index::IndexList, Catalog, Column, Layout, SqlName, Table};
+use super::{Catalog, Column, Layout, SqlName, Table, index::IndexList};
 
 // In debug builds (for testing etc.) unconditionally create exclusion constraints, in release
 // builds for production, skip them
@@ -194,12 +194,15 @@ impl Table {
             //
             // We also index `vid` as that correlates with the order in which
             // entities are stored.
-            write!(out,"create index brin_{table_name}\n    \
+            write!(
+                out,
+                "create index brin_{table_name}\n    \
                 on {qname}\n \
                    using brin(lower(block_range) {int4}, coalesce(upper(block_range), {block_max}) {int4}, vid {int8});\n",
                 table_name = self.name,
                 qname = self.qualified_name,
-                block_max = BLOCK_NUMBER_MAX)?;
+                block_max = BLOCK_NUMBER_MAX
+            )?;
 
             // Add a BTree index that helps with the `RevertClampQuery` by making
             // it faster to find entity versions that have been modified
@@ -343,9 +346,8 @@ impl Table {
                 && [ColumnType::BigDecimal, ColumnType::BigInt, ColumnType::Int]
                     .contains(&col.column_type))
         };
-        
-        self
-            .columns
+
+        self.columns
             .iter()
             .filter(not_enum_list)
             .filter(not_immutable_pk)

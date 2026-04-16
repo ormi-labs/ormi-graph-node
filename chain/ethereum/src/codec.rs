@@ -12,15 +12,15 @@ use graph::{
         AnyBlock, AnyHeader, AnyRpcHeader, AnyTransactionReceiptBare, AnyTxEnvelope,
     },
     prelude::{
+        BlockNumber, Error, EthereumBlock, EthereumBlockWithCalls, EthereumCall,
+        LightEthereumBlock,
         alloy::{
             self,
             consensus::{ReceiptWithBloom, TxEnvelope, TxType},
             network::AnyReceiptEnvelope,
-            primitives::{aliases::B2048, Address, Bloom, Bytes, LogData, B256, U256},
+            primitives::{Address, B256, Bloom, Bytes, LogData, U256, aliases::B2048},
             rpc::types::{self as alloy_rpc_types, AccessList, AccessListItem, Transaction},
         },
-        BlockNumber, Error, EthereumBlock, EthereumBlockWithCalls, EthereumCall,
-        LightEthereumBlock,
     },
 };
 use std::sync::Arc;
@@ -650,7 +650,7 @@ fn transaction_trace_to_alloy_txn_reciept(
         TransactionTraceStatus::Unknown => {
             return Err(format_err!(
                 "Transaction trace has UNKNOWN status; datasource is broken"
-            ))
+            ));
         }
         TransactionTraceStatus::Succeeded => true,
         TransactionTraceStatus::Failed | TransactionTraceStatus::Reverted => false,

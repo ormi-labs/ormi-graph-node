@@ -6,16 +6,16 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 use inflector::Inflector;
 use serde_json::Value as JsonValue;
 
 use crate::config::networks::update_networks_file;
 use crate::formatter::format_typescript;
-use crate::output::{step, Step};
-use crate::scaffold::manifest::{extract_events_from_abi, EventInfo};
+use crate::output::{Step, step};
 use crate::scaffold::ScaffoldOptions;
+use crate::scaffold::manifest::{EventInfo, extract_events_from_abi};
 use crate::services::ContractService;
 
 #[derive(Clone, Debug, Parser)]
@@ -511,10 +511,12 @@ mod tests {
 
         let result = run_add(opt).await;
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Invalid contract address"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Invalid contract address")
+        );
     }
 
     #[test]

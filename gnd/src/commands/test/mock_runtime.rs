@@ -8,9 +8,9 @@ use graph::data_source;
 use graph::futures03::FutureExt;
 use graph::prelude::EthereumCallCache;
 use graph::runtime::HostExportError;
+use graph_chain_ethereum::Chain;
 use graph_chain_ethereum::chain::{EthereumRuntimeAdapterBuilder, RuntimeAdapterBuilder};
 use graph_chain_ethereum::network::EthereumNetworkAdapters;
-use graph_chain_ethereum::Chain;
 use std::sync::Arc;
 
 const WRAPPED_HOST_FNS: &[&str] = &["ethereum.call", "ethereum.getBalance", "ethereum.hasCode"];

@@ -12,10 +12,9 @@ use graph::{
 };
 
 use crate::{
-    catalog,
+    AsyncPgConnection, catalog,
     primary::Namespace,
     relational::{Table, VID_COLUMN},
-    AsyncPgConnection,
 };
 
 /// The initial batch size for tables that do not have an array column

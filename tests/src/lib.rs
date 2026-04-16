@@ -8,5 +8,5 @@ pub mod output;
 pub mod recipe;
 pub mod subgraph;
 
-pub use config::{Config, DbConfig, EthConfig, CONFIG};
+pub use config::{CONFIG, Config, DbConfig, EthConfig};
 pub use output::OutputConfig;

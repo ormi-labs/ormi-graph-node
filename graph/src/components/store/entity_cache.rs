@@ -2,14 +2,14 @@ use anyhow::{anyhow, bail};
 use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::fmt::{self, Debug};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::cheap_clone::CheapClone;
 use crate::components::store::write::EntityModification;
 use crate::components::store::{self as s, Entity, EntityOperation};
 use crate::data::store::{EntityValidationError, Id, IdType, IntoEntityIterator};
-use crate::prelude::{CacheWeight, StopwatchMetrics, ENV_VARS};
+use crate::prelude::{CacheWeight, ENV_VARS, StopwatchMetrics};
 use crate::schema::{EntityKey, InputSchema};
 use crate::util::intern::Error as InternError;
 use crate::util::lfu_cache::{EvictStats, LfuCache};
@@ -355,23 +355,24 @@ impl EntityCache {
         // - Add the entity to entity_map.
         for (key, op) in self.updates.iter() {
             if !entity_map.contains_key(key)
-                && let Some(entity) = matches_query(op, &query, key)? {
-                    if let Some(handler_op) = self.handler_updates.get(key).cloned() {
-                        // If there's a corresponding update in handler_updates, apply it to the entity
-                        // and insert the updated entity into entity_map
-                        let mut entity = Some(entity);
-                        entity = handler_op
-                            .apply_to(&entity)
-                            .map_err(|e| key.unknown_attribute(e))?;
+                && let Some(entity) = matches_query(op, &query, key)?
+            {
+                if let Some(handler_op) = self.handler_updates.get(key).cloned() {
+                    // If there's a corresponding update in handler_updates, apply it to the entity
+                    // and insert the updated entity into entity_map
+                    let mut entity = Some(entity);
+                    entity = handler_op
+                        .apply_to(&entity)
+                        .map_err(|e| key.unknown_attribute(e))?;
 
-                        if let Some(updated_entity) = entity {
-                            entity_map.insert(key.clone(), updated_entity);
-                        }
-                    } else {
-                        // If there isn't a corresponding update in handler_updates or the update doesn't match the query, just insert the entity from self.updates
-                        entity_map.insert(key.clone(), entity);
+                    if let Some(updated_entity) = entity {
+                        entity_map.insert(key.clone(), updated_entity);
                     }
+                } else {
+                    // If there isn't a corresponding update in handler_updates or the update doesn't match the query, just insert the entity from self.updates
+                    entity_map.insert(key.clone(), entity);
                 }
+            }
         }
 
         // Iterate over handler_updates to find entities that:
@@ -380,10 +381,12 @@ impl EntityCache {
         // - Match the query.
         // If these conditions are met, add the entity to entity_map.
         for (key, handler_op) in self.handler_updates.iter() {
-            if !entity_map.contains_key(key) && !self.updates.contains_key(key)
-                && let Some(entity) = matches_query(handler_op, &query, key)? {
-                    entity_map.insert(key.clone(), entity);
-                }
+            if !entity_map.contains_key(key)
+                && !self.updates.contains_key(key)
+                && let Some(entity) = matches_query(handler_op, &query, key)?
+            {
+                entity_map.insert(key.clone(), entity);
+            }
         }
 
         // Remove entities that are in the store but have been removed by an update.

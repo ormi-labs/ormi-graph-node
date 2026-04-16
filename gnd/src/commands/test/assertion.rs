@@ -2,9 +2,9 @@
 
 use super::runner::TestContext;
 use super::schema::{Assertion, AssertionFailure, AssertionOutcome, TestResult};
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use graph::data::query::{Query, QueryResults, QueryTarget};
-use graph::prelude::{q, ApiVersion, GraphQlRunner as GraphQlRunnerTrait};
+use graph::prelude::{ApiVersion, GraphQlRunner as GraphQlRunnerTrait, q};
 
 pub(super) async fn run_assertions(
     ctx: &TestContext,
@@ -137,10 +137,11 @@ fn json_similarity(a: &serde_json::Value, b: &serde_json::Value) -> usize {
             let mut score = 0;
             for (k, v) in a_obj {
                 if let Some(bv) = b_obj.get(k)
-                    && json_equal(v, bv) {
-                        // `id` match is a strong signal for entity identity.
-                        score += if k == "id" { 100 } else { 1 };
-                    }
+                    && json_equal(v, bv)
+                {
+                    // `id` match is a strong signal for entity identity.
+                    score += if k == "id" { 100 } else { 1 };
+                }
             }
             score
         }

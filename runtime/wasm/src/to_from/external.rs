@@ -5,10 +5,10 @@ use graph::data::store::scalar::Timestamp;
 use graph::data::value::Word;
 use graph::prelude::alloy::primitives::{Address, B256};
 use graph::prelude::{BigDecimal, BigInt};
-use graph::runtime::gas::GasCounter;
 use graph::runtime::AscHeap;
+use graph::runtime::gas::GasCounter;
 use graph::runtime::{
-    asc_get, asc_new, AscIndexId, AscPtr, AscType, AscValue, HostExportError, ToAscObj,
+    AscIndexId, AscPtr, AscType, AscValue, HostExportError, ToAscObj, asc_get, asc_new,
 };
 use graph::{data::store, runtime::DeterministicHostError};
 use graph::{

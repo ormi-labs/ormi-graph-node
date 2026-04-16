@@ -8,16 +8,16 @@ use std::fmt::Debug;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use axum::Json;
 use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
-use axum::Json;
 use graph::prelude::{
-    DeploymentHash, NodeId, SubgraphName, SubgraphRegistrar, SubgraphRegistrarError, ENV_VARS,
+    DeploymentHash, ENV_VARS, NodeId, SubgraphName, SubgraphRegistrar, SubgraphRegistrarError,
 };
 use serde::Deserialize;
 use serde_json::{self, Value as JsonValue};
-use slog::{error, info, Logger};
+use slog::{Logger, error, info};
 
 use crate::jsonrpc::{JsonRpcError, JsonRpcId, JsonRpcRequest, JsonRpcResponse};
 

@@ -9,7 +9,7 @@ use diesel_async::scoped_futures::ScopedFutureExt;
 use std::fmt;
 use std::{
     collections::{BTreeMap, HashMap},
-    sync::{atomic::AtomicU8, Arc, Mutex},
+    sync::{Arc, Mutex, atomic::AtomicU8},
 };
 use std::{iter::FromIterator, time::Duration};
 
@@ -26,14 +26,14 @@ use graph::{
     data::{
         query::QueryTarget,
         store::DEFAULT_NODE_ID,
-        subgraph::{schema::DeploymentCreate, status, DeploymentFeatures},
+        subgraph::{DeploymentFeatures, schema::DeploymentCreate, status},
     },
     internal_error,
     prelude::{
-        anyhow, lazy_static, o, ApiVersion, BlockNumber, BlockPtr, ChainStore, DeploymentHash,
-        EntityOperation, Logger, MetricsRegistry, NodeId, PartialBlockPtr, StoreError, StoreEvent,
-        SubgraphDeploymentEntity, SubgraphName, SubgraphStore as SubgraphStoreTrait,
-        SubgraphVersionSwitchingMode,
+        ApiVersion, BlockNumber, BlockPtr, ChainStore, DeploymentHash, EntityOperation, Logger,
+        MetricsRegistry, NodeId, PartialBlockPtr, StoreError, StoreEvent, SubgraphDeploymentEntity,
+        SubgraphName, SubgraphStore as SubgraphStoreTrait, SubgraphVersionSwitchingMode, anyhow,
+        lazy_static, o,
     },
     schema::{ApiSchema, InputSchema},
     url::Url,
@@ -42,25 +42,24 @@ use graph::{
 use graph::{derive::CheapClone, futures03::future::join_all, prelude::alloy::primitives::Address};
 
 use crate::{
+    ConnectionPool, NotificationSender,
     catalog::Catalog,
     deployment::{OnSync, SubgraphHealth},
     primary::{
         self, DeploymentId, Mirror as PrimaryMirror, Primary, RestoreAction, RestoreMode, Site,
     },
     relational::{
-        self,
+        self, Layout,
         index::{IndexList, Method},
-        Layout,
     },
     writable::{SourceableStore, WritableStore},
-    ConnectionPool, NotificationSender,
 };
 use crate::{
     deployment_store::{DeploymentStore, ReplicaId},
     detail::DeploymentDetail,
     primary::UnusedDeployment,
 };
-use crate::{fork, relational::index::CreateIndex, relational::SqlName};
+use crate::{fork, relational::SqlName, relational::index::CreateIndex};
 
 /// The name of a database shard; valid names must match `[a-z0-9_]+`
 #[derive(Clone, Debug, Eq, PartialEq, Hash, AsExpression, FromSqlRow)]
@@ -132,7 +131,7 @@ impl ToSql<Text, Pg> for Shard {
 /// shards.
 pub trait DeploymentPlacer {
     fn place(&self, name: &str, network: &str)
-        -> Result<Option<(Vec<Shard>, Vec<NodeId>)>, String>;
+    -> Result<Option<(Vec<Shard>, Vec<NodeId>)>, String>;
 }
 
 /// Tools for managing unused deployments

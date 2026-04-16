@@ -1,7 +1,7 @@
-use std::collections::{btree_map::Entry, BTreeMap};
+use std::collections::{BTreeMap, btree_map::Entry};
 
 use alloy::primitives::{BlockHash, BlockNumber};
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use arrow::array::RecordBatch;
 
 use super::{Aggregator, RecordBatchGroup, RecordBatchGroups, StreamRecordBatch};
@@ -190,7 +190,8 @@ impl Buffer {
                 }
                 Entry::Occupied(entry) => {
                     if *entry.get() != max_completed_block_hash {
-                        bail!("aggregated data is corrupted: stream {} produced block hash '0x{}' for block {}, but a previous stream set the block hash to '0x{}'",
+                        bail!(
+                            "aggregated data is corrupted: stream {} produced block hash '0x{}' for block {}, but a previous stream set the block hash to '0x{}'",
                             stream_index,
                             hex::encode(max_completed_block_hash),
                             max_completed_block_number,

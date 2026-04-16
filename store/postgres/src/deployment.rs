@@ -1,7 +1,7 @@
 //! Utilities for dealing with deployment metadata. Any connection passed
 //! into these methods must be for the shard that holds the actual
 //! deployment data and metadata
-use crate::{advisory_lock, detail::GraphNodeVersion, primary::DeploymentId, AsyncPgConnection};
+use crate::{AsyncPgConnection, advisory_lock, detail::GraphNodeVersion, primary::DeploymentId};
 use diesel::{
     dsl::{count, delete, insert_into, now, select, sql, update},
     sql_types::{Bool, Integer},
@@ -18,7 +18,7 @@ use graph::{
     data::subgraph::schema::SubgraphError,
     env::ENV_VARS,
     schema::EntityType,
-    slog::{debug, Logger},
+    slog::{Logger, debug},
 };
 use graph::{components::store::StoreResult, semver::Version};
 use graph::{
@@ -26,7 +26,7 @@ use graph::{
     util::backoff::ExponentialBackoff,
 };
 use graph::{
-    prelude::{anyhow, hex, BlockNumber, BlockPtr, DeploymentHash, DeploymentState, StoreError},
+    prelude::{BlockNumber, BlockPtr, DeploymentHash, DeploymentState, StoreError, anyhow, hex},
     schema::InputSchema,
 };
 use stable_hash_legacy::crypto::SetHasher;
@@ -55,8 +55,8 @@ impl SubgraphHealth {
 
 impl From<SubgraphHealth> for graph::data::subgraph::schema::SubgraphHealth {
     fn from(health: SubgraphHealth) -> Self {
-        use graph::data::subgraph::schema::SubgraphHealth as H;
         use SubgraphHealth as Db;
+        use graph::data::subgraph::schema::SubgraphHealth as H;
 
         match health {
             Db::Failed => H::Failed,
@@ -479,12 +479,13 @@ pub async fn transact_block(
     // of a simple primary key lookup. So a separate query it is.
     let block_ptr = block_ptr(conn, site).await?;
     if let Some(block_ptr_from) = block_ptr
-        && block_ptr_from.number >= ptr.number {
-            return Err(StoreError::DuplicateBlockProcessing(
-                site.deployment.clone(),
-                ptr.number,
-            ));
-        }
+        && block_ptr_from.number >= ptr.number
+    {
+        return Err(StoreError::DuplicateBlockProcessing(
+            site.deployment.clone(),
+            ptr.number,
+        ));
+    }
 
     reset_reorg_count(conn, site).await?;
 
@@ -578,7 +579,6 @@ pub async fn get_subgraph_firehose_cursor(
 ) -> Result<Option<String>, StoreError> {
     use head as h;
 
-    
     h::table
         .filter(h::id.eq(site.id))
         .select(h::firehose_cursor)

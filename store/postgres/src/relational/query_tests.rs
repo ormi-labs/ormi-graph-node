@@ -5,13 +5,13 @@ use graph::{
     components::store::write::RowGroup,
     data_source::CausalityRegion,
     entity,
-    prelude::{r, serde_json as json, DeploymentHash, EntityFilter},
+    prelude::{DeploymentHash, EntityFilter, r, serde_json as json},
     schema::InputSchema,
 };
 
 use crate::{
     block_range::BoundSide,
-    layout_for_tests::{make_dummy_site, Namespace},
+    layout_for_tests::{Namespace, make_dummy_site},
     relational::{Catalog, ColumnType, Layout},
     relational_queries::{FindRangeQuery, FromColumnValue, InsertQuery},
 };

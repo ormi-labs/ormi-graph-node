@@ -3,8 +3,9 @@ use graph::{
     abi,
     data::store::ethereum::call,
     prelude::{
+        Logger,
         alloy::transports::{RpcError, TransportErrorKind},
-        serde_json, Logger,
+        serde_json,
     },
     slog::info,
 };
@@ -94,9 +95,10 @@ pub fn interpret_eth_call_error(
     }
 
     if let RpcError::ErrorResp(rpc_error) = &err
-        && is_rpc_revert_message(&rpc_error.message) {
-            return reverted(logger, &rpc_error.message);
-        }
+        && is_rpc_revert_message(&rpc_error.message)
+    {
+        return reverted(logger, &rpc_error.message);
+    }
 
     if let RpcError::ErrorResp(rpc_error) = &err {
         let code = rpc_error.code;
@@ -107,9 +109,10 @@ pub fn interpret_eth_call_error(
 
         if code == PARITY_VM_EXECUTION_ERROR
             && let Some(data) = data
-                && is_parity_revert(&data) {
-                    return reverted(logger, &parity_revert_reason(&data));
-                }
+            && is_parity_revert(&data)
+        {
+            return reverted(logger, &parity_revert_reason(&data));
+        }
     }
 
     Err(ContractCallError::AlloyError(err))

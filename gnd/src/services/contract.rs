@@ -6,7 +6,7 @@
 use std::env;
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
@@ -221,14 +221,15 @@ impl ContractService {
             match self.fetch_from_etherscan(&api_url).await {
                 Ok(response) => {
                     if response.status == "1"
-                        && let Some(result) = response.result {
-                            // The result is a JSON string containing the ABI
-                            if let Some(abi_str) = result.as_str() {
-                                return serde_json::from_str(abi_str)
-                                    .context("Failed to parse ABI JSON");
-                            }
-                            return Ok(result);
+                        && let Some(result) = response.result
+                    {
+                        // The result is a JSON string containing the ABI
+                        if let Some(abi_str) = result.as_str() {
+                            return serde_json::from_str(abi_str)
+                                .context("Failed to parse ABI JSON");
                         }
+                        return Ok(result);
+                    }
                     last_error = Some(anyhow!(
                         "{} - {}",
                         response.message,
@@ -274,11 +275,12 @@ impl ContractService {
                     Ok(data) => {
                         if data.status == "1"
                             && let Some(results) = data.result
-                                && let Some(first) = results.first()
-                                    && let Some(name) = &first.contract_name
-                                        && !name.is_empty() {
-                                            return Ok(name.clone());
-                                        }
+                            && let Some(first) = results.first()
+                            && let Some(name) = &first.contract_name
+                            && !name.is_empty()
+                        {
+                            return Ok(name.clone());
+                        }
                         last_error = Some(anyhow!("Contract name is empty"));
                     }
                     Err(e) => {
@@ -327,20 +329,21 @@ impl ContractService {
                     Ok(data) => {
                         if data.status == "1"
                             && let Some(results) = data.result
-                                && let Some(first) = results.first() {
-                                    // Try direct block number first
-                                    if let Some(block) = &first.block_number
-                                        && let Ok(num) = block.parse::<u64>() {
-                                            return Ok(num);
-                                        }
-                                    // Fall back to fetching transaction
-                                    if let Some(tx_hash) = &first.tx_hash
-                                        && let Ok(block) =
-                                            self.get_block_from_tx(network_id, tx_hash).await
-                                        {
-                                            return Ok(block);
-                                        }
-                                }
+                            && let Some(first) = results.first()
+                        {
+                            // Try direct block number first
+                            if let Some(block) = &first.block_number
+                                && let Ok(num) = block.parse::<u64>()
+                            {
+                                return Ok(num);
+                            }
+                            // Fall back to fetching transaction
+                            if let Some(tx_hash) = &first.tx_hash
+                                && let Ok(block) = self.get_block_from_tx(network_id, tx_hash).await
+                            {
+                                return Ok(block);
+                            }
+                        }
                         last_error = Some(anyhow!("No contract creation info found"));
                     }
                     Err(e) => {
@@ -562,13 +565,14 @@ impl ContractService {
                         match response.json::<RpcResponse>().await {
                             Ok(data) => {
                                 if let Some(result) = data.result
-                                    && let Some(block_hex) = result.block_number {
-                                        // Parse hex block number
-                                        let block_str = block_hex.trim_start_matches("0x");
-                                        if let Ok(block) = u64::from_str_radix(block_str, 16) {
-                                            return Ok(block);
-                                        }
+                                    && let Some(block_hex) = result.block_number
+                                {
+                                    // Parse hex block number
+                                    let block_str = block_hex.trim_start_matches("0x");
+                                    if let Ok(block) = u64::from_str_radix(block_str, 16) {
+                                        return Ok(block);
                                     }
+                                }
                                 last_error = Some(anyhow!("No block number in transaction"));
                             }
                             Err(e) => {

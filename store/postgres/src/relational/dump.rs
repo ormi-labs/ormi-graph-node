@@ -3,11 +3,11 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::{collections::HashMap, fs};
 
+use diesel::QueryDsl;
 use diesel::dsl::sql;
 use diesel::sql_types::{
     Array, BigInt, Binary, Bool, Integer, Nullable, Numeric, Text, Timestamptz, Untyped,
 };
-use diesel::QueryDsl;
 use diesel_async::RunQueryDsl;
 use diesel_dynamic_schema::DynamicSelectClause;
 
@@ -16,6 +16,7 @@ use graph::data::subgraph::schema::{SubgraphError, SubgraphHealth, SubgraphManif
 use graph::prelude::{DeploymentHash, StoreError, SubgraphDeploymentEntity};
 use serde::{Deserialize, Serialize};
 
+use crate::AsyncPgConnection;
 use crate::catalog;
 use crate::detail::deployment_entity;
 use crate::parquet::convert::rows_to_record_batch;
@@ -26,7 +27,6 @@ use crate::relational::index::IndexList;
 use crate::relational::value::OidRow;
 use crate::relational::{ColumnType, SqlName, Table as RelTable};
 use crate::vid_batcher::{VidBatcher, VidRange};
-use crate::AsyncPgConnection;
 
 use super::Layout;
 
@@ -655,22 +655,23 @@ async fn dump_entity_table(
         // No new rows, but for incremental mutable tables we still
         // need to check for clamps
         if let (Some(prev_info), Some(prev_head)) = (prev, prev_head_block_number)
-            && !table.immutable {
-                let clamp_index = prev_info.clamps.len();
-                if let Some(clamp_info) = dump_clamp(
-                    conn,
-                    table,
-                    dir,
-                    prev_info.max_vid,
-                    prev_head,
-                    clamp_index,
-                    reporter,
-                )
-                .await?
-                {
-                    clamps.push(clamp_info);
-                }
+            && !table.immutable
+        {
+            let clamp_index = prev_info.clamps.len();
+            if let Some(clamp_info) = dump_clamp(
+                conn,
+                table,
+                dir,
+                prev_info.max_vid,
+                prev_head,
+                clamp_index,
+                reporter,
+            )
+            .await?
+            {
+                clamps.push(clamp_info);
             }
+        }
 
         let max_vid = prev.map_or(-1, |p| p.max_vid);
         reporter.finish_table(table_dir_name, 0);
@@ -733,22 +734,23 @@ async fn dump_entity_table(
 
     // For incremental mutable tables, dump clamps
     if let (Some(prev_info), Some(prev_head)) = (prev, prev_head_block_number)
-        && !table.immutable {
-            let clamp_index = prev_info.clamps.len();
-            if let Some(clamp_info) = dump_clamp(
-                conn,
-                table,
-                dir,
-                prev_info.max_vid,
-                prev_head,
-                clamp_index,
-                reporter,
-            )
-            .await?
-            {
-                clamps.push(clamp_info);
-            }
+        && !table.immutable
+    {
+        let clamp_index = prev_info.clamps.len();
+        if let Some(clamp_info) = dump_clamp(
+            conn,
+            table,
+            dir,
+            prev_info.max_vid,
+            prev_head,
+            clamp_index,
+            reporter,
+        )
+        .await?
+        {
+            clamps.push(clamp_info);
         }
+    }
 
     reporter.finish_table(table_dir_name, total_rows);
 
@@ -1068,14 +1070,14 @@ impl Layout {
         if let (Some(prev_head), Some(curr_head)) = (
             prev_head_block_number,
             metadata.head_block.as_ref().map(|b| b.number),
-        )
-            && curr_head <= prev_head {
-                return Err(StoreError::InternalError(format!(
-                    "incremental dump refused: current head block ({}) <= previous head block ({}); \
+        ) && curr_head <= prev_head
+        {
+            return Err(StoreError::InternalError(format!(
+                "incremental dump refused: current head block ({}) <= previous head block ({}); \
                      possible reorg — delete the dump directory and re-dump",
-                    curr_head, prev_head
-                )));
-            }
+                curr_head, prev_head
+            )));
+        }
 
         write_file(dir.join("schema.graphql"), &schema)?;
 

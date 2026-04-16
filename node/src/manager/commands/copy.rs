@@ -6,19 +6,20 @@ use graph::{
     components::store::{BlockStore as _, DeploymentId, DeploymentLocator},
     data::query::QueryTarget,
     prelude::{
-        anyhow::{anyhow, bail, Error},
-        chrono::{DateTime, Duration, SecondsFormat, Utc},
         BlockPtr, ChainStore, DeploymentHash, NodeId, QueryStoreManager,
+        anyhow::{Error, anyhow, bail},
+        chrono::{DateTime, Duration, SecondsFormat, Utc},
     },
-};
-use graph_store_postgres::{
-    command_support::{
-        catalog::{self, copy_state, copy_table_state},
-        on_sync, OnSync,
-    },
-    PRIMARY_SHARD,
 };
 use graph_store_postgres::{ConnectionPool, Shard, Store, SubgraphStore};
+use graph_store_postgres::{
+    PRIMARY_SHARD,
+    command_support::{
+        OnSync,
+        catalog::{self, copy_state, copy_table_state},
+        on_sync,
+    },
+};
 
 use crate::manager::display::List;
 use crate::manager::{deployment::DeploymentSearch, fmt};
@@ -120,7 +121,8 @@ async fn create_inner(
         .ok_or_else(|| anyhow!("subgraph {} has not indexed any blocks yet and can not be used as the source of a copy", src))?;
 
     if src_ptr.number <= block_offset {
-        bail!("subgraph {} has only indexed up to block {}, but we need at least block {} before we can copy from it",
+        bail!(
+            "subgraph {} has only indexed up to block {}, but we need at least block {} before we can copy from it",
             src,
             src_ptr.number,
             block_offset

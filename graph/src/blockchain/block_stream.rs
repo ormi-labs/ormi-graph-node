@@ -1,5 +1,5 @@
 use crate::blockchain::SubgraphFilter;
-use crate::data_source::{subgraph, CausalityRegion};
+use crate::data_source::{CausalityRegion, subgraph};
 use anyhow::Error;
 use async_stream::stream;
 use async_trait::async_trait;
@@ -66,7 +66,7 @@ impl<C: Blockchain + 'static> BufferedBlockStream<C> {
                     return Err(anyhow!(
                         "buffered blockstream channel is closed, stopping. Err: {}",
                         err
-                    ))
+                    ));
                 }
             }
         }

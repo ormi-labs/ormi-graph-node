@@ -9,8 +9,8 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use anyhow::{anyhow, Result};
-use notify::{recommended_watcher, RecursiveMode, Watcher};
+use anyhow::{Result, anyhow};
+use notify::{RecursiveMode, Watcher, recommended_watcher};
 
 /// Delay between file change detection and callback execution to batch multiple events.
 pub const WATCH_DEBOUNCE: Duration = Duration::from_millis(500);
@@ -66,11 +66,12 @@ where
     let mut watched_dirs = HashSet::new();
     for file in &files_to_watch {
         if let Some(dir) = file.parent()
-            && watched_dirs.insert(dir.to_path_buf()) {
-                watcher
-                    .watch(dir, RecursiveMode::NonRecursive)
-                    .map_err(|e| anyhow!("Failed to watch {}: {}", dir.display(), e))?;
-            }
+            && watched_dirs.insert(dir.to_path_buf())
+        {
+            watcher
+                .watch(dir, RecursiveMode::NonRecursive)
+                .map_err(|e| anyhow!("Failed to watch {}: {}", dir.display(), e))?;
+        }
     }
 
     // Event loop

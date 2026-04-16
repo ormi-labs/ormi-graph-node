@@ -4,15 +4,15 @@
 use graph::components::store::QueryStoreManager;
 use graph::data::query::QueryTarget;
 use graph::data::store::SqlQueryObject;
-use graph::prelude::{r, QueryExecutionError};
+use graph::prelude::{QueryExecutionError, r};
 use std::collections::BTreeSet;
-use test_store::{run_test_sequentially, STORE};
+use test_store::{STORE, run_test_sequentially};
 
 #[cfg(debug_assertions)]
 use graph::env::ENV_VARS;
 
 // Import test setup from query.rs module
-use super::query::{setup, IdType};
+use super::query::{IdType, setup};
 
 /// Synchronous wrapper for SQL query execution
 fn run_sql_query<F>(sql: &str, test: F)
@@ -54,9 +54,10 @@ fn sql_can_query_simple_select() {
         // Check first musician
         if let Some(first) = results.first()
             && let r::Value::Object(ref obj) = first.0
-                && let Some(r::Value::String(name)) = obj.get("name") {
-                    assert_eq!(name, "John", "First musician should be John");
-                }
+            && let Some(r::Value::String(name)) = obj.get("name")
+        {
+            assert_eq!(name, "John", "First musician should be John");
+        }
     });
 }
 
@@ -70,9 +71,10 @@ fn sql_can_query_with_where_clause() {
 
         if let Some(first) = results.first()
             && let r::Value::Object(ref obj) = first.0
-                && let Some(r::Value::String(name)) = obj.get("name") {
-                    assert_eq!(name, "John", "Should return John");
-                }
+            && let Some(r::Value::String(name)) = obj.get("name")
+        {
+            assert_eq!(name, "John", "Should return John");
+        }
     });
 }
 
@@ -86,14 +88,15 @@ fn sql_can_query_with_aggregation() {
 
         if let Some(first) = results.first()
             && let r::Value::Object(ref obj) = first.0
-                && let Some(total) = obj.get("total") {
-                    // The count should be a number (could be various forms)
-                    match total {
-                        r::Value::Int(n) => assert_eq!(*n, 5),
-                        r::Value::String(s) => assert_eq!(s, "5"),
-                        _ => panic!("Total should be a number: {:?}", total),
-                    }
-                }
+            && let Some(total) = obj.get("total")
+        {
+            // The count should be a number (could be various forms)
+            match total {
+                r::Value::Int(n) => assert_eq!(*n, 5),
+                r::Value::String(s) => assert_eq!(s, "5"),
+                _ => panic!("Total should be a number: {:?}", total),
+            }
+        }
     });
 }
 
@@ -108,10 +111,11 @@ fn sql_can_query_with_limit_offset() {
         // Should skip first musician (order may vary by id type)
         if let Some(first) = results.first()
             && let r::Value::Object(ref obj) = first.0
-                && let Some(r::Value::String(name)) = obj.get("name") {
-                    // Just check we got a valid musician name
-                    assert!(["John", "Lisa", "Tom", "Valerie", "Paul"].contains(&name.as_str()));
-                }
+            && let Some(r::Value::String(name)) = obj.get("name")
+        {
+            // Just check we got a valid musician name
+            assert!(["John", "Lisa", "Tom", "Valerie", "Paul"].contains(&name.as_str()));
+        }
     });
 }
 
@@ -246,12 +250,13 @@ fn sql_can_query_with_case_expression() {
 
         // Check that popularity field exists in first result
         if let Some(first) = results.first()
-            && let r::Value::Object(ref obj) = first.0 {
-                assert!(
-                    obj.get("popularity").is_some(),
-                    "Should have popularity field"
-                );
-            }
+            && let r::Value::Object(ref obj) = first.0
+        {
+            assert!(
+                obj.get("popularity").is_some(),
+                "Should have popularity field"
+            );
+        }
     });
 }
 
@@ -271,9 +276,10 @@ fn sql_can_query_with_subquery() {
         assert_eq!(results.len(), 1, "Should return one count result");
 
         if let Some(first) = results.first()
-            && let r::Value::Object(ref obj) = first.0 {
-                let count = obj.get("active_count");
-                assert!(count.is_some(), "Should have active_count field");
-            }
+            && let r::Value::Object(ref obj) = first.0
+        {
+            let count = obj.get("active_count");
+            assert!(count.is_some(), "Should have active_count field");
+        }
     });
 }

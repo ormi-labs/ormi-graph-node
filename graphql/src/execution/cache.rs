@@ -1,6 +1,6 @@
-use graph::prelude::{debug, BlockPtr, CheapClone, Logger, QueryResult};
-use std::sync::atomic::{AtomicU64, Ordering};
+use graph::prelude::{BlockPtr, CheapClone, Logger, QueryResult, debug};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{collections::HashMap, time::Duration};
 use std::{collections::VecDeque, time::Instant};
 
@@ -108,9 +108,10 @@ impl QueryBlockCache {
         // - `block_ptr` is of higher or equal number than the most recent block in the cache.
         // Otherwise this is a historical query that does not belong in the block cache.
         if let Some(highest) = cache.iter().next()
-            && highest.block.number > block_ptr.number {
-                return false;
-            };
+            && highest.block.number > block_ptr.number
+        {
+            return false;
+        };
 
         if cache.len() == self.max_blocks {
             // At capacity, so pop the oldest block.
@@ -164,9 +165,10 @@ impl QueryBlockCache {
         {
             // Iterate from the most recent block looking for a block that matches.
             if let Some(cache_by_block) = cache.iter().find(|c| &c.block == block_ptr)
-                && let Some(response) = cache_by_block.get(key) {
-                    return Some(response.cheap_clone());
-                }
+                && let Some(response) = cache_by_block.get(key)
+            {
+                return Some(response.cheap_clone());
+            }
         }
         None
     }

@@ -6,7 +6,7 @@ use std::{
 use alloy::primitives::BlockNumber;
 use sqlparser_latest::ast::{self, VisitMut, VisitorMut};
 
-use super::{extract_tables, parse_query, TableReference};
+use super::{TableReference, extract_tables, parse_query};
 
 /// Limits the query execution to the specified block range.
 ///

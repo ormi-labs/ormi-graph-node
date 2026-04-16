@@ -17,11 +17,11 @@ use crate::components::versions::ApiVersion;
 use crate::data::query::Trace;
 use crate::data::store::ethereum::call;
 use crate::data::store::{QueryObject, SqlQueryObject};
-use crate::data::subgraph::{status, DeploymentFeatures};
+use crate::data::subgraph::{DeploymentFeatures, status};
 use crate::data::{query::QueryTarget, subgraph::schema::*};
 use crate::prelude::{
-    alloy::primitives::{Address, B256},
     DeploymentState, NodeId, QueryExecutionError, SubgraphName,
+    alloy::primitives::{Address, B256},
 };
 use crate::schema::{ApiSchema, InputSchema};
 
@@ -142,7 +142,7 @@ pub trait SubgraphStore: Send + Sync + 'static {
 
     /// Returns assignments that are not paused
     async fn active_assignments(&self, node: &NodeId)
-        -> Result<Vec<DeploymentLocator>, StoreError>;
+    -> Result<Vec<DeploymentLocator>, StoreError>;
 
     /// Return `true` if a subgraph `name` exists, regardless of whether the
     /// subgraph has any deployments attached to it
@@ -582,7 +582,7 @@ pub trait ChainStore: ChainHeadStore {
     /// column. More efficient than `blocks` when only the parent pointer is
     /// needed.
     async fn block_parent_ptr(self: Arc<Self>, hash: &BlockHash)
-        -> Result<Option<BlockPtr>, Error>;
+    -> Result<Option<BlockPtr>, Error>;
 
     /// Returns the blocks present in the store for the given block numbers.
     async fn block_ptrs_by_numbers(
@@ -740,7 +740,7 @@ pub trait QueryStore: Send + Sync {
     async fn block_ptr(&self) -> Result<Option<BlockPtr>, StoreError>;
 
     async fn block_number(&self, block_hash: &BlockHash)
-        -> Result<Option<BlockNumber>, StoreError>;
+    -> Result<Option<BlockNumber>, StoreError>;
 
     async fn block_numbers(
         &self,

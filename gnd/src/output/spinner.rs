@@ -28,7 +28,7 @@
 use std::fmt::Display;
 use std::time::Duration;
 
-use console::{style, Term};
+use console::{Term, style};
 use indicatif::{ProgressBar, ProgressStyle};
 
 /// The checkmark symbol used for successful steps (matches TS CLI)

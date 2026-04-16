@@ -16,30 +16,30 @@ use std::{
     future::Future,
     pin::Pin,
     sync::{
-        atomic::{AtomicBool, AtomicI64, Ordering},
         Arc, Mutex,
+        atomic::{AtomicBool, AtomicI64, Ordering},
     },
     time::{Duration, Instant},
 };
 
 use diesel::{
-    dsl::sql, insert_into, select, sql_query, update, ExpressionMethods, OptionalExtension,
-    QueryDsl,
+    ExpressionMethods, OptionalExtension, QueryDsl, dsl::sql, insert_into, select, sql_query,
+    update,
 };
 use diesel_async::{
-    scoped_futures::{ScopedBoxFuture, ScopedFutureExt},
     AsyncConnection,
+    scoped_futures::{ScopedBoxFuture, ScopedFutureExt},
 };
 use diesel_async::{RunQueryDsl, SimpleAsyncConnection};
 
 use graph::{
     futures03::{
-        future::{select_all, BoxFuture},
         FutureExt as _,
+        future::{BoxFuture, select_all},
     },
     internal_error,
     prelude::{
-        info, lazy_static, o, warn, BlockNumber, BlockPtr, CheapClone, Logger, StoreError, ENV_VARS,
+        BlockNumber, BlockPtr, CheapClone, ENV_VARS, Logger, StoreError, info, lazy_static, o, warn,
     },
     schema::EntityType,
     slog::error,
@@ -47,13 +47,12 @@ use graph::{
 use itertools::Itertools;
 
 use crate::{
-    advisory_lock, catalog, deployment,
+    AsyncPgConnection, ConnectionPool, advisory_lock, catalog, deployment,
     dynds::DataSourcesTable,
     primary::{DeploymentId, Primary, Site},
-    relational::{index::IndexList, Layout, Table},
+    relational::{Layout, Table, index::IndexList},
     relational_queries as rq,
     vid_batcher::{VidBatcher, VidRange},
-    AsyncPgConnection, ConnectionPool,
 };
 
 const LOG_INTERVAL: Duration = Duration::from_secs(3 * 60);
@@ -151,7 +150,8 @@ impl CopyState {
                         src.site.deployment,
                         dst.site.deployment,
                         stored_target_block,
-                        target_block));
+                        target_block
+                    ));
                 }
                 if src_id != src.site.id {
                     return Err(internal_error!(

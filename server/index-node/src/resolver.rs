@@ -6,18 +6,18 @@ use graph::data::store::Id;
 use graph::prelude::alloy::primitives::Address;
 use graph::schema::EntityType;
 
-use git_testament::{git_testament, CommitKind};
+use git_testament::{CommitKind, git_testament};
 use graph::amp;
 use graph::blockchain::{Blockchain, BlockchainKind, BlockchainMap};
 use graph::components::link_resolver::LinkResolverContext;
 use graph::components::store::{BlockPtrForNumber, BlockStore, QueryPermit, Store};
 use graph::components::versions::VERSIONS;
-use graph::data::graphql::{object, IntoValue, ObjectOrInterface, ValueMap};
-use graph::data::subgraph::{status, DeploymentFeatures};
+use graph::data::graphql::{IntoValue, ObjectOrInterface, ValueMap, object};
+use graph::data::subgraph::{DeploymentFeatures, status};
 use graph::data::value::Object;
 use graph::futures03::TryFutureExt;
 use graph::prelude::*;
-use graph_graphql::prelude::{a, ExecutionContext, Resolver};
+use graph_graphql::prelude::{ExecutionContext, Resolver, a};
 
 use crate::auth::PoiProtection;
 

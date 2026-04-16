@@ -5,12 +5,12 @@
 
 use std::path::PathBuf;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use clap::Parser;
 use inquire::Confirm;
 
-use crate::commands::build::{run_build, BuildOpt};
-use crate::output::{step, Step};
+use crate::commands::build::{BuildOpt, run_build};
+use crate::output::{Step, step};
 
 /// Default IPFS URL for The Graph's hosted IPFS node.
 const DEFAULT_IPFS_URL: &str = "https://api.thegraph.com/ipfs/api/v0";

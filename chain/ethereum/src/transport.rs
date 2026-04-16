@@ -265,12 +265,11 @@ impl Service<RequestPacket> for PatchingHttp {
                 ));
             }
 
-            if should_patch
-                && let Some(patched) = Self::patch_response(&body) {
-                    return serde_json::from_slice(&patched).map_err(|err| {
-                        TransportError::deser_err(err, String::from_utf8_lossy(&patched))
-                    });
-                }
+            if should_patch && let Some(patched) = Self::patch_response(&body) {
+                return serde_json::from_slice(&patched).map_err(|err| {
+                    TransportError::deser_err(err, String::from_utf8_lossy(&patched))
+                });
+            }
             serde_json::from_slice(&body)
                 .map_err(|err| TransportError::deser_err(err, String::from_utf8_lossy(&body)))
         })

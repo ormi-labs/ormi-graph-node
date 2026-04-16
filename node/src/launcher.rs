@@ -20,15 +20,15 @@ use graph::{
     blockchain::{Blockchain, BlockchainKind, BlockchainMap},
     components::network_provider::AmpChainNames,
 };
-use graph_core::polling_monitor::{arweave_service, ArweaveService, IpfsService};
+use graph_core::polling_monitor::{ArweaveService, IpfsService, arweave_service};
 use graph_graphql::prelude::GraphQlRunner;
 use graph_server_http::GraphQLServer as GraphQLQueryServer;
 use graph_server_index_node::IndexNodeServer;
 use graph_server_json_rpc::JsonRpcServer;
 use graph_server_metrics::PrometheusMetricsServer;
 use graph_store_postgres::{
-    register_jobs as register_store_jobs, ChainHeadUpdateListener, ConnectionPool,
-    NotificationSender, Store, SubgraphStore, SubscriptionManager,
+    ChainHeadUpdateListener, ConnectionPool, NotificationSender, Store, SubgraphStore,
+    SubscriptionManager, register_jobs as register_store_jobs,
 };
 use graphman_server::GraphmanServer;
 use graphman_server::GraphmanServerConfig;
@@ -692,25 +692,28 @@ fn spawn_contention_checker(logger: Logger) {
         }
         panic!("ping sender dropped");
     });
-    std::thread::spawn(move || loop {
-        std::thread::sleep(Duration::from_secs(1));
-        let (pong_send, pong_receive) = std::sync::mpsc::sync_channel(1);
-        if graph::futures03::executor::block_on(ping_send.clone().send(pong_send)).is_err() {
-            debug!(logger, "Shutting down contention checker thread");
-            break;
-        }
-        let mut timeout = Duration::from_millis(10);
-        while pong_receive.recv_timeout(timeout) == Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-        {
-            debug!(logger, "Possible contention in tokio threadpool";
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(Duration::from_secs(1));
+            let (pong_send, pong_receive) = std::sync::mpsc::sync_channel(1);
+            if graph::futures03::executor::block_on(ping_send.clone().send(pong_send)).is_err() {
+                debug!(logger, "Shutting down contention checker thread");
+                break;
+            }
+            let mut timeout = Duration::from_millis(10);
+            while pong_receive.recv_timeout(timeout)
+                == Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            {
+                debug!(logger, "Possible contention in tokio threadpool";
                                      "timeout_ms" => timeout.as_millis(),
                                      "code" => LogCode::TokioContention);
-            if timeout < ENV_VARS.kill_if_unresponsive_timeout {
-                timeout *= 10;
-            } else if ENV_VARS.kill_if_unresponsive {
-                // The node is unresponsive, kill it in hopes it will be restarted.
-                crit!(logger, "Node is unresponsive, killing process");
-                std::process::abort()
+                if timeout < ENV_VARS.kill_if_unresponsive_timeout {
+                    timeout *= 10;
+                } else if ENV_VARS.kill_if_unresponsive {
+                    // The node is unresponsive, kill it in hopes it will be restarted.
+                    crit!(logger, "Node is unresponsive, killing process");
+                    std::process::abort()
+                }
             }
         }
     });

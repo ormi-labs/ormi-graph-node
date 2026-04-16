@@ -4,8 +4,8 @@ use graph::{
     components::store::{AggregationCurrent, AttributeNames, ChildMultiplicity, EntityOrder},
     data::{graphql::ObjectOrInterface, store::ID},
     env::ENV_VARS,
-    prelude::{anyhow, q, r, s, QueryExecutionError, ValueMap},
-    schema::{ast::ObjectType, kw, AggregationInterval, ApiSchema, EntityType},
+    prelude::{QueryExecutionError, ValueMap, anyhow, q, r, s},
+    schema::{AggregationInterval, ApiSchema, EntityType, ast::ObjectType, kw},
 };
 
 /// A selection set is a table that maps object types to the fields that

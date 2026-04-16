@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use alloy::primitives::{BlockHash, BlockNumber};
 use graph::{
-    amp::{log::Logger as _, Codec, Manifest},
+    amp::{Codec, Manifest, log::Logger as _},
     cheap_clone::CheapClone,
     components::store::WritableStore,
     data::subgraph::DeploymentHash,

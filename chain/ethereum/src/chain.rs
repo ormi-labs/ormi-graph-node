@@ -1,5 +1,5 @@
-use anyhow::{anyhow, bail, Result};
 use anyhow::{Context, Error};
+use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use graph::blockchain::client::ChainClient;
 use graph::blockchain::firehose_block_ingestor::{FirehoseBlockIngestor, Transforms};
@@ -13,26 +13,27 @@ use graph::data::subgraph::UnifiedMappingApiVersion;
 use graph::firehose::{FirehoseEndpoint, FirehoseEndpoints, ForkStep};
 use graph::futures03::TryStreamExt;
 use graph::prelude::{
-    retry, BlockHash, ComponentLoggerConfig, ElasticComponentLoggerConfig, EthereumBlock,
+    BlockHash, ComponentLoggerConfig, ElasticComponentLoggerConfig, EthereumBlock,
     EthereumCallCache, LightEthereumBlock, LightEthereumBlockExt, MetricsRegistry, StoreError,
+    retry,
 };
 use graph::slog::{debug, error, trace, warn};
 use graph::{
     blockchain::{
+        Block, BlockPtr, Blockchain, ChainHeadUpdateListener, IngestorError,
+        RuntimeAdapter as RuntimeAdapterTrait, TriggerFilter as _,
         block_stream::{
             BlockRefetcher, BlockStreamEvent, BlockWithTriggers, FirehoseError,
             FirehoseMapper as FirehoseMapperTrait, TriggersAdapter as TriggersAdapterTrait,
         },
         firehose_block_stream::FirehoseBlockStream,
-        Block, BlockPtr, Blockchain, ChainHeadUpdateListener, IngestorError,
-        RuntimeAdapter as RuntimeAdapterTrait, TriggerFilter as _,
     },
     cheap_clone::CheapClone,
     components::store::DeploymentLocator,
     firehose,
     prelude::{
-        o, serde_json as json, BlockNumber, ChainStore, EthereumBlockWithCalls, Logger,
-        LoggerFactory,
+        BlockNumber, ChainStore, EthereumBlockWithCalls, Logger, LoggerFactory, o,
+        serde_json as json,
     },
 };
 use prost::Message;
@@ -49,7 +50,9 @@ use crate::ingestor::PollingBlockIngestor;
 use crate::network::EthereumNetworkAdapters;
 use crate::polling_block_stream::PollingBlockStream;
 use crate::runtime::runtime_adapter::eth_call_gas;
+use crate::{BufferedCallCache, NodeCapabilities};
 use crate::{
+    ENV_VARS, SubgraphEthRpcMetrics, TriggerFilter,
     adapter::EthereumAdapter as _,
     codec,
     data_source::{DataSource, UnresolvedDataSource},
@@ -57,9 +60,7 @@ use crate::{
         blocks_with_triggers, get_calls, parse_block_triggers, parse_call_triggers,
         parse_log_triggers,
     },
-    SubgraphEthRpcMetrics, TriggerFilter, ENV_VARS,
 };
-use crate::{BufferedCallCache, NodeCapabilities};
 use crate::{EthereumAdapter, RuntimeAdapter};
 use graph::blockchain::block_stream::{
     BlockStream, BlockStreamBuilder, BlockStreamError, BlockStreamMapper, FirehoseCursor,
@@ -397,9 +398,10 @@ where
         match parent_getter(current_ptr.clone()).await? {
             Some(parent) => {
                 if let Some(root_hash) = &root
-                    && parent.hash == *root_hash {
-                        break;
-                    }
+                    && parent.hash == *root_hash
+                {
+                    break;
+                }
                 current_ptr = parent;
             }
             None => return Ok(None),
@@ -813,7 +815,9 @@ async fn fetch_unique_blocks_from_cache(
         .unwrap_or_default();
 
     // Collect blocks and filter out ones with multiple entries
-    let blocks: Vec<Arc<ExtendedBlockPtr>> = blocks_map.into_values().filter_map(|values| {
+    let blocks: Vec<Arc<ExtendedBlockPtr>> = blocks_map
+        .into_values()
+        .filter_map(|values| {
             if values.len() == 1 {
                 Some(Arc::new(values[0].clone()))
             } else {
@@ -1369,7 +1373,9 @@ impl FirehoseMapperTrait<Chain> for FirehoseMapper {
             }
 
             StepFinal => {
-                unreachable!("irreversible step is not handled and should not be requested in the Firehose request")
+                unreachable!(
+                    "irreversible step is not handled and should not be requested in the Firehose request"
+                )
             }
 
             StepUnset => {

@@ -4,9 +4,9 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use crate::output::OutputConfig;
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 use graph::itertools::Itertools;
-use graph::prelude::serde_json::{json, Value};
+use graph::prelude::serde_json::{Value, json};
 use graph::prelude::{reqwest, serde_json};
 
 /// Parses stdout bytes into a prefixed String

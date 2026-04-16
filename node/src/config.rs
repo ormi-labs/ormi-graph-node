@@ -6,22 +6,23 @@ use graph::{
         store::BLOCK_CACHE_SIZE,
     },
     env::ENV_VARS,
-    firehose::{SubgraphLimit, SUBGRAPHS_PER_CONN},
+    firehose::{SUBGRAPHS_PER_CONN, SubgraphLimit},
     itertools::Itertools,
     prelude::{
-        anyhow::{anyhow, bail, Context, Result},
+        BLOCK_NUMBER_MAX, Logger, NodeId, StoreError,
+        anyhow::{Context, Result, anyhow, bail},
         info,
         regex::Regex,
         serde::{
-            de::{self, value, SeqAccess, Visitor},
             Deserialize, Deserializer,
+            de::{self, SeqAccess, Visitor, value},
         },
-        serde_json, serde_regex, toml, Logger, NodeId, StoreError, BLOCK_NUMBER_MAX,
+        serde_json, serde_regex, toml,
     },
 };
 use graph_chain_ethereum as ethereum;
 use graph_chain_ethereum::{Compression, NodeCapabilities};
-use graph_store_postgres::{DeploymentPlacer, Shard as ShardName, PRIMARY_SHARD};
+use graph_store_postgres::{DeploymentPlacer, PRIMARY_SHARD, Shard as ShardName};
 
 use graph::http::{HeaderMap, Uri};
 use serde::Serialize;
@@ -518,19 +519,20 @@ impl ChainSection {
             // Check that an explicit amp alias doesn't collide with
             // another chain's own name (which would be ambiguous).
             if chain.amp.is_some()
-                && let Some(other) = self.chains.get(effective) {
-                    // Only a collision if the other chain doesn't also
-                    // set the same amp alias (which is covered by the
-                    // duplicate check above).
-                    if other.amp.as_deref() != Some(effective) {
-                        return Err(anyhow!(
-                            "AMP alias `{}` on chain `{}` collides with chain `{}`",
-                            effective,
-                            chain_name,
-                            effective,
-                        ));
-                    }
+                && let Some(other) = self.chains.get(effective)
+            {
+                // Only a collision if the other chain doesn't also
+                // set the same amp alias (which is covered by the
+                // duplicate check above).
+                if other.amp.as_deref() != Some(effective) {
+                    return Err(anyhow!(
+                        "AMP alias `{}` on chain `{}` collides with chain `{}`",
+                        effective,
+                        chain_name,
+                        effective,
+                    ));
                 }
+            }
             amp_names.insert(effective.to_string(), chain_name.clone());
         }
 
@@ -1133,7 +1135,9 @@ impl<'de> Deserialize<'de> for Provider {
                             || features.is_some()
                             || headers.is_some()
                         {
-                            return Err(serde::de::Error::custom("when `details` field is provided, deprecated `url`, `transport`, `features` and `headers` cannot be specified"));
+                            return Err(serde::de::Error::custom(
+                                "when `details` field is provided, deprecated `url`, `transport`, `features` and `headers` cannot be specified",
+                            ));
                         }
 
                         if let ProviderDetails::Firehose(ref mut firehose) = v {
@@ -1324,9 +1328,10 @@ impl Predicate {
 
     pub fn matches(&self, name: &str, network: &str) -> bool {
         if let Some(n) = &self.network
-            && !n.matches(network) {
-                return false;
-            }
+            && !n.matches(network)
+        {
+            return false;
+        }
 
         match self.name.find(name) {
             None => false,
@@ -1505,11 +1510,11 @@ mod tests {
     use std::time::Duration;
 
     use crate::config::{
-        default_block_batch_size, default_block_ingestor_max_concurrent_json_rpc_calls,
-        default_block_ptr_batch_size, default_genesis_block_number, default_get_logs_max_contracts,
-        default_json_rpc_timeout, default_max_block_range_size, default_max_event_only_range,
-        default_polling_interval, default_request_retries, default_target_triggers_per_block_range,
-        ChainSection, Web3Rule,
+        ChainSection, Web3Rule, default_block_batch_size,
+        default_block_ingestor_max_concurrent_json_rpc_calls, default_block_ptr_batch_size,
+        default_genesis_block_number, default_get_logs_max_contracts, default_json_rpc_timeout,
+        default_max_block_range_size, default_max_event_only_range, default_polling_interval,
+        default_request_retries, default_target_triggers_per_block_range,
     };
 
     use super::{
@@ -1520,7 +1525,7 @@ mod tests {
     use graph::firehose::SubgraphLimit;
     use graph::http::{HeaderMap, HeaderValue};
     use graph::prelude::regex::Regex;
-    use graph::prelude::{toml, NodeId};
+    use graph::prelude::{NodeId, toml};
     use graph_chain_ethereum::Compression;
     use std::collections::BTreeSet;
     use std::fs::read_to_string;
@@ -1884,9 +1889,11 @@ mod tests {
         assert!(actual.is_err(), "{:?}", actual);
 
         if let Err(error) = actual {
-            assert!(error
-                .to_string()
-                .starts_with("supported firehose endpoint filters are:"))
+            assert!(
+                error
+                    .to_string()
+                    .starts_with("supported firehose endpoint filters are:")
+            )
         }
     }
 

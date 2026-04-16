@@ -225,9 +225,10 @@ impl PollingBlockStreamContext {
         // Only continue if the subgraph block ptr is behind the head block ptr.
         // subgraph_ptr > head_ptr shouldn't happen, but if it does, it's safest to just stop.
         if let Some(ptr) = &subgraph_ptr
-            && ptr.number >= head_ptr.number {
-                return Ok(ReconciliationStep::Done);
-            }
+            && ptr.number >= head_ptr.number
+        {
+            return Ok(ReconciliationStep::Done);
+        }
 
         // Subgraph ptr is behind head ptr.
         // Let's try to move the subgraph ptr one step in the right direction.

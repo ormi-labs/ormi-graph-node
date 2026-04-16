@@ -1,7 +1,7 @@
 //! Schema (schema.graphql) generation for scaffold.
 
-use super::manifest::{extract_events_from_abi, EventInput};
 use super::ScaffoldOptions;
+use super::manifest::{EventInput, extract_events_from_abi};
 
 /// Generate the schema.graphql content.
 pub fn generate_schema(options: &ScaffoldOptions) -> String {

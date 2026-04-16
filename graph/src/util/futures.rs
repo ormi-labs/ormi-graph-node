@@ -2,14 +2,14 @@ use crate::ext::futures::FutureExtension;
 use futures03::{Future, FutureExt, TryFutureExt};
 use lazy_static::lazy_static;
 use regex::Regex;
-use slog::{debug, trace, warn, Logger};
+use slog::{Logger, debug, trace, warn};
 use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
-use tokio_retry::strategy::{jitter, ExponentialBackoff};
 use tokio_retry::Retry;
+use tokio_retry::strategy::{ExponentialBackoff, jitter};
 
 // Use different limits for test and production code to speed up tests
 #[cfg(debug_assertions)]

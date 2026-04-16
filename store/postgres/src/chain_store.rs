@@ -1,18 +1,18 @@
 use anyhow::anyhow;
 use async_trait::async_trait;
 use diesel::sql_types::Text;
-use diesel::{insert_into, update, ExpressionMethods, OptionalExtension, QueryDsl};
+use diesel::{ExpressionMethods, OptionalExtension, QueryDsl, insert_into, update};
 use diesel_async::AsyncConnection;
-use diesel_async::{scoped_futures::ScopedFutureExt, RunQueryDsl};
+use diesel_async::{RunQueryDsl, scoped_futures::ScopedFutureExt};
 
 use graph::components::store::ChainHeadStore;
 use graph::data::store::ethereum::call;
 use graph::env::ENV_VARS;
 use graph::parking_lot::RwLock;
-use graph::prelude::alloy::primitives::B256;
 use graph::prelude::MetricsRegistry;
+use graph::prelude::alloy::primitives::B256;
 use graph::prometheus::{CounterVec, GaugeVec};
-use graph::slog::{info, o, Logger};
+use graph::slog::{Logger, info, o};
 use graph::stable_hash::crypto_stable_hash;
 use graph::util::herd_cache::HerdCache;
 
@@ -31,15 +31,15 @@ use graph::blockchain::{Block, BlockHash, ChainIdentifier, ExtendedBlockPtr};
 use graph::cheap_clone::CheapClone;
 use graph::components::ethereum::CachedBlock;
 use graph::prelude::{
-    serde_json as json, transaction_receipt::LightTransactionReceipt, BlockNumber, BlockPtr,
-    CachedEthereumCall, ChainStore as ChainStoreTrait, Error, EthereumCallCache,
-    StaleCallCacheResult, StoreError,
+    BlockNumber, BlockPtr, CachedEthereumCall, ChainStore as ChainStoreTrait, Error,
+    EthereumCallCache, StaleCallCacheResult, StoreError, serde_json as json,
+    transaction_receipt::LightTransactionReceipt,
 };
 use graph::{ensure, internal_error};
 
 use self::recent_blocks_cache::RecentBlocksCache;
-use crate::vid_batcher::AdaptiveBatchSize;
 use crate::AsyncPgConnection;
+use crate::vid_batcher::AdaptiveBatchSize;
 use crate::{chain_head_listener::ChainHeadUpdateSender, pool::ConnectionPool};
 
 /// Our own internal notion of a block
@@ -127,13 +127,13 @@ pub use data::Storage;
 /// Encapuslate access to the blocks table for a chain.
 mod data {
     use crate::diesel::dsl::IntervalDsl;
-    use crate::{catalog, AsyncPgConnection};
+    use crate::{AsyncPgConnection, catalog};
     use diesel::dsl::sql;
     use diesel::insert_into;
     use diesel::sql_types::{Array, Binary, Bool, Nullable, Text};
     use diesel::{
-        delete, sql_query, BoolExpressionMethods, ExpressionMethods, JoinOnDsl,
-        NullableExpressionMethods, OptionalExtension, QueryDsl,
+        BoolExpressionMethods, ExpressionMethods, JoinOnDsl, NullableExpressionMethods,
+        OptionalExtension, QueryDsl, delete, sql_query,
     };
     use diesel::{
         deserialize::FromSql,
@@ -151,8 +151,8 @@ mod data {
     use graph::prelude::alloy::primitives::{Address, B256};
     use graph::prelude::transaction_receipt::LightTransactionReceipt;
     use graph::prelude::{
-        info, serde_json as json, BlockNumber, BlockPtr, CachedEthereumCall, Error, Logger,
-        StoreError,
+        BlockNumber, BlockPtr, CachedEthereumCall, Error, Logger, StoreError, info,
+        serde_json as json,
     };
 
     use std::collections::HashMap;
@@ -2236,10 +2236,11 @@ impl ChainHeadPtrCache {
         }
         let guard = self.entry.read();
         if let Some((value, expires)) = guard.as_ref()
-            && Instant::now() < *expires {
-                self.metrics.record_chain_head_ptr_cache_hit(&self.chain);
-                return Some(value.clone());
-            }
+            && Instant::now() < *expires
+        {
+            self.metrics.record_chain_head_ptr_cache_hit(&self.chain);
+            return Some(value.clone());
+        }
         self.metrics.record_chain_head_ptr_cache_miss(&self.chain);
         None
     }
@@ -2273,39 +2274,40 @@ impl ChainHeadPtrCache {
         // Only update estimate if we have a previous value and block number advanced
         // (skip reorgs where new block number <= old)
         if let Some(old_ptr) = old_value.as_ref()
-            && new_value.number > old_ptr.number {
-                let mut last_change = self.last_change.write();
-                let delta_ms = now.duration_since(*last_change).as_millis() as u64;
-                *last_change = now;
+            && new_value.number > old_ptr.number
+        {
+            let mut last_change = self.last_change.write();
+            let delta_ms = now.duration_since(*last_change).as_millis() as u64;
+            *last_change = now;
 
-                let blocks_advanced = (new_value.number - old_ptr.number) as u64;
+            let blocks_advanced = (new_value.number - old_ptr.number) as u64;
 
-                // Increment observation count
-                let obs = AtomicU64::fetch_add(&self.observations, 1, Ordering::Relaxed);
+            // Increment observation count
+            let obs = AtomicU64::fetch_add(&self.observations, 1, Ordering::Relaxed);
 
-                // Ignore unreasonable deltas (> 60s)
-                if delta_ms > 0 && delta_ms < 60_000 {
-                    let per_block_ms = delta_ms / blocks_advanced;
-                    let new_estimate = if obs == 0 {
-                        // First observation - use as initial estimate
-                        per_block_ms
-                    } else {
-                        // EWMA: new = 0.8 * old + 0.2 * observed
-                        let old_estimate =
-                            AtomicU64::load(&self.estimated_block_time_ms, Ordering::Relaxed);
-                        (old_estimate * 4 + per_block_ms) / 5
-                    };
-                    AtomicU64::store(
-                        &self.estimated_block_time_ms,
-                        new_estimate,
-                        Ordering::Relaxed,
-                    );
+            // Ignore unreasonable deltas (> 60s)
+            if delta_ms > 0 && delta_ms < 60_000 {
+                let per_block_ms = delta_ms / blocks_advanced;
+                let new_estimate = if obs == 0 {
+                    // First observation - use as initial estimate
+                    per_block_ms
+                } else {
+                    // EWMA: new = 0.8 * old + 0.2 * observed
+                    let old_estimate =
+                        AtomicU64::load(&self.estimated_block_time_ms, Ordering::Relaxed);
+                    (old_estimate * 4 + per_block_ms) / 5
+                };
+                AtomicU64::store(
+                    &self.estimated_block_time_ms,
+                    new_estimate,
+                    Ordering::Relaxed,
+                );
 
-                    // Update metric gauge
-                    self.metrics
-                        .set_chain_head_ptr_block_time(&self.chain, new_estimate);
-                }
+                // Update metric gauge
+                self.metrics
+                    .set_chain_head_ptr_block_time(&self.chain, new_estimate);
             }
+        }
 
         // Compute TTL and store with expiry
         let ttl = self.current_ttl();

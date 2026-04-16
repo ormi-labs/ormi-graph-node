@@ -1,8 +1,8 @@
 use std::convert::TryFrom;
 use std::mem::MaybeUninit;
 
-use anyhow::anyhow;
 use anyhow::Error;
+use anyhow::anyhow;
 use async_trait::async_trait;
 use graph::blockchain::Blockchain;
 use graph::data_source::subgraph;
@@ -13,14 +13,13 @@ use wasmtime::AsContext;
 use wasmtime::AsContextMut;
 use wasmtime::Memory;
 
-use graph::data_source::{offchain, MappingTrigger, TriggerWithHandler};
+use graph::data_source::{MappingTrigger, TriggerWithHandler, offchain};
 use graph::prelude::*;
 use graph::runtime::AscPtr;
 use graph::runtime::{
-    asc_new,
-    gas::{Gas, GasCounter},
     AscHeap, AscIndexId, AscType, DeterministicHostError, FromAscObj, HostExportError,
-    IndexForAscTypeId,
+    IndexForAscTypeId, asc_new,
+    gas::{Gas, GasCounter},
 };
 pub use into_wasm_ret::IntoWasmRet;
 

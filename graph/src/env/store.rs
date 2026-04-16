@@ -255,11 +255,12 @@ impl TryFrom<InnerStore> for EnvVarsStore {
             ),
         };
         if let Some(timeout) = vars.batch_timeout
-            && timeout < 2 * vars.batch_target_duration {
-                bail!(
-                    "GRAPH_STORE_BATCH_TIMEOUT must be greater than 2*GRAPH_STORE_BATCH_TARGET_DURATION"
-                );
-            }
+            && timeout < 2 * vars.batch_target_duration
+        {
+            bail!(
+                "GRAPH_STORE_BATCH_TIMEOUT must be greater than 2*GRAPH_STORE_BATCH_TARGET_DURATION"
+            );
+        }
         if vars.batch_workers < 1 {
             bail!("GRAPH_STORE_BATCH_WORKERS must be at least 1");
         }

@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 
 /// Network-specific configuration for a data source.
@@ -86,24 +86,26 @@ pub fn apply_network_config(
 ) -> Result<()> {
     // Update data sources
     if let Some(data_sources) = manifest.get_mut("dataSources")
-        && let Some(arr) = data_sources.as_sequence_mut() {
-            for ds in arr.iter_mut() {
-                update_data_source(ds, network, network_config)?;
-            }
+        && let Some(arr) = data_sources.as_sequence_mut()
+    {
+        for ds in arr.iter_mut() {
+            update_data_source(ds, network, network_config)?;
         }
+    }
 
     // Update templates to use the same network
     if let Some(templates) = manifest.get_mut("templates")
-        && let Some(arr) = templates.as_sequence_mut() {
-            for template in arr.iter_mut() {
-                if let Some(mapping) = template.as_mapping_mut() {
-                    mapping.insert(
-                        serde_yaml::Value::String("network".to_string()),
-                        serde_yaml::Value::String(network.to_string()),
-                    );
-                }
+        && let Some(arr) = templates.as_sequence_mut()
+    {
+        for template in arr.iter_mut() {
+            if let Some(mapping) = template.as_mapping_mut() {
+                mapping.insert(
+                    serde_yaml::Value::String("network".to_string()),
+                    serde_yaml::Value::String(network.to_string()),
+                );
             }
         }
+    }
 
     Ok(())
 }

@@ -6,7 +6,7 @@ use arrow::array::RecordBatch;
 use chrono::{DateTime, Utc};
 use graph::{
     amp::{
-        codec::{utils::auto_block_timestamp_decoder, DecodeOutput, DecodedEntity, Decoder},
+        codec::{DecodeOutput, DecodedEntity, Decoder, utils::auto_block_timestamp_decoder},
         stream_aggregator::{RecordBatchGroup, RecordBatchGroups, StreamRecordBatch},
     },
     blockchain::block_stream::FirehoseCursor,
@@ -15,7 +15,7 @@ use graph::{
 };
 use slog::{debug, trace};
 
-use super::{data_stream::TablePtr, Compat, Context, Error};
+use super::{Compat, Context, Error, data_stream::TablePtr};
 
 pub(super) async fn process_record_batch_groups<AC>(
     cx: &mut Context<AC>,

@@ -13,8 +13,8 @@ use crate::{
     data::subgraph::{DeploymentHash, UnifiedMappingApiVersion},
     data_source,
     prelude::{
-        transaction_receipt::LightTransactionReceipt, BlockHash, ChainStore,
-        DataSourceTemplateInfo, StoreError,
+        BlockHash, ChainStore, DataSourceTemplateInfo, StoreError,
+        transaction_receipt::LightTransactionReceipt,
     },
 };
 use alloy::primitives::{B256, U256};
@@ -29,17 +29,17 @@ use std::{
 };
 
 use super::{
-    block_stream::{self, BlockStream, FirehoseCursor},
-    client::ChainClient,
     BlockIngestor, BlockTime, ChainIdentifier, EmptyNodeCapabilities, ExtendedBlockPtr, HostFn,
     IngestorError, MappingTriggerTrait, NoopDecoderHook, Trigger, TriggerFilterWrapper,
     TriggerWithHandler,
+    block_stream::{self, BlockStream, FirehoseCursor},
+    client::ChainClient,
 };
 
 use super::{
-    block_stream::BlockWithTriggers, Block, BlockPtr, Blockchain, BlockchainKind, DataSource,
-    DataSourceTemplate, RuntimeAdapter, TriggerData, TriggerFilter, TriggersAdapter,
-    UnresolvedDataSource, UnresolvedDataSourceTemplate,
+    Block, BlockPtr, Blockchain, BlockchainKind, DataSource, DataSourceTemplate, RuntimeAdapter,
+    TriggerData, TriggerFilter, TriggersAdapter, UnresolvedDataSource,
+    UnresolvedDataSourceTemplate, block_stream::BlockWithTriggers,
 };
 
 #[derive(Debug)]

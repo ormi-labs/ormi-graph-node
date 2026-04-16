@@ -10,7 +10,7 @@ use graph::data::query::QueryExecutionError;
 use graph::data::store::{Attribute, Value, ValueType};
 use graph::data::value::Object;
 use graph::data::value::Value as DataValue;
-use graph::prelude::{r, TryFromValue, ENV_VARS};
+use graph::prelude::{ENV_VARS, TryFromValue, r};
 use graph::schema::ast::{self as sast, FilterOp};
 use graph::schema::kw;
 use graph::schema::{EntityType, InputSchema, ObjectOrInterface};
@@ -258,9 +258,7 @@ fn build_filter_from_object(
             let filter_list = column_filters.join(", ");
             let example = format!(
                 "Instead of:\nwhere: {{ {}, or: [...] }}\n\nUse:\nwhere: {{ or: [{{ {}, ... }}, {{ {}, ... }}] }}",
-                filter_list,
-                filter_list,
-                filter_list
+                filter_list, filter_list, filter_list
             );
             return Err(QueryExecutionError::InvalidOrFilterStructure(
                 column_filters,
@@ -695,10 +693,9 @@ mod tests {
         data::value::Object,
         prelude::lazy_static,
         prelude::{
-            r,
+            AttributeNames, BLOCK_NUMBER_MAX, DeploymentHash, EntityCollection, EntityFilter,
+            EntityOrder, EntityRange, Value, ValueType, r,
             s::{self, Directive, Field, InputValue, ObjectType, Type, Value as SchemaValue},
-            AttributeNames, DeploymentHash, EntityCollection, EntityFilter, EntityOrder,
-            EntityRange, Value, ValueType, BLOCK_NUMBER_MAX,
         },
         schema::{EntityType, InputSchema},
     };
@@ -1218,7 +1215,9 @@ mod tests {
                 assert!(example.contains("Instead of:"));
                 assert!(example.contains("where: { 'name_gt', or: [...] }"));
                 assert!(example.contains("Use:"));
-                assert!(example.contains("where: { or: [{ 'name_gt', ... }, { 'name_gt', ... }] }"));
+                assert!(
+                    example.contains("where: { or: [{ 'name_gt', ... }, { 'name_gt', ... }] }")
+                );
             }
             _ => panic!("Expected InvalidOrFilterStructure error, got: {}", error),
         }
@@ -1247,7 +1246,9 @@ mod tests {
         assert!(error_msg.contains("Instead of:"));
         assert!(error_msg.contains("Use:"));
         assert!(error_msg.contains("where: { 'age_gt', 'name', or: [...] }"));
-        assert!(error_msg
-            .contains("where: { or: [{ 'age_gt', 'name', ... }, { 'age_gt', 'name', ... }] }"));
+        assert!(
+            error_msg
+                .contains("where: { or: [{ 'age_gt', 'name', ... }, { 'age_gt', 'name', ... }] }")
+        );
     }
 }

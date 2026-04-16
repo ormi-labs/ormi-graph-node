@@ -3,10 +3,10 @@ use alloy::{
         AnyHeader, AnyReceiptEnvelope, AnyRpcHeader, AnyTxEnvelope, ReceiptResponse,
         TransactionResponse,
     },
-    primitives::{Address, Bytes, B256, U256},
+    primitives::{Address, B256, Bytes, U256},
     rpc::types::{
-        trace::parity::{Action, LocalizedTransactionTrace, TraceOutput},
         Block, Header, Log, Transaction, TransactionReceipt,
+        trace::parity::{Action, LocalizedTransactionTrace, TraceOutput},
     },
 };
 use serde::{Deserialize, Serialize};

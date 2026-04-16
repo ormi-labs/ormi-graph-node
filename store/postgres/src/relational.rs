@@ -26,12 +26,12 @@ use diesel::deserialize::FromSql;
 use diesel::pg::Pg;
 use diesel::serialize::{Output, ToSql};
 use diesel::sql_types::Text;
-use diesel::{debug_query, sql_query, OptionalExtension, QueryDsl, QueryResult};
+use diesel::{OptionalExtension, QueryDsl, QueryResult, debug_query, sql_query};
 use diesel_async::scoped_futures::ScopedFutureExt;
 use diesel_async::{AsyncConnection, RunQueryDsl, SimpleAsyncConnection};
 
-use graph::blockchain::block_stream::{EntityOperationKind, EntitySourceOperation};
 use graph::blockchain::BlockTime;
+use graph::blockchain::block_stream::{EntityOperationKind, EntitySourceOperation};
 use graph::cheap_clone::CheapClone;
 use graph::components::store::write::{RowGroup, WriteChunk};
 use graph::data::graphql::TypeExt as _;
@@ -39,7 +39,7 @@ use graph::data::query::Trace;
 use graph::data::value::Word;
 use graph::data_source::CausalityRegion;
 use graph::internal_error;
-use graph::prelude::{q, EntityQuery, StopwatchMetrics, ENV_VARS};
+use graph::prelude::{ENV_VARS, EntityQuery, StopwatchMetrics, q};
 use graph::schema::{
     AggregationInterval, EntityKey, EntityType, Field, FulltextConfig, FulltextDefinition,
     InputSchema,
@@ -71,17 +71,17 @@ use crate::{
     },
 };
 use graph::components::store::{AttributeNames, DerivedEntityQuery};
-use graph::data::store::{IdList, IdType, BYTES_SCALAR};
+use graph::data::store::{BYTES_SCALAR, IdList, IdType};
 use graph::data::subgraph::schema::POI_TABLE;
 use graph::prelude::{
-    anyhow, info, BlockNumber, DeploymentHash, Entity, EntityOperation, Logger,
-    QueryExecutionError, StoreError, ValueType,
+    BlockNumber, DeploymentHash, Entity, EntityOperation, Logger, QueryExecutionError, StoreError,
+    ValueType, anyhow, info,
 };
 
-use crate::block_range::{BoundSide, BLOCK_COLUMN, BLOCK_RANGE_COLUMN, CAUSALITY_REGION_COLUMN};
-pub use crate::catalog::Catalog;
 use crate::ForeignServer;
-use crate::{catalog, deployment, AsyncPgConnection};
+use crate::block_range::{BLOCK_COLUMN, BLOCK_RANGE_COLUMN, BoundSide, CAUSALITY_REGION_COLUMN};
+pub use crate::catalog::Catalog;
+use crate::{AsyncPgConnection, catalog, deployment};
 
 use self::rollup::Rollup;
 
@@ -1039,7 +1039,8 @@ impl Layout {
             }
             return Err(internal_error!(
                 "entities of type `{}` can not be deleted since they are immutable. Entity ids are [{}]",
-                table.object, group.ids().join(", ")
+                table.object,
+                group.ids().join(", ")
             ));
         }
 

@@ -5,20 +5,20 @@ use async_trait::async_trait;
 use graph::components::graphql::GraphQLMetrics as _;
 use graph::components::store::QueryPermit;
 use graph::data::graphql::load_manager::LoadManager;
-use graph::data::graphql::{object, ObjectOrInterface};
+use graph::data::graphql::{ObjectOrInterface, object};
 use graph::data::query::{CacheStatus, QueryResults, Trace};
 use graph::data::store::ID;
 use graph::data::value::{Object, Word};
 use graph::derive::CheapClone;
 use graph::prelude::alloy::primitives::B256;
 use graph::prelude::*;
+use graph::schema::{BLOCK_FIELD_TYPE, ErrorPolicy};
 use graph::schema::{
-    ast as sast, INTROSPECTION_SCHEMA_FIELD_NAME, INTROSPECTION_TYPE_FIELD_NAME, META_FIELD_NAME,
-    META_FIELD_TYPE,
+    INTROSPECTION_SCHEMA_FIELD_NAME, INTROSPECTION_TYPE_FIELD_NAME, META_FIELD_NAME,
+    META_FIELD_TYPE, ast as sast,
 };
-use graph::schema::{ErrorPolicy, BLOCK_FIELD_TYPE};
 
-use crate::execution::{ast as a, Query};
+use crate::execution::{Query, ast as a};
 use crate::metrics::GraphQLMetrics;
 use crate::prelude::{ExecutionContext, Resolver};
 use crate::query::ext::BlockConstraint;
@@ -329,8 +329,11 @@ impl Resolver for StoreResolver {
                         let child1_id = child_id(&children[1]);
                         QueryExecutionError::InternalError(format!(
                             "expected only one child for {}.{} but got {}. One child has id {}, another has id {}",
-                            object_type.name(), field.name,
-                            children.len(), child0_id, child1_id
+                            object_type.name(),
+                            field.name,
+                            children.len(),
+                            child0_id,
+                            child1_id
                         ))
                     }
                 };

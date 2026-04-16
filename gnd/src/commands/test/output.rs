@@ -5,7 +5,7 @@ use similar::{ChangeTag, TextDiff};
 
 use super::assertion::align_for_diff;
 use super::schema::{AssertionFailure, AssertionOutcome, TestResult};
-use crate::output::{step, Step};
+use crate::output::{Step, step};
 
 pub fn print_test_start(path: &std::path::Path) {
     step(Step::Load, &format!("Running {}", path.display()));

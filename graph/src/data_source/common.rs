@@ -12,13 +12,13 @@ use crate::{
 };
 use alloy::primitives::{Address, U256};
 use alloy::rpc::types::Log;
-use anyhow::{anyhow, Context, Error};
+use anyhow::{Context, Error, anyhow};
 use graph_derive::CheapClone;
 use lazy_static::lazy_static;
 use num_bigint::Sign;
 use regex::Regex;
-use serde::de;
 use serde::Deserialize;
+use serde::de;
 use serde_json;
 use slog::Logger;
 use std::collections::HashMap;
@@ -57,9 +57,10 @@ fn normalize_abi_json(json_bytes: &[u8]) -> Result<Vec<u8>, anyhow::Error> {
             if let Some(obj) = item.as_object_mut() {
                 if let Some(state_mutability) = obj.get_mut("stateMutability")
                     && let Some(s) = state_mutability.as_str()
-                        && s == "undefined" {
-                            *state_mutability = serde_json::Value::String("nonpayable".to_string());
-                        }
+                    && s == "undefined"
+                {
+                    *state_mutability = serde_json::Value::String("nonpayable".to_string());
+                }
 
                 let item_type = obj.get("type").and_then(|t| t.as_str());
 
@@ -183,35 +184,36 @@ impl AbiJson {
             // Only process events
             if item.get("type").and_then(|t| t.as_str()) == Some("event")
                 && let Some(item_event_name) = item.get("name").and_then(|n| n.as_str())
-                    && item_event_name == event_name {
-                        // Found the event, now look for the parameter
-                        if let Some(inputs) = item.get("inputs").and_then(|i| i.as_array()) {
-                            for input in inputs {
-                                if let Some(input_param_name) =
-                                    input.get("name").and_then(|n| n.as_str())
-                                    && input_param_name == param_name {
-                                        // Found the parameter, check if it's a struct
-                                        if let Some(param_type) =
-                                            input.get("type").and_then(|t| t.as_str())
-                                            && param_type == "tuple"
-                                                && let Some(components) = input.get("components") {
-                                                    // Parse the ParamType from the JSON (simplified for now)
-                                                    let param_type = abi::DynSolType::Tuple(vec![]);
-                                                    return StructFieldInfo::from_components(
-                                                        param_name.to_string(),
-                                                        param_type,
-                                                        components,
-                                                    )
-                                                    .map(Some);
-                                                }
-                                        // Parameter found but not a struct
-                                        return Ok(None);
-                                    }
+                && item_event_name == event_name
+            {
+                // Found the event, now look for the parameter
+                if let Some(inputs) = item.get("inputs").and_then(|i| i.as_array()) {
+                    for input in inputs {
+                        if let Some(input_param_name) = input.get("name").and_then(|n| n.as_str())
+                            && input_param_name == param_name
+                        {
+                            // Found the parameter, check if it's a struct
+                            if let Some(param_type) = input.get("type").and_then(|t| t.as_str())
+                                && param_type == "tuple"
+                                && let Some(components) = input.get("components")
+                            {
+                                // Parse the ParamType from the JSON (simplified for now)
+                                let param_type = abi::DynSolType::Tuple(vec![]);
+                                return StructFieldInfo::from_components(
+                                    param_name.to_string(),
+                                    param_type,
+                                    components,
+                                )
+                                .map(Some);
                             }
+                            // Parameter found but not a struct
+                            return Ok(None);
                         }
-                        // Event found but parameter not found
-                        return Ok(None);
                     }
+                }
+                // Event found but parameter not found
+                return Ok(None);
+            }
         }
 
         // Event not found
@@ -242,37 +244,34 @@ impl AbiJson {
             // Only process events
             if item.get("type").and_then(|t| t.as_str()) == Some("event")
                 && let Some(item_event_name) = item.get("name").and_then(|n| n.as_str())
-                    && item_event_name == event_name {
-                        // Found the event, now look for the parameter
-                        if let Some(inputs) = item.get("inputs").and_then(|i| i.as_array()) {
-                            for input in inputs {
-                                if let Some(input_param_name) =
-                                    input.get("name").and_then(|n| n.as_str())
-                                    && input_param_name == param_name {
-                                        // Found the parameter, check if it's a struct
-                                        if let Some(param_type) =
-                                            input.get("type").and_then(|t| t.as_str())
-                                            && param_type == "tuple"
-                                                && let Some(components) = input.get("components") {
-                                                    // If no nested path, this is the end
-                                                    if nested_path.is_empty() {
-                                                        return Ok(Some(vec![]));
-                                                    }
-                                                    // Recursively resolve the nested path
-                                                    return Self::resolve_field_path(
-                                                        components,
-                                                        nested_path,
-                                                    )
-                                                    .map(Some);
-                                                }
-                                        // Parameter found but not a struct
-                                        return Ok(None);
-                                    }
+                && item_event_name == event_name
+            {
+                // Found the event, now look for the parameter
+                if let Some(inputs) = item.get("inputs").and_then(|i| i.as_array()) {
+                    for input in inputs {
+                        if let Some(input_param_name) = input.get("name").and_then(|n| n.as_str())
+                            && input_param_name == param_name
+                        {
+                            // Found the parameter, check if it's a struct
+                            if let Some(param_type) = input.get("type").and_then(|t| t.as_str())
+                                && param_type == "tuple"
+                                && let Some(components) = input.get("components")
+                            {
+                                // If no nested path, this is the end
+                                if nested_path.is_empty() {
+                                    return Ok(Some(vec![]));
+                                }
+                                // Recursively resolve the nested path
+                                return Self::resolve_field_path(components, nested_path).map(Some);
                             }
+                            // Parameter found but not a struct
+                            return Ok(None);
                         }
-                        // Event found but parameter not found
-                        return Ok(None);
                     }
+                }
+                // Event found but parameter not found
+                return Ok(None);
+            }
         }
 
         // Event not found
@@ -346,42 +345,40 @@ impl AbiJson {
         // It's a field name - find it in the current level
         for (index, component) in components_array.iter().enumerate() {
             if let Some(component_name) = component.get("name").and_then(|n| n.as_str())
-                && component_name == field_accessor {
-                    // Found the field
-                    if remaining_path.is_empty() {
-                        // This is the final field, return its index
-                        return Ok(vec![index]);
-                    } else {
-                        // We need to go deeper - check if this component is a tuple
-                        if let Some(component_type) = component.get("type").and_then(|t| t.as_str())
-                        {
-                            if component_type == "tuple" {
-                                if let Some(nested_components) = component.get("components") {
-                                    // Recursively resolve the remaining path
-                                    let mut result = vec![index];
-                                    let nested_result = Self::resolve_field_path(
-                                        nested_components,
-                                        remaining_path,
-                                    )?;
-                                    result.extend(nested_result);
-                                    return Ok(result);
-                                } else {
-                                    return Err(anyhow!(
-                                        "Tuple field '{}' has no components",
-                                        field_accessor
-                                    ));
-                                }
+                && component_name == field_accessor
+            {
+                // Found the field
+                if remaining_path.is_empty() {
+                    // This is the final field, return its index
+                    return Ok(vec![index]);
+                } else {
+                    // We need to go deeper - check if this component is a tuple
+                    if let Some(component_type) = component.get("type").and_then(|t| t.as_str()) {
+                        if component_type == "tuple" {
+                            if let Some(nested_components) = component.get("components") {
+                                // Recursively resolve the remaining path
+                                let mut result = vec![index];
+                                let nested_result =
+                                    Self::resolve_field_path(nested_components, remaining_path)?;
+                                result.extend(nested_result);
+                                return Ok(result);
                             } else {
                                 return Err(anyhow!(
-                                    "Field '{}' is not a struct (type: {}), cannot access nested field '{}'",
-                                    field_accessor,
-                                    component_type,
-                                    remaining_path[0]
+                                    "Tuple field '{}' has no components",
+                                    field_accessor
                                 ));
                             }
+                        } else {
+                            return Err(anyhow!(
+                                "Field '{}' is not a struct (type: {}), cannot access nested field '{}'",
+                                field_accessor,
+                                component_type,
+                                remaining_path[0]
+                            ));
                         }
                     }
                 }
+            }
         }
 
         // Field not found at this level
@@ -540,9 +537,9 @@ impl CallDecl {
             },
             CallArg::Subgraph(_) => {
                 return Err(anyhow!(
-                "In declarative call '{}': Subgraph params are not supported for event handlers",
-                self.label
-            ))
+                    "In declarative call '{}': Subgraph params are not supported for event handlers",
+                    self.label
+                ));
             }
         };
         Ok(address)
@@ -857,7 +854,9 @@ impl CallDecl {
                 _ => {
                     return Err(anyhow!(
                         "In declarative call '{}': cannot access field on non-struct/tuple at access step {} (field path: {:?})",
-                        call_label, index, field_accesses
+                        call_label,
+                        index,
+                        field_accesses
                     ));
                 }
             }
@@ -1171,9 +1170,10 @@ impl CallArg {
     ) -> Result<Self, anyhow::Error> {
         // Handle hex addresses first
         if ADDR_RE.is_match(s)
-            && let Ok(parsed_address) = Address::from_str(s) {
-                return Ok(CallArg::HexAddress(parsed_address));
-            }
+            && let Ok(parsed_address) = Address::from_str(s)
+        {
+            return Ok(CallArg::HexAddress(parsed_address));
+        }
 
         // Context validation
         let starts_with_event = s.starts_with("event.");
@@ -1217,11 +1217,11 @@ impl CallArg {
                     // Validate spec version before allowing any struct field access
                     if spec_version < &SPEC_VERSION_1_4_0 {
                         return Err(anyhow!(
-                                "Struct field access 'event.params.{}.*' in declarative calls is only supported for specVersion >= 1.4.0, current version is {}. Event: '{}'",
-                                param,
-                                spec_version,
-                                event_signature.unwrap_or("unknown")
-                            ));
+                            "Struct field access 'event.params.{}.*' in declarative calls is only supported for specVersion >= 1.4.0, current version is {}. Event: '{}'",
+                            param,
+                            spec_version,
+                            event_signature.unwrap_or("unknown")
+                        ));
                     }
 
                     // Resolve field path - supports both numeric and named fields
@@ -2382,8 +2382,6 @@ mod tests {
                 ]
             }
         ]"#;
-
-        
 
         AbiJson::new(ABI_JSON.as_bytes()).unwrap()
     }

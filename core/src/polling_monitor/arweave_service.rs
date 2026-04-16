@@ -8,7 +8,7 @@ use graph::{
     prelude::CheapClone,
 };
 use std::{sync::Arc, time::Duration};
-use tower::{buffer::Buffer, ServiceBuilder, ServiceExt};
+use tower::{ServiceBuilder, ServiceExt, buffer::Buffer};
 
 pub type ArweaveService = Buffer<Base64, BoxFuture<'static, Result<Option<Bytes>, Error>>>;
 

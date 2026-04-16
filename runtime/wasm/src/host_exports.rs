@@ -24,7 +24,7 @@ use graph::data_source::{CausalityRegion, DataSource, EntityTypeAccess};
 use graph::ensure;
 use graph::prelude::serde_json;
 use graph::prelude::{slog::b, slog::record_static, *};
-use graph::runtime::gas::{self, complexity, Gas, GasCounter};
+use graph::runtime::gas::{self, Gas, GasCounter, complexity};
 pub use graph::runtime::{DeterministicHostError, HostExportError};
 
 use crate::module::WasmInstance;
@@ -178,7 +178,9 @@ impl HostExports {
             });
 
             if has_invalid_fields {
-                let mut invalid_fields: Vec<Word> = data.keys().filter_map(|field_name| {
+                let mut invalid_fields: Vec<Word> = data
+                    .keys()
+                    .filter_map(|field_name| {
                         if !state
                             .entity_cache
                             .schema
@@ -1297,7 +1299,7 @@ pub mod test_support {
         components::{store::GetScope, subgraph::SharedProofOfIndexing},
         data::value::Word,
         prelude::{BlockState, Entity, StopwatchMetrics, Value},
-        runtime::{gas::GasCounter, HostExportError},
+        runtime::{HostExportError, gas::GasCounter},
         slog::Logger,
     };
 
@@ -1369,7 +1371,9 @@ fn bytes_to_string_is_lossy() {
         "Downcoin WETH-USDT",
         bytes_to_string(
             &graph::log::logger(true),
-            vec![68, 111, 119, 110, 99, 111, 105, 110, 32, 87, 69, 84, 72, 45, 85, 83, 68, 84],
+            vec![
+                68, 111, 119, 110, 99, 111, 105, 110, 32, 87, 69, 84, 72, 45, 85, 83, 68, 84
+            ],
         )
     );
 

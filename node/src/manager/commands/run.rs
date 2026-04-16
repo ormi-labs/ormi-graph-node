@@ -2,11 +2,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::MetricsContext;
 use crate::config::Config;
 use crate::manager::PanicSubscriptionManager;
 use crate::network_setup::Networks;
 use crate::store_builder::StoreBuilder;
-use crate::MetricsContext;
 use graph::amp;
 use graph::anyhow::bail;
 use graph::cheap_clone::CheapClone;
@@ -17,11 +17,11 @@ use graph::components::subgraph::{Settings, SubgraphInstanceManager as _};
 use graph::endpoint::EndpointMetrics;
 use graph::env::EnvVars;
 use graph::prelude::{
-    anyhow, tokio, BlockNumber, DeploymentHash, IpfsResolver, LoggerFactory, NodeId,
+    BlockNumber, DeploymentHash, ENV_VARS, IpfsResolver, LoggerFactory, NodeId,
     SubgraphCountMetric, SubgraphName, SubgraphRegistrar, SubgraphStore,
-    SubgraphVersionSwitchingMode, ENV_VARS,
+    SubgraphVersionSwitchingMode, anyhow, tokio,
 };
-use graph::slog::{debug, info, Logger};
+use graph::slog::{Logger, debug, info};
 use graph_core::polling_monitor::{arweave_service, ipfs_service};
 use tokio_util::sync::CancellationToken;
 

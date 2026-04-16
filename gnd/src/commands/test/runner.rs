@@ -10,6 +10,7 @@
 //! 5. Waits for all blocks to be processed (or a fatal error)
 //! 6. Runs GraphQL assertions against the indexed entity state
 
+use super::TestOpt;
 use super::assertion::run_assertions;
 use super::block_stream::StaticStreamBuilder;
 use super::mock_arweave::MockArweaveResolver;
@@ -20,9 +21,8 @@ use super::mock_transport::MockTransport;
 use super::noop::{NoopAdapterSelector, StaticBlockRefetcher};
 use super::schema::{TestFile, TestResult};
 use super::trigger::build_blocks_with_triggers;
-use super::TestOpt;
-use crate::manifest::{load_manifest, Manifest};
-use anyhow::{anyhow, ensure, Context, Result};
+use crate::manifest::{Manifest, load_manifest};
+use anyhow::{Context, Result, anyhow, ensure};
 use graph::amp::FlightClient;
 use graph::blockchain::block_stream::BlockWithTriggers;
 use graph::blockchain::{BlockPtr, BlockchainMap, ChainIdentifier};
@@ -44,11 +44,11 @@ use graph::prelude::{
     DeploymentHash, LoggerFactory, NodeId, SubgraphCountMetric, SubgraphName, SubgraphRegistrar,
     SubgraphStore as SubgraphStoreTrait, SubgraphVersionSwitchingMode,
 };
-use graph::slog::{info, o, Logger};
+use graph::slog::{Logger, info, o};
 use graph_chain_ethereum::network::{EthereumNetworkAdapter, EthereumNetworkAdapters};
 use graph_chain_ethereum::{
-    chain::ChainSettings, Chain, EthereumAdapter, NodeCapabilities, ProviderEthRpcMetrics,
-    Transport,
+    Chain, EthereumAdapter, NodeCapabilities, ProviderEthRpcMetrics, Transport,
+    chain::ChainSettings,
 };
 use graph_core::polling_monitor::{arweave_service, ipfs_service};
 use graph_graphql::prelude::GraphQlRunner;

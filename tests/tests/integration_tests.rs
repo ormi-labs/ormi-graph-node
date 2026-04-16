@@ -14,7 +14,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use graph::components::subgraph::{
     ProofOfIndexing, ProofOfIndexingEvent, ProofOfIndexingFinisher, ProofOfIndexingVersion,
 };
@@ -22,13 +22,13 @@ use graph::data::store::Id;
 use graph::entity;
 use graph::futures03::StreamExt;
 use graph::itertools::Itertools;
-use graph::prelude::serde_json::{json, Value};
-use graph::prelude::{alloy::primitives::Address, hex, BlockPtr, DeploymentHash};
+use graph::prelude::serde_json::{Value, json};
+use graph::prelude::{BlockPtr, DeploymentHash, alloy::primitives::Address, hex};
 use graph::schema::InputSchema;
-use graph::slog::{o, Discard, Logger};
+use graph::slog::{Discard, Logger, o};
 use graph_tests::contract::Contract;
 use graph_tests::subgraph::Subgraph;
-use graph_tests::{error, status, CONFIG};
+use graph_tests::{CONFIG, error, status};
 use tokio::process::Child;
 use tokio::task::JoinError;
 use tokio::time::sleep;
@@ -1200,9 +1200,9 @@ async fn test_declared_calls_basic(ctx: TestContext) -> anyhow::Result<()> {
             );
             let Some(act_value) = call_result["value"].as_str() else {
                 panic!(
-                "Expected call result with label '{}' to have a string 'value' field, but got: {:?}",
-                label, call_result["value"]
-            );
+                    "Expected call result with label '{}' to have a string 'value' field, but got: {:?}",
+                    label, call_result["value"]
+                );
             };
             assert_eq!(
                 exp_value, act_value,

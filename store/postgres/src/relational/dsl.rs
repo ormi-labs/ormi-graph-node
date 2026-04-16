@@ -6,7 +6,7 @@ use std::marker::PhantomData;
 
 use diesel::backend::Backend;
 use diesel::dsl::sql;
-use diesel::expression::{expression_types, is_aggregate, TypedExpressionType, ValidGrouping};
+use diesel::expression::{TypedExpressionType, ValidGrouping, expression_types, is_aggregate};
 use diesel::pg::Pg;
 use diesel::query_builder::{
     AsQuery, AstPass, BoxedSelectStatement, FromClause, Query, QueryFragment, QueryId,
@@ -21,17 +21,17 @@ use diesel::sql_types::{
 };
 use diesel::{AppearsOnTable, Expression, QueryDsl, QueryResult, SelectableExpression};
 use diesel_dynamic_schema::DynamicSelectClause;
-use graph::components::store::{AttributeNames, BlockNumber, StoreError, BLOCK_NUMBER_MAX};
-use graph::data::store::{Id, IdType, ID, VID};
+use graph::components::store::{AttributeNames, BLOCK_NUMBER_MAX, BlockNumber, StoreError};
+use graph::data::store::{ID, Id, IdType, VID};
 use graph::data_source::CausalityRegion;
-use graph::prelude::{lazy_static, ENV_VARS};
+use graph::prelude::{ENV_VARS, lazy_static};
 
 use crate::relational::ColumnType;
 use crate::relational_queries::PARENT_ID;
 
-use super::value::FromOidRow;
 use super::Column as RelColumn;
 use super::SqlName;
+use super::value::FromOidRow;
 use super::{BLOCK_COLUMN, BLOCK_RANGE_COLUMN, CAUSALITY_REGION_COLUMN};
 
 const TYPENAME: &str = "__typename";

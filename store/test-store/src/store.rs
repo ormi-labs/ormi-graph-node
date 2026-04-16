@@ -1,13 +1,13 @@
 use diesel;
-use graph::blockchain::mock::MockDataSource;
 use graph::blockchain::BlockTime;
 use graph::blockchain::ChainIdentifier;
+use graph::blockchain::mock::MockDataSource;
 use graph::components::store::{BlockStore, SeqGenerator};
 use graph::data::graphql::load_manager::LoadManager;
 use graph::data::query::QueryResults;
 use graph::data::query::QueryTarget;
-use graph::data::subgraph::schema::{DeploymentCreate, SubgraphError};
 use graph::data::subgraph::SubgraphFeature;
+use graph::data::subgraph::schema::{DeploymentCreate, SubgraphError};
 use graph::data_source::DataSource;
 use graph::log;
 use graph::prelude::alloy::primitives::B256;
@@ -21,16 +21,16 @@ use graph::{
     data::subgraph::status, prelude::NodeId,
 };
 use graph_graphql::prelude::{
-    execute_query, Query as PreparedQuery, QueryExecutionOptions, StoreResolver,
+    Query as PreparedQuery, QueryExecutionOptions, StoreResolver, execute_query,
 };
 use graph_graphql::test_support::GraphQLMetrics;
 use graph_node::config::{Config, Opt};
 use graph_node::store_builder::StoreBuilder;
 use graph_store_postgres::AsyncPgConnection;
 use graph_store_postgres::{
-    layout_for_tests::FAKE_NETWORK_SHARED, BlockStore as DieselBlockStore, ConnectionPool,
-    DeploymentPlacer, Shard, SubgraphStore as DieselSubgraphStore, SubscriptionManager,
-    PRIMARY_SHARD,
+    BlockStore as DieselBlockStore, ConnectionPool, DeploymentPlacer, PRIMARY_SHARD, Shard,
+    SubgraphStore as DieselSubgraphStore, SubscriptionManager,
+    layout_for_tests::FAKE_NETWORK_SHARED,
 };
 use hex_literal::hex;
 use lazy_static::lazy_static;
@@ -419,8 +419,8 @@ pub async fn revert_block(store: &Arc<Store>, deployment: &DeploymentLocator, pt
 }
 
 pub async fn insert_ens_name(hash: &str, name: &str) {
-    use diesel::insert_into;
     use diesel::ExpressionMethods;
+    use diesel::insert_into;
     use diesel_async::RunQueryDsl;
     use graph_store_postgres::command_support::catalog::ens_names;
 
@@ -626,13 +626,17 @@ fn build_store() -> (Arc<Store>, ConnectionPool, Config, Arc<SubscriptionManager
         let file = file.into_string().unwrap();
         opt.config = Some(file);
         if url.is_some() {
-            eprintln!("WARNING: ignoring THEGRAPH_STORE_POSTGRES_DIESEL_URL because GRAPH_NODE_TEST_CONFIG is set");
+            eprintln!(
+                "WARNING: ignoring THEGRAPH_STORE_POSTGRES_DIESEL_URL because GRAPH_NODE_TEST_CONFIG is set"
+            );
         }
     } else if let Some(url) = url {
         let url = url.into_string().unwrap();
         opt.postgres_url = Some(url);
     } else {
-        panic!("You must set either THEGRAPH_STORE_POSTGRES_DIESEL_URL or GRAPH_NODE_TEST_CONFIG (see ./CONTRIBUTING.md).");
+        panic!(
+            "You must set either THEGRAPH_STORE_POSTGRES_DIESEL_URL or GRAPH_NODE_TEST_CONFIG (see ./CONTRIBUTING.md)."
+        );
     }
     opt.store_connection_pool_size = CONN_POOL_SIZE;
 

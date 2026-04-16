@@ -1375,7 +1375,6 @@ fn indexed_input_type(param_type: &DynSolType) -> DynSolType {
 
 #[cfg(test)]
 mod tests {
-    
 
     use super::*;
 

@@ -6,7 +6,7 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 
 /// Format TypeScript/AssemblyScript code using Prettier.
 ///

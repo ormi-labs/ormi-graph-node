@@ -11,8 +11,8 @@ use graph::{
     components::store::StoreError,
     data::{
         store::{
-            scalar::{BigDecimal, Bytes, Timestamp},
             Entity, QueryObject,
+            scalar::{BigDecimal, Bytes, Timestamp},
         },
         value::{Object, Word},
     },
@@ -153,7 +153,7 @@ impl FromOidValue for r::Value {
             O::Int4Range(..) => {
                 return Err(StoreError::InternalError(
                     "int4range can not be converted to r::Value".to_string(),
-                ))
+                ));
             }
             O::Null => Self::Null,
         };
@@ -210,7 +210,7 @@ impl FromOidValue for graph::prelude::Value {
             O::Int4Range(..) => {
                 return Err(StoreError::InternalError(
                     "int4range can not be converted to Value".to_string(),
-                ))
+                ));
             }
             O::Null => Self::Null,
         };

@@ -6,8 +6,8 @@ use graph::{
     data::{
         query::QueryTarget,
         subgraph::{
-            schema::{DeploymentCreate, SubgraphError, SubgraphHealth},
             DeploymentFeatures, SubgraphFeature,
+            schema::{DeploymentCreate, SubgraphError, SubgraphHealth},
         },
     },
     prelude::{
@@ -18,8 +18,8 @@ use graph::{
     schema::InputSchema,
     semver::Version,
 };
-use graph_store_postgres::layout_for_tests::Connection as Primary;
 use graph_store_postgres::SubgraphStore;
+use graph_store_postgres::layout_for_tests::Connection as Primary;
 use std::{collections::HashSet, marker::PhantomData, sync::Arc};
 use test_store::*;
 
@@ -483,9 +483,9 @@ fn status() {
             .await
             .unwrap();
         let infos = store
-            .status(status::Filter::Deployments(vec![deployment
-                .hash
-                .to_string()]))
+            .status(status::Filter::Deployments(vec![
+                deployment.hash.to_string(),
+            ]))
             .await
             .unwrap();
         assert_eq!(1, infos.len());

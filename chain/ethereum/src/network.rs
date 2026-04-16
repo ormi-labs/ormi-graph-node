@@ -15,9 +15,9 @@ use std::sync::Arc;
 pub use graph::impl_slog_value;
 use graph::prelude::Error;
 
+use crate::EthereumAdapter;
 use crate::adapter::EthereumAdapter as _;
 use crate::capabilities::NodeCapabilities;
-use crate::EthereumAdapter;
 
 pub const DEFAULT_ADAPTER_ERROR_RETEST_PERCENT: f64 = 0.2;
 
@@ -107,7 +107,7 @@ impl EthereumNetworkAdapters {
         use std::cmp::Ordering;
 
         use graph::components::network_provider::ProviderCheckStrategy;
-        use graph::slog::{o, Discard, Logger};
+        use graph::slog::{Discard, Logger, o};
 
         let chain_id: ChainName = "testing".into();
         adapters.sort_by(|a, b| {
@@ -329,14 +329,14 @@ mod tests {
         endpoint::EndpointMetrics,
         firehose::SubgraphLimit,
         prelude::MetricsRegistry,
-        slog::{o, Discard, Logger},
+        slog::{Discard, Logger, o},
         url::Url,
     };
     use std::sync::Arc;
 
     use crate::{
-        chain::ChainSettings, Compression, EthereumAdapter, EthereumAdapterTrait,
-        ProviderEthRpcMetrics, Transport,
+        Compression, EthereumAdapter, EthereumAdapterTrait, ProviderEthRpcMetrics, Transport,
+        chain::ChainSettings,
     };
 
     use super::{EthereumNetworkAdapter, EthereumNetworkAdapters, NodeCapabilities};
@@ -465,13 +465,15 @@ mod tests {
 
         {
             // Not Found
-            assert!(adapters
-                .cheapest_with(&NodeCapabilities {
-                    archive: false,
-                    traces: true,
-                })
-                .await
-                .is_err());
+            assert!(
+                adapters
+                    .cheapest_with(&NodeCapabilities {
+                        archive: false,
+                        traces: true,
+                    })
+                    .await
+                    .is_err()
+            );
 
             // Check cheapest is not call only
             let adapter = adapters

@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use graph::blockchain::BlockTime;
 use graph::components::metrics::gas::GasMetrics;
 use graph::components::store::*;
-use graph::data::store::{scalar, Id, IdType};
+use graph::data::store::{Id, IdType, scalar};
 use graph::data::subgraph::*;
 use graph::data::value::Word;
 use graph::futures03::future::BoxFuture;
@@ -16,7 +16,7 @@ use graph::{entity, prelude::*};
 use graph_chain_ethereum::DataSource;
 use graph_runtime_wasm::asc_abi::class::{Array, AscBigInt, AscEntity, AscString, Uint8Array};
 use graph_runtime_wasm::{
-    host_exports, ExperimentalFeatures, MappingContext, ValidModule, WasmInstance,
+    ExperimentalFeatures, MappingContext, ValidModule, WasmInstance, host_exports,
 };
 use semver::Version;
 use std::collections::{BTreeMap, HashMap};
@@ -994,10 +994,12 @@ async fn test_ens_name_by_hash(api_version: Version) {
     let data: String = module.asc_get(converted).unwrap();
     assert_eq!(data, name);
 
-    assert!(module
-        .invoke_export1::<_, _, AscString>("nameByHash", "impossible keccak hash")
-        .await
-        .is_null());
+    assert!(
+        module
+            .invoke_export1::<_, _, AscString>("nameByHash", "impossible keccak hash")
+            .await
+            .is_null()
+    );
 }
 
 #[graph::test]
@@ -1130,10 +1132,12 @@ fn test_detect_contract_calls(api_version: Version) {
         &wasm_file_path("abi_store_value.wasm", api_version.clone()),
         api_version.clone(),
     );
-    assert!(!data_source_without_calls
-        .mapping
-        .requires_archive()
-        .unwrap());
+    assert!(
+        !data_source_without_calls
+            .mapping
+            .requires_archive()
+            .unwrap()
+    );
 
     let data_source_with_calls = mock_data_source(
         &wasm_file_path("contract_calls.wasm", api_version.clone()),
@@ -1250,30 +1254,38 @@ async fn test_boolean() {
 
     // non-zero values are true
     for x in (-10i32..10).filter(|&x| x != 0) {
-        assert!(module
-            .invoke_export1_val_void("testReceiveTrue", x)
-            .await
-            .is_ok(),);
+        assert!(
+            module
+                .invoke_export1_val_void("testReceiveTrue", x)
+                .await
+                .is_ok(),
+        );
     }
 
     // zero is not true
-    assert!(module
-        .invoke_export1_val_void("testReceiveTrue", 0i32)
-        .await
-        .is_err());
+    assert!(
+        module
+            .invoke_export1_val_void("testReceiveTrue", 0i32)
+            .await
+            .is_err()
+    );
 
     // zero is false
-    assert!(module
-        .invoke_export1_val_void("testReceiveFalse", 0i32)
-        .await
-        .is_ok());
+    assert!(
+        module
+            .invoke_export1_val_void("testReceiveFalse", 0i32)
+            .await
+            .is_ok()
+    );
 
     // non-zero values are not false
     for x in (-10i32..10).filter(|&x| x != 0) {
-        assert!(module
-            .invoke_export1_val_void("testReceiveFalse", x)
-            .await
-            .is_err());
+        assert!(
+            module
+                .invoke_export1_val_void("testReceiveFalse", x)
+                .await
+                .is_err()
+        );
     }
 }
 
@@ -1566,7 +1578,10 @@ async fn test_store_set_invalid_fields() {
         .err()
         .unwrap();
 
-    err_says(err, "Attempted to set undefined fields [test3] for the entity type `User`. Make sure those fields are defined in the schema.");
+    err_says(
+        err,
+        "Attempted to set undefined fields [test3] for the entity type `User`. Make sure those fields are defined in the schema.",
+    );
 
     // For apiVersion below 0.0.8, we should not error out
     let mut host2 = Host::new(

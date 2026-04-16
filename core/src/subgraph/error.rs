@@ -1,6 +1,6 @@
 use graph::data::subgraph::schema::SubgraphError;
 use graph::env::ENV_VARS;
-use graph::prelude::{anyhow, thiserror, Error, StoreError};
+use graph::prelude::{Error, StoreError, anyhow, thiserror};
 
 pub trait DeterministicError: std::fmt::Debug + std::fmt::Display + Send + Sync + 'static {}
 

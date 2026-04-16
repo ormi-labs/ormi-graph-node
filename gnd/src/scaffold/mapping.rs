@@ -1,7 +1,7 @@
 //! Mapping (AssemblyScript) generation for scaffold.
 
-use super::manifest::{extract_events_from_abi, EventInfo};
 use super::ScaffoldOptions;
+use super::manifest::{EventInfo, extract_events_from_abi};
 
 /// Generate the mapping.ts content.
 pub fn generate_mapping(options: &ScaffoldOptions) -> String {
@@ -277,9 +277,10 @@ fn extract_callable_functions(options: &ScaffoldOptions) -> String {
 
             // Only include view and pure functions (callable from mappings)
             if (state == "view" || state == "pure")
-                && let Some(name) = item.get("name").and_then(|n| n.as_str()) {
-                    functions.push(format!("\n  // - contract.{}(...)", name));
-                }
+                && let Some(name) = item.get("name").and_then(|n| n.as_str())
+            {
+                functions.push(format!("\n  // - contract.{}(...)", name));
+            }
         }
     }
 

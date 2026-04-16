@@ -1,5 +1,5 @@
-use anyhow::{anyhow, Error};
-use anyhow::{ensure, Context};
+use anyhow::{Context, ensure};
+use anyhow::{Error, anyhow};
 use async_trait::async_trait;
 use graph::abi;
 use graph::abi::EventExt;
@@ -18,16 +18,16 @@ use graph::data_source::common::{
 };
 use graph::data_source::{CausalityRegion, MappingTrigger as MappingTriggerType};
 use graph::env::ENV_VARS;
+use graph::futures03::TryStreamExt;
 use graph::futures03::future::try_join;
 use graph::futures03::stream::FuturesOrdered;
-use graph::futures03::TryStreamExt;
 use graph::prelude::alloy::{
     consensus::{TxEnvelope, TxLegacy},
     network::TransactionResponse,
     primitives::{Address, B256, U256},
     rpc::types::Log,
 };
-use graph::prelude::{alloy, Link, SubgraphManifestValidationError};
+use graph::prelude::{Link, SubgraphManifestValidationError, alloy};
 use graph::slog::{debug, error, o, trace};
 use itertools::Itertools;
 use serde::de::Error as ErrorD;
@@ -37,26 +37,26 @@ use std::num::NonZeroU32;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tiny_keccak::{keccak256, Keccak};
+use tiny_keccak::{Keccak, keccak256};
 
 use graph::{
     blockchain::{self, Blockchain},
     prelude::{
-        serde_json, warn, BlockNumber, CheapClone, EthereumCall, LightEthereumBlock,
-        LightEthereumBlockExt, LinkResolver, Logger,
+        BlockNumber, CheapClone, EthereumCall, LightEthereumBlock, LightEthereumBlockExt,
+        LinkResolver, Logger, serde_json, warn,
     },
 };
 
 use graph::data::subgraph::{
-    calls_host_fn, DataSourceContext, Source, MIN_SPEC_VERSION, SPEC_VERSION_0_0_8,
-    SPEC_VERSION_1_2_0,
+    DataSourceContext, MIN_SPEC_VERSION, SPEC_VERSION_0_0_8, SPEC_VERSION_1_2_0, Source,
+    calls_host_fn,
 };
 
+use crate::NodeCapabilities;
 use crate::adapter::EthereumAdapter as _;
 use crate::chain::Chain;
 use crate::network::EthereumNetworkAdapters;
 use crate::trigger::{EthereumBlockTriggerType, EthereumTrigger, MappingTrigger};
-use crate::NodeCapabilities;
 
 // The recommended kind is `ethereum`, `ethereum/contract` is accepted for backwards compatibility.
 const ETHEREUM_KINDS: &[&str] = &["ethereum/contract", "ethereum"];
@@ -446,7 +446,7 @@ fn create_dummy_transaction(
 ) -> Result<AnyTransaction, anyhow::Error> {
     use graph::components::ethereum::AnyTxEnvelope;
     use graph::prelude::alloy::{
-        consensus::transaction::Recovered, consensus::Signed, primitives::Signature,
+        consensus::Signed, consensus::transaction::Recovered, primitives::Signature,
         rpc::types::Transaction,
     };
 

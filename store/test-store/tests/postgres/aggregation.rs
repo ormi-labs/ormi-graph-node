@@ -3,7 +3,7 @@ use std::fmt::Write;
 use std::{future::Future, sync::Arc};
 
 use graph::{
-    blockchain::{block_stream::FirehoseCursor, BlockPtr, BlockTime},
+    blockchain::{BlockPtr, BlockTime, block_stream::FirehoseCursor},
     components::{
         metrics::stopwatch::StopwatchMetrics,
         store::{
@@ -15,8 +15,8 @@ use graph::{
     },
     data::{
         store::{
-            scalar::{BigDecimal, Bytes, Timestamp},
             Entity, Id, IdList, Value,
+            scalar::{BigDecimal, Bytes, Timestamp},
         },
         subgraph::DeploymentHash,
     },
@@ -26,8 +26,8 @@ use graph::{
 };
 use graph_store_postgres::Store as DieselStore;
 use test_store::{
-    create_test_subgraph, remove_subgraphs, run_test_sequentially, BLOCKS, LOGGER,
-    METRICS_REGISTRY, STOPWATCH,
+    BLOCKS, LOGGER, METRICS_REGISTRY, STOPWATCH, create_test_subgraph, remove_subgraphs,
+    run_test_sequentially,
 };
 
 const SCHEMA: &str = r#"

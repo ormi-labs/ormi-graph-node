@@ -159,7 +159,6 @@ impl TemplateCodeGenerator {
 
 #[cfg(test)]
 mod tests {
-    
 
     use super::*;
 

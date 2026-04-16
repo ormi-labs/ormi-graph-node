@@ -149,7 +149,7 @@ impl TryFrom<InnerMappingHandlers> for EnvVarsMapping {
 
             max_api_version: x.max_api_version,
             timeout: x.mapping_handler_timeout_in_secs.map(Duration::from_secs),
-            max_stack_size: x.runtime_max_stack_size.0 .0,
+            max_stack_size: x.runtime_max_stack_size.0.0,
 
             max_ipfs_cache_file_size: x.max_ipfs_cache_file_size.0,
             max_ipfs_cache_size: x.max_ipfs_cache_size,

@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use reqwest::multipart::{Form, Part};
 use serde::Deserialize;
 use url::Url;

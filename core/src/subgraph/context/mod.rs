@@ -1,7 +1,7 @@
 mod instance;
 
 use crate::polling_monitor::{
-    spawn_monitor, ArweaveService, IpfsRequest, IpfsService, PollingMonitor, PollingMonitorMetrics,
+    ArweaveService, IpfsRequest, IpfsService, PollingMonitor, PollingMonitorMetrics, spawn_monitor,
 };
 use anyhow::{self, Error};
 use bytes::Bytes;
@@ -10,9 +10,9 @@ use graph::{
     components::{store::DeploymentId, subgraph::HostMetrics},
     data::subgraph::SubgraphManifest,
     data_source::{
+        CausalityRegion, DataSource, DataSourceTemplate,
         causality_region::CausalityRegionSeq,
         offchain::{self, Base64},
-        CausalityRegion, DataSource, DataSourceTemplate,
     },
     derive::CheapClone,
     ipfs::IpfsContext,
@@ -133,12 +133,13 @@ impl<C: Blockchain, T: RuntimeHostBuilder<C>> IndexingContext<C, T> {
         let host = self.instance.add_dynamic_data_source(logger, data_source)?;
 
         if host.is_some()
-            && let Some((source, is_processed)) = offchain_fields {
-                // monitor data source only if it has not yet been processed.
-                if !is_processed {
-                    self.offchain_monitor.add_source(source);
-                }
+            && let Some((source, is_processed)) = offchain_fields
+        {
+            // monitor data source only if it has not yet been processed.
+            if !is_processed {
+                self.offchain_monitor.add_source(source);
             }
+        }
 
         Ok(host)
     }

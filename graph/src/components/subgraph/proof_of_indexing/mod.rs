@@ -81,7 +81,7 @@ impl SharedProofOfIndexing {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::util::stable_hash_glue::{impl_stable_hash, AsBytes};
+    use crate::util::stable_hash_glue::{AsBytes, impl_stable_hash};
     use crate::{
         data::store::Id,
         prelude::{BlockPtr, DeploymentHash, Value},
@@ -91,7 +91,7 @@ mod tests {
     use maplit::hashmap;
     use online::ProofOfIndexingFinisher;
     use reference::*;
-    use slog::{o, Discard, Logger};
+    use slog::{Discard, Logger, o};
     use stable_hash::{fast_stable_hash, utils::check_for_child_errors};
     use stable_hash_legacy::crypto::SetHasher;
     use stable_hash_legacy::utils::stable_hash as stable_hash_legacy;

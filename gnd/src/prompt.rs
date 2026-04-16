@@ -6,11 +6,11 @@
 use std::path::Path;
 
 use anyhow::Result;
-use console::{style, Term};
+use console::{Term, style};
 use inquire::validator::Validation;
 use inquire::{Autocomplete, Confirm, CustomUserError, Select, Text};
 
-use crate::output::{step, Step};
+use crate::output::{Step, step};
 use crate::services::{ContractInfo, ContractService, Network, NetworksRegistry};
 
 /// Format a network for display.
@@ -609,12 +609,13 @@ fn prompt_network_interactive(registry: &NetworksRegistry) -> Result<String> {
     // Extract network ID from the selection
     // Format is "Full Name (id)"
     if let Some(start) = input.rfind('(')
-        && let Some(end) = input.rfind(')') {
-            let id = &input[start + 1..end];
-            if registry.get_network(id).is_some() {
-                return Ok(id.to_string());
-            }
+        && let Some(end) = input.rfind(')')
+    {
+        let id = &input[start + 1..end];
+        if registry.get_network(id).is_some() {
+            return Ok(id.to_string());
         }
+    }
 
     // Try the input as-is
     if registry.get_network(&input).is_some() {

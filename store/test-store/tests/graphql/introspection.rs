@@ -5,16 +5,16 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use graph::components::store::QueryPermit;
-use graph::data::graphql::{object_value, ObjectOrInterface};
+use graph::data::graphql::{ObjectOrInterface, object_value};
 use graph::data::query::Trace;
 use graph::prelude::{
-    o, q, r, s, serde_json, slog, tokio, DeploymentHash, Logger, Query, QueryExecutionError,
-    QueryResult,
+    DeploymentHash, Logger, Query, QueryExecutionError, QueryResult, o, q, r, s, serde_json, slog,
+    tokio,
 };
 use graph::schema::{ApiSchema, InputSchema};
 
 use graph_graphql::prelude::{
-    a, execute_query, ExecutionContext, Query as PreparedQuery, QueryExecutionOptions, Resolver,
+    ExecutionContext, Query as PreparedQuery, QueryExecutionOptions, Resolver, a, execute_query,
 };
 use test_store::graphql_metrics;
 
