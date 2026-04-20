@@ -104,7 +104,7 @@ where
         };
 
         let mapping_request_sender = {
-            let module_hash = tiny_keccak::keccak256(module_bytes.as_ref());
+            let module_hash = alloy::primitives::keccak256(module_bytes.as_ref()).0;
             if let Some(sender) = self.module_cache.get(&module_hash) {
                 sender.clone()
             } else {

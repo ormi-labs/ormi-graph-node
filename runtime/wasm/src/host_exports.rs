@@ -670,7 +670,7 @@ impl HostExports {
             gas::DEFAULT_GAS_OP.with_args(complexity::Size, data),
             "crypto_keccak_256",
         )?;
-        Ok(tiny_keccak::keccak256(data))
+        Ok(alloy::primitives::keccak256(data).0)
     }
 
     pub(crate) fn big_int_plus(

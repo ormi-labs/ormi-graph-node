@@ -21,6 +21,7 @@ use graph::env::ENV_VARS;
 use graph::futures03::TryStreamExt;
 use graph::futures03::future::try_join;
 use graph::futures03::stream::FuturesOrdered;
+use graph::prelude::alloy::primitives::keccak256;
 use graph::prelude::alloy::{
     consensus::{TxEnvelope, TxLegacy},
     network::TransactionResponse,
@@ -37,7 +38,6 @@ use std::num::NonZeroU32;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tiny_keccak::{Keccak, keccak256};
 
 use graph::{
     blockchain::{self, Blockchain},
@@ -1590,13 +1590,7 @@ impl MappingEventHandler {
 
 /// Hashes a string to a B256 hash.
 fn string_to_b256(s: &str) -> B256 {
-    let mut result = [0u8; 32];
-    let data = s.replace(' ', "").into_bytes();
-    let mut sponge = Keccak::new_keccak256();
-    sponge.update(&data);
-    sponge.finalize(&mut result);
-
-    B256::from_slice(&result)
+    keccak256(s.replace(' ', "").as_bytes())
 }
 
 #[derive(Clone, Debug, Default, Hash, Eq, PartialEq, Deserialize)]

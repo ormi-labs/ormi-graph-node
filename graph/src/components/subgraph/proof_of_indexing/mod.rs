@@ -134,7 +134,8 @@ mod tests {
         // return the same result.
         check_for_child_errors(&case.data).expect("Found child errors");
 
-        let offline_fast = tiny_keccak::keccak256(&fast_stable_hash(&case.data).to_le_bytes());
+        let offline_fast =
+            alloy::primitives::keccak256(fast_stable_hash(&case.data).to_le_bytes()).0;
         let offline_legacy = stable_hash_legacy::<SetHasher, _>(&case.data);
 
         for (version, offline, hardcoded) in [

@@ -13,11 +13,11 @@ use graph::blockchain::client::ChainClient;
 use graph::blockchain::{BlockPtr, Trigger, TriggersAdapterSelector};
 use graph::cheap_clone::CheapClone;
 use graph::data_source::subgraph;
-use graph::prelude::alloy::primitives::{Address, B256, U256};
+use graph::prelude::alloy::primitives::{Address, B256, U256, keccak256};
 use graph::prelude::alloy::rpc::types::BlockTransactions;
 use graph::prelude::{
     DeploymentHash, ENV_VARS, Entity, LightEthereumBlock, create_dummy_transaction,
-    create_minimal_block_for_test, tiny_keccak,
+    create_minimal_block_for_test,
 };
 use graph::schema::EntityType;
 use graph_chain_ethereum::network::EthereumNetworkAdapters;
@@ -143,7 +143,7 @@ pub fn push_test_log(block: &mut BlockWithTriggers<Chain>, payload: impl Into<St
         inner: alloy::primitives::Log {
             address: Address::ZERO,
             data: LogData::new_unchecked(
-                vec![tiny_keccak::keccak256(b"TestEvent(string)").into()],
+                vec![keccak256(b"TestEvent(string)")],
                 abi::DynSolValue::String(payload.into()).abi_encode().into(),
             ),
         },
@@ -199,7 +199,7 @@ pub fn push_test_command(
         inner: alloy::primitives::Log {
             address: Address::ZERO,
             data: LogData::new_unchecked(
-                vec![tiny_keccak::keccak256(b"TestEvent(string,string)").into()],
+                vec![keccak256(b"TestEvent(string,string)")],
                 abi::DynSolValue::Tuple(vec![
                     abi::DynSolValue::String(test_command.into()),
                     abi::DynSolValue::String(data.into()),

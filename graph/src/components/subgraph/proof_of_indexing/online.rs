@@ -324,7 +324,7 @@ impl ProofOfIndexingFinisher {
 
         match self.state {
             Hashers::Legacy(legacy) => legacy.finish(),
-            Hashers::Fast(fast) => tiny_keccak::keccak256(&fast.finish().to_le_bytes()),
+            Hashers::Fast(fast) => alloy::primitives::keccak256(fast.finish().to_le_bytes()).0,
         }
     }
 }

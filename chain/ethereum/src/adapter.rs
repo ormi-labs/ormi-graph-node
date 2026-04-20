@@ -9,6 +9,7 @@ use graph::data_source::common::ContractCall;
 use graph::firehose::CallToFilter;
 use graph::firehose::CombinedFilter;
 use graph::firehose::LogFilter;
+use graph::prelude::alloy::primitives::keccak256;
 use graph::prelude::alloy::primitives::{Address, B256};
 use graph::prelude::alloy::rpc::types::Log;
 use graph::prelude::alloy::transports::{RpcError, TransportErrorKind};
@@ -19,7 +20,6 @@ use std::cmp;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use thiserror::Error;
-use tiny_keccak::keccak256;
 
 use graph::prelude::*;
 use graph::{

@@ -72,7 +72,7 @@ fn is_rpc_revert_message(message: &str) -> bool {
 
 /// Decode a Solidity revert(reason) payload, returning the reason string when possible.
 fn as_solidity_revert_reason(bytes: &[u8]) -> Option<String> {
-    let selector = &tiny_keccak::keccak256(b"Error(string)")[..4];
+    let selector = &graph::prelude::alloy::primitives::keccak256(b"Error(string)")[..4];
     if bytes.len() >= 4 && &bytes[..4] == selector {
         abi::DynSolType::String
             .abi_decode(&bytes[4..])
