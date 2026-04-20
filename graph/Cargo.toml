@@ -9,7 +9,7 @@ base64 = "=0.21.7"
 anyhow = "1.0"
 async-trait = { workspace = true }
 async-stream = "0.3"
-atomic_refcell = "0.1.13"
+atomic_refcell = "0.1.14"
 # We require this precise version of bigdecimal. Updating to later versions
 # has caused PoI differences; if you update this version, you will need to
 # make sure that it does not cause PoI changes
