@@ -16,7 +16,7 @@ use graph::data_source::{MappingTrigger, TriggerWithHandler};
 use graph::prelude::*;
 use graph::runtime::{
     HostExportError, asc_new,
-    gas::{Gas, GasCounter, SaturatingInto},
+    gas::{Gas, GasCounter},
 };
 use graph::{components::subgraph::MappingError, runtime::AscPtr};
 
@@ -576,7 +576,7 @@ pub(crate) fn build_linker(
     linker.func_wrap(
         "gas",
         "gas",
-        |mut caller: wasmtime::Caller<'_, WasmInstanceData>, gas_used: u32| -> anyhow::Result<()> {
+        |mut caller: wasmtime::Caller<'_, WasmInstanceData>, gas_used: u64| -> anyhow::Result<()> {
             // Gas metering has a relevant execution cost cost, being called tens of thousands
             // of times per handler, but it's not worth having a stopwatch section here because
             // the cost of measuring would be greater than the cost of `consume_host_fn`. Last
@@ -584,7 +584,7 @@ pub(crate) fn build_linker(
             if let Err(e) = caller
                 .data()
                 .gas
-                .consume_host_fn_with_metrics(gas_used.saturating_into(), "gas")
+                .consume_host_fn_with_metrics(Gas::new(gas_used), "gas")
             {
                 caller.data_mut().deterministic_host_trap = true;
                 return Err(e.into());

@@ -1844,10 +1844,10 @@ async fn test_yaml_parsing(api_version: Version, gas_used: u64) {
 
 #[graph::test]
 async fn yaml_parsing_v0_0_4() {
-    test_yaml_parsing(API_VERSION_0_0_4, 1053927678771).await;
+    test_yaml_parsing(API_VERSION_0_0_4, 1066812580659).await;
 }
 
 #[graph::test]
 async fn yaml_parsing_v0_0_5() {
-    test_yaml_parsing(API_VERSION_0_0_5, 1053946160531).await;
+    test_yaml_parsing(API_VERSION_0_0_5, 1066831062419).await;
 }
