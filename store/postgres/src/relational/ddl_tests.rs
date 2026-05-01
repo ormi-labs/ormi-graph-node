@@ -93,7 +93,7 @@ fn test_manual_index_creation_ddl() {
         vec!["id".to_string()],
         BTREE,
         "create index concurrently if not exists manual_book_id on {namespace}.book using btree (\"id\")",
-        None
+        None,
     );
 
     assert_generated_sql(
@@ -102,7 +102,7 @@ fn test_manual_index_creation_ddl() {
         vec!["content".to_string()],
         BTREE,
         "create index concurrently if not exists manual_book_content on {namespace}.book using btree (substring(\"content\", 1, 64))",
-        None
+        None,
     );
 
     assert_generated_sql(
@@ -111,7 +111,7 @@ fn test_manual_index_creation_ddl() {
         vec!["title".to_string()],
         BTREE,
         "create index concurrently if not exists manual_book_title on {namespace}.book using btree (left(\"title\", 256))",
-        None
+        None,
     );
 
     assert_generated_sql(
@@ -120,7 +120,7 @@ fn test_manual_index_creation_ddl() {
         vec!["page_count".to_string()],
         BTREE,
         "create index concurrently if not exists manual_book_page_count on {namespace}.book using btree (\"page_count\")",
-        None
+        None,
     );
 
     assert_generated_sql(
@@ -129,7 +129,7 @@ fn test_manual_index_creation_ddl() {
         vec!["page_count".to_string(), "title".to_string()],
         BTREE,
         "create index concurrently if not exists manual_book_page_count_title on {namespace}.book using btree (\"page_count\", left(\"title\", 256))",
-        None
+        None,
     );
 
     assert_generated_sql(
@@ -138,7 +138,7 @@ fn test_manual_index_creation_ddl() {
         vec!["content".to_string(), "block_range".to_string()], // Explicitly including 'block_range'
         GIST,
         "create index concurrently if not exists manual_book_content_block_range on {namespace}.book using gist (substring(\"content\", 1, 64), block_range)",
-        None
+        None,
     );
 
     assert_generated_sql(
@@ -147,7 +147,7 @@ fn test_manual_index_creation_ddl() {
         vec!["page_count".to_string()],
         BTREE,
         "create index concurrently if not exists manual_book_page_count_12345 on sgd0815.book using btree (\"page_count\")  where coalesce(upper(block_range), 2147483647) > 12345",
-        Some(12345)
+        Some(12345),
     );
 }
 

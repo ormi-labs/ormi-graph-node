@@ -1,11 +1,11 @@
 use anyhow::bail;
 use num_bigint;
 use serde::{self, Deserialize, Serialize};
-use stable_hash::utils::AsInt;
 use stable_hash::StableHash;
+use stable_hash::utils::AsInt;
 use thiserror::Error;
 
-use crate::prelude::alloy::primitives::{U128, U256, U64};
+use crate::prelude::alloy::primitives::{U64, U128, U256};
 use std::convert::{TryFrom, TryInto};
 use std::fmt;
 use std::ops::{Add, BitAnd, BitOr, Div, Mul, Rem, Shl, Shr, Sub};

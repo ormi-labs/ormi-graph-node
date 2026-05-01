@@ -1,7 +1,7 @@
 extern crate clap;
 extern crate graph_store_postgres;
 
-use clap::{arg, Command};
+use clap::{Command, arg};
 use graph::schema::InputSchema;
 use std::collections::BTreeSet;
 use std::process::exit;

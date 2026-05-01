@@ -1,5 +1,5 @@
 //! Parse Postgres index definition into a form that is meaningful for us.
-use anyhow::{anyhow, Error};
+use anyhow::{Error, anyhow};
 use std::collections::HashMap;
 use std::fmt::{Display, Write};
 use std::sync::Arc;
@@ -10,9 +10,8 @@ use diesel_async::RunQueryDsl;
 use graph::components::store::StoreError;
 use graph::itertools::Itertools;
 use graph::prelude::{
-    lazy_static,
+    BlockNumber, lazy_static,
     regex::{Captures, Regex},
-    BlockNumber,
 };
 
 use crate::block_range::{BLOCK_COLUMN, BLOCK_RANGE_COLUMN};
@@ -20,7 +19,7 @@ use crate::command_support::catalog::Site;
 use crate::deployment_store::DeploymentStore;
 use crate::primary::Namespace;
 use crate::relational::{BYTE_ARRAY_PREFIX_SIZE, STRING_PREFIX_SIZE};
-use crate::{catalog, AsyncPgConnection};
+use crate::{AsyncPgConnection, catalog};
 
 use super::{Layout, Table, VID_COLUMN};
 
@@ -441,7 +440,7 @@ impl CreateIndex {
         }
     }
 
-    pub fn with_nsp(&self, nsp2: String) -> Result<Self, Error> {
+    pub(crate) fn with_nsp(&self, nsp2: String) -> Result<Self, Error> {
         let s = self.clone();
         match s {
             CreateIndex::Unknown { defn: _ } => Err(anyhow!("Failed to parse the index")),
@@ -647,15 +646,13 @@ impl CreateIndex {
     }
 
     pub fn fields_exist_in_dest(&self, dest_table: &Table) -> bool {
-        fn column_exists<'a>(it: &mut impl Iterator<Item = &'a str>, column_name: &str) -> bool {
-            it.any(|c| *c == *column_name)
+        fn column_exists(dest_table: &Table, column_name: &str) -> bool {
+            dest_table
+                .columns
+                .iter()
+                .any(|c| c.name.as_str() == column_name)
         }
 
-        fn some_column_contained<'a>(expr: &str, it: &mut impl Iterator<Item = &'a str>) -> bool {
-            it.any(|c| expr.contains(c))
-        }
-
-        let cols = &mut dest_table.columns.iter().map(|i| i.name.as_str());
         match self {
             CreateIndex::Unknown { defn: _ } => return true,
             CreateIndex::Parsed {
@@ -665,12 +662,12 @@ impl CreateIndex {
                 for c in parsed_cols {
                     match c {
                         Expr::Column(column_name) => {
-                            if !column_exists(cols, column_name) {
+                            if !column_exists(dest_table, column_name) {
                                 return false;
                             }
                         }
                         Expr::Prefix(column_name, _) => {
-                            if !column_exists(cols, column_name) {
+                            if !column_exists(dest_table, column_name) {
                                 return false;
                             }
                         }
@@ -686,18 +683,15 @@ impl CreateIndex {
                             }
                         }
                         Expr::Unknown(expression) => {
-                            if some_column_contained(
-                                expression,
-                                &mut (vec!["block_range"]).into_iter(),
-                            ) && dest_table.immutable
-                            {
+                            if expression.contains("block_range") && dest_table.immutable {
                                 return false;
                             }
-                            if !some_column_contained(expression, cols)
-                                && !some_column_contained(
-                                    expression,
-                                    &mut (vec!["block_range", "vid"]).into_iter(),
-                                )
+                            if !dest_table
+                                .columns
+                                .iter()
+                                .any(|c| expression.contains(c.name.as_str()))
+                                && !expression.contains("block_range")
+                                && !expression.contains("vid")
                             {
                                 return false;
                             }
@@ -730,7 +724,9 @@ impl CreateIndex {
                 let if_not_exists = if if_not_exists { "if not exists " } else { "" };
                 let columns = columns.iter().map(|c| c.to_sql()).join(", ");
 
-                let mut sql = format!("create {unique}index {concurrent}{if_not_exists}{name} on {nsp}.{table} using {method} ({columns})");
+                let mut sql = format!(
+                    "create {unique}index {concurrent}{if_not_exists}{name} on {nsp}.{table} using {method} ({columns})"
+                );
                 if let Some(with) = with {
                     write!(sql, " with ({with})")?;
                 }
@@ -801,13 +797,11 @@ impl IndexList {
                     // that are not to be postponed we want to create during initial creation of
                     // the copied subgraph
                     && postponed == ci.to_postpone()
-                {
-                    if let Ok(sql) = ci
+                    && let Ok(sql) = ci
                         .with_nsp(namespace.to_string())?
                         .to_sql(concurrent, if_not_exists)
-                    {
-                        arr.push((ci.name(), sql))
-                    }
+                {
+                    arr.push((ci.name(), sql))
                 }
             }
         }
@@ -868,290 +862,350 @@ impl IndexList {
     }
 }
 
-#[test]
-fn parse() {
-    use Method::*;
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
 
-    #[derive(Debug)]
-    enum TestExpr {
-        Name(&'static str),
-        Prefix(&'static str, &'static str),
-        Vid,
-        Block,
-        BlockRange,
-        BlockRangeLower,
-        BlockRangeUpper,
-        #[allow(dead_code)]
-        Unknown(&'static str),
+    use graph::prelude::{BlockNumber, DeploymentHash};
+    use graph::schema::InputSchema;
+
+    use crate::layout_for_tests::{Namespace, make_dummy_site};
+    use crate::relational::Catalog;
+
+    use super::*;
+
+    fn test_layout(gql: &str) -> Layout {
+        let subgraph = DeploymentHash::new("subgraph").unwrap();
+        let schema = InputSchema::parse_latest(gql, subgraph.clone()).expect("Test schema invalid");
+        let namespace = Namespace::new("sgd0815".to_owned()).unwrap();
+        let site = Arc::new(make_dummy_site(subgraph, namespace, "anet".to_string()));
+        let catalog =
+            Catalog::for_tests(site.clone(), BTreeSet::new()).expect("Can not create catalog");
+        Layout::new(site, &schema, catalog).expect("Failed to construct Layout")
     }
 
-    impl<'a> From<&'a TestExpr> for Expr {
-        fn from(expr: &'a TestExpr) -> Self {
-            match expr {
-                TestExpr::Name(name) => Expr::Column(name.to_string()),
-                TestExpr::Prefix(name, kind) => {
-                    Expr::Prefix(name.to_string(), PrefixKind::parse(kind).unwrap())
+    #[test]
+    fn parse() {
+        use Method::*;
+
+        #[derive(Debug)]
+        enum TestExpr {
+            Name(&'static str),
+            Prefix(&'static str, &'static str),
+            Vid,
+            Block,
+            BlockRange,
+            BlockRangeLower,
+            BlockRangeUpper,
+            #[allow(dead_code)]
+            Unknown(&'static str),
+        }
+
+        impl<'a> From<&'a TestExpr> for Expr {
+            fn from(expr: &'a TestExpr) -> Self {
+                match expr {
+                    TestExpr::Name(name) => Expr::Column(name.to_string()),
+                    TestExpr::Prefix(name, kind) => {
+                        Expr::Prefix(name.to_string(), PrefixKind::parse(kind).unwrap())
+                    }
+                    TestExpr::Vid => Expr::Vid,
+                    TestExpr::Block => Expr::Block,
+                    TestExpr::BlockRange => Expr::BlockRange,
+                    TestExpr::BlockRangeLower => Expr::BlockRangeLower,
+                    TestExpr::BlockRangeUpper => Expr::BlockRangeUpper,
+                    TestExpr::Unknown(s) => Expr::Unknown(s.to_string()),
                 }
-                TestExpr::Vid => Expr::Vid,
-                TestExpr::Block => Expr::Block,
-                TestExpr::BlockRange => Expr::BlockRange,
-                TestExpr::BlockRangeLower => Expr::BlockRangeLower,
-                TestExpr::BlockRangeUpper => Expr::BlockRangeUpper,
-                TestExpr::Unknown(s) => Expr::Unknown(s.to_string()),
             }
         }
-    }
 
-    #[derive(Debug)]
-    enum TestCond {
-        Partial(BlockNumber),
-        Closed,
-        Unknown(&'static str),
-    }
+        #[derive(Debug)]
+        enum TestCond {
+            Partial(BlockNumber),
+            Closed,
+            Unknown(&'static str),
+        }
 
-    impl From<TestCond> for Cond {
-        fn from(expr: TestCond) -> Self {
-            match expr {
-                TestCond::Partial(number) => Cond::Partial(number),
-                TestCond::Unknown(s) => Cond::Unknown(s.to_string()),
-                TestCond::Closed => Cond::Closed,
+        impl From<TestCond> for Cond {
+            fn from(expr: TestCond) -> Self {
+                match expr {
+                    TestCond::Partial(number) => Cond::Partial(number),
+                    TestCond::Unknown(s) => Cond::Unknown(s.to_string()),
+                    TestCond::Closed => Cond::Closed,
+                }
             }
         }
-    }
 
-    #[derive(Debug)]
-    struct Parsed {
-        unique: bool,
-        name: &'static str,
-        nsp: &'static str,
-        table: &'static str,
-        method: Method,
-        columns: &'static [TestExpr],
-        cond: Option<TestCond>,
-    }
+        #[derive(Debug)]
+        struct Parsed {
+            unique: bool,
+            name: &'static str,
+            nsp: &'static str,
+            table: &'static str,
+            method: Method,
+            columns: &'static [TestExpr],
+            cond: Option<TestCond>,
+        }
 
-    impl From<Parsed> for CreateIndex {
-        fn from(p: Parsed) -> Self {
-            let Parsed {
-                unique,
-                name,
-                nsp,
-                table,
-                method,
-                columns,
-                cond,
-            } = p;
-            let columns: Vec<_> = columns.iter().map(Expr::from).collect();
-            let cond = cond.map(Cond::from);
-            CreateIndex::Parsed {
-                unique,
-                name: name.to_string(),
-                nsp: nsp.to_string(),
-                table: table.to_string(),
-                method,
-                columns,
-                cond,
-                with: None,
+        impl From<Parsed> for CreateIndex {
+            fn from(p: Parsed) -> Self {
+                let Parsed {
+                    unique,
+                    name,
+                    nsp,
+                    table,
+                    method,
+                    columns,
+                    cond,
+                } = p;
+                let columns: Vec<_> = columns.iter().map(Expr::from).collect();
+                let cond = cond.map(Cond::from);
+                CreateIndex::Parsed {
+                    unique,
+                    name: name.to_string(),
+                    nsp: nsp.to_string(),
+                    table: table.to_string(),
+                    method,
+                    columns,
+                    cond,
+                    with: None,
+                }
             }
         }
+
+        #[track_caller]
+        fn parse_one(defn: &str, exp: Parsed) {
+            let act = CreateIndex::parse(defn.to_string());
+            let exp = CreateIndex::from(exp);
+            assert_eq!(exp, act);
+
+            let defn = defn.to_ascii_lowercase();
+            assert_eq!(defn, act.to_sql(false, false).unwrap());
+        }
+
+        use TestCond::*;
+        use TestExpr::*;
+
+        let sql = "create index attr_1_0_token_id on sgd44.token using btree (\"id\")";
+        let exp = Parsed {
+            unique: false,
+            name: "attr_1_0_token_id",
+            nsp: "sgd44",
+            table: "token",
+            method: BTree,
+            columns: &[Name("id")],
+            cond: None,
+        };
+        parse_one(sql, exp);
+
+        let sql =
+            "create index attr_1_1_token_symbol on sgd44.token using btree (left(\"symbol\", 256))";
+        let exp = Parsed {
+            unique: false,
+            name: "attr_1_1_token_symbol",
+            nsp: "sgd44",
+            table: "token",
+            method: BTree,
+            columns: &[Prefix("symbol", "left")],
+            cond: None,
+        };
+        parse_one(sql, exp);
+
+        let sql = "create index attr_1_5_token_trade_volume on sgd44.token using btree (\"trade_volume\")";
+        let exp = Parsed {
+            unique: false,
+            name: "attr_1_5_token_trade_volume",
+            nsp: "sgd44",
+            table: "token",
+            method: BTree,
+            columns: &[Name("trade_volume")],
+            cond: None,
+        };
+        parse_one(sql, exp);
+
+        let sql = "create unique index token_pkey on sgd44.token using btree (vid)";
+        let exp = Parsed {
+            unique: true,
+            name: "token_pkey",
+            nsp: "sgd44",
+            table: "token",
+            method: BTree,
+            columns: &[Vid],
+            cond: None,
+        };
+        parse_one(sql, exp);
+
+        let sql = "create index brin_token on sgd44.token using brin (lower(block_range), coalesce(upper(block_range), 2147483647), vid)";
+        let exp = Parsed {
+            unique: false,
+            name: "brin_token",
+            nsp: "sgd44",
+            table: "token",
+            method: Brin,
+            columns: &[BlockRangeLower, BlockRangeUpper, Vid],
+            cond: None,
+        };
+        parse_one(sql, exp);
+
+        let sql = "create index token_block_range_closed on sgd44.token using btree (coalesce(upper(block_range), 2147483647)) where (coalesce(upper(block_range), 2147483647) < 2147483647)";
+        let exp = Parsed {
+            unique: false,
+            name: "token_block_range_closed",
+            nsp: "sgd44",
+            table: "token",
+            method: BTree,
+            columns: &[BlockRangeUpper],
+            cond: Some(Closed),
+        };
+        parse_one(sql, exp);
+
+        let sql = "create index token_id_block_range_excl on sgd44.token using gist (\"id\", block_range)";
+        let exp = Parsed {
+            unique: false,
+            name: "token_id_block_range_excl",
+            nsp: "sgd44",
+            table: "token",
+            method: Gist,
+            columns: &[Name("id"), BlockRange],
+            cond: None,
+        };
+        parse_one(sql, exp);
+
+        let sql = "create index attr_1_11_pool_owner on sgd411585.pool using btree (substring(\"owner\", 1, 64))";
+        let exp = Parsed {
+            unique: false,
+            name: "attr_1_11_pool_owner",
+            nsp: "sgd411585",
+            table: "pool",
+            method: BTree,
+            columns: &[Prefix("owner", "substring")],
+            cond: None,
+        };
+        parse_one(sql, exp);
+
+        let sql = "create index attr_1_20_pool_vault_id on sgd411585.pool using gist (\"vault_id\", block_range)";
+        let exp = Parsed {
+            unique: false,
+            name: "attr_1_20_pool_vault_id",
+            nsp: "sgd411585",
+            table: "pool",
+            method: Gist,
+            columns: &[Name("vault_id"), BlockRange],
+            cond: None,
+        };
+        parse_one(sql, exp);
+
+        let sql =
+            "create index attr_1_22_pool_tokens_list on sgd411585.pool using gin (\"tokens_list\")";
+        let exp = Parsed {
+            unique: false,
+            name: "attr_1_22_pool_tokens_list",
+            nsp: "sgd411585",
+            table: "pool",
+            method: Gin,
+            columns: &[Name("tokens_list")],
+            cond: None,
+        };
+        parse_one(sql, exp);
+
+        let sql = "create index manual_partial_pool_total_liquidity on sgd411585.pool using btree (\"total_liquidity\") where (coalesce(upper(block_range), 2147483647) > 15635000)";
+        let exp = Parsed {
+            unique: false,
+            name: "manual_partial_pool_total_liquidity",
+            nsp: "sgd411585",
+            table: "pool",
+            method: BTree,
+            columns: &[Name("total_liquidity")],
+            cond: Some(Partial(15635000)),
+        };
+        parse_one(sql, exp);
+
+        let sql = "create index manual_swap_pool_timestamp_id on sgd217942.swap using btree (\"pool\", \"timestamp\", \"id\")";
+        let exp = Parsed {
+            unique: false,
+            name: "manual_swap_pool_timestamp_id",
+            nsp: "sgd217942",
+            table: "swap",
+            method: BTree,
+            columns: &[Name("pool"), Name("timestamp"), Name("id")],
+            cond: None,
+        };
+        parse_one(sql, exp);
+
+        let sql = "CREATE INDEX brin_scy ON sgd314614.scy USING brin (block$, vid)";
+        let exp = Parsed {
+            unique: false,
+            name: "brin_scy",
+            nsp: "sgd314614",
+            table: "scy",
+            method: Brin,
+            columns: &[Block, Vid],
+            cond: None,
+        };
+        parse_one(sql, exp);
+
+        let sql =
+            "CREATE INDEX brin_scy ON sgd314614.scy USING brin (block$, vid) where (amount > 0)";
+        let exp = Parsed {
+            unique: false,
+            name: "brin_scy",
+            nsp: "sgd314614",
+            table: "scy",
+            method: Brin,
+            columns: &[Block, Vid],
+            cond: Some(TestCond::Unknown("amount > 0")),
+        };
+        parse_one(sql, exp);
+
+        let sql = "CREATE INDEX manual_token_random_cond ON sgd44.token USING btree (\"decimals\") WHERE (decimals > (5)::numeric)";
+        let exp = Parsed {
+            unique: false,
+            name: "manual_token_random_cond",
+            nsp: "sgd44",
+            table: "token",
+            method: BTree,
+            columns: &[Name("decimals")],
+            cond: Some(TestCond::Unknown("decimals > (5)::numeric")),
+        };
+        parse_one(sql, exp);
     }
 
-    #[track_caller]
-    fn parse_one(defn: &str, exp: Parsed) {
-        let act = CreateIndex::parse(defn.to_string());
-        let exp = CreateIndex::from(exp);
-        assert_eq!(exp, act);
+    #[test]
+    fn fields_exist_in_dest_out_of_order() {
+        let gql = "type Thing @entity {
+            id: Bytes!
+            early: String!
+            mid: String!
+            late: String!
+        }";
+        let layout = test_layout(gql);
+        let table = layout
+            .table_for_entity(&layout.input_schema.entity_type("Thing").unwrap())
+            .unwrap();
 
-        let defn = defn.to_ascii_lowercase();
-        assert_eq!(defn, act.to_sql(false, false).unwrap());
+        // Index references columns in reverse order vs the table definition.
+        // Table columns: id, early, mid, late
+        // Index columns: late, mid, early
+        // The consuming iterator finds 'late', advances past 'mid' and 'early',
+        // then can't find 'mid' because the iterator is already past it.
+        let index = CreateIndex::Parsed {
+            unique: false,
+            name: "test_reverse".to_string(),
+            nsp: "sgd0815".to_string(),
+            table: "thing".to_string(),
+            method: Method::BTree,
+            columns: vec![
+                Expr::Column("late".to_string()),
+                Expr::Column("mid".to_string()),
+                Expr::Column("early".to_string()),
+            ],
+            cond: None,
+            with: None,
+        };
+
+        assert!(
+            index.fields_exist_in_dest(table),
+            "index columns exist in table regardless of order"
+        );
     }
-
-    use TestCond::*;
-    use TestExpr::*;
-
-    let sql = "create index attr_1_0_token_id on sgd44.token using btree (\"id\")";
-    let exp = Parsed {
-        unique: false,
-        name: "attr_1_0_token_id",
-        nsp: "sgd44",
-        table: "token",
-        method: BTree,
-        columns: &[Name("id")],
-        cond: None,
-    };
-    parse_one(sql, exp);
-
-    let sql =
-        "create index attr_1_1_token_symbol on sgd44.token using btree (left(\"symbol\", 256))";
-    let exp = Parsed {
-        unique: false,
-        name: "attr_1_1_token_symbol",
-        nsp: "sgd44",
-        table: "token",
-        method: BTree,
-        columns: &[Prefix("symbol", "left")],
-        cond: None,
-    };
-    parse_one(sql, exp);
-
-    let sql =
-        "create index attr_1_5_token_trade_volume on sgd44.token using btree (\"trade_volume\")";
-    let exp = Parsed {
-        unique: false,
-        name: "attr_1_5_token_trade_volume",
-        nsp: "sgd44",
-        table: "token",
-        method: BTree,
-        columns: &[Name("trade_volume")],
-        cond: None,
-    };
-    parse_one(sql, exp);
-
-    let sql = "create unique index token_pkey on sgd44.token using btree (vid)";
-    let exp = Parsed {
-        unique: true,
-        name: "token_pkey",
-        nsp: "sgd44",
-        table: "token",
-        method: BTree,
-        columns: &[Vid],
-        cond: None,
-    };
-    parse_one(sql, exp);
-
-    let sql = "create index brin_token on sgd44.token using brin (lower(block_range), coalesce(upper(block_range), 2147483647), vid)";
-    let exp = Parsed {
-        unique: false,
-        name: "brin_token",
-        nsp: "sgd44",
-        table: "token",
-        method: Brin,
-        columns: &[BlockRangeLower, BlockRangeUpper, Vid],
-        cond: None,
-    };
-    parse_one(sql, exp);
-
-    let sql = "create index token_block_range_closed on sgd44.token using btree (coalesce(upper(block_range), 2147483647)) where (coalesce(upper(block_range), 2147483647) < 2147483647)";
-    let exp = Parsed {
-        unique: false,
-        name: "token_block_range_closed",
-        nsp: "sgd44",
-        table: "token",
-        method: BTree,
-        columns: &[BlockRangeUpper],
-        cond: Some(Closed),
-    };
-    parse_one(sql, exp);
-
-    let sql =
-        "create index token_id_block_range_excl on sgd44.token using gist (\"id\", block_range)";
-    let exp = Parsed {
-        unique: false,
-        name: "token_id_block_range_excl",
-        nsp: "sgd44",
-        table: "token",
-        method: Gist,
-        columns: &[Name("id"), BlockRange],
-        cond: None,
-    };
-    parse_one(sql, exp);
-
-    let sql="create index attr_1_11_pool_owner on sgd411585.pool using btree (substring(\"owner\", 1, 64))";
-    let exp = Parsed {
-        unique: false,
-        name: "attr_1_11_pool_owner",
-        nsp: "sgd411585",
-        table: "pool",
-        method: BTree,
-        columns: &[Prefix("owner", "substring")],
-        cond: None,
-    };
-    parse_one(sql, exp);
-
-    let sql =
-        "create index attr_1_20_pool_vault_id on sgd411585.pool using gist (\"vault_id\", block_range)";
-    let exp = Parsed {
-        unique: false,
-        name: "attr_1_20_pool_vault_id",
-        nsp: "sgd411585",
-        table: "pool",
-        method: Gist,
-        columns: &[Name("vault_id"), BlockRange],
-        cond: None,
-    };
-    parse_one(sql, exp);
-
-    let sql =
-        "create index attr_1_22_pool_tokens_list on sgd411585.pool using gin (\"tokens_list\")";
-    let exp = Parsed {
-        unique: false,
-        name: "attr_1_22_pool_tokens_list",
-        nsp: "sgd411585",
-        table: "pool",
-        method: Gin,
-        columns: &[Name("tokens_list")],
-        cond: None,
-    };
-    parse_one(sql, exp);
-
-    let sql = "create index manual_partial_pool_total_liquidity on sgd411585.pool using btree (\"total_liquidity\") where (coalesce(upper(block_range), 2147483647) > 15635000)";
-    let exp = Parsed {
-        unique: false,
-        name: "manual_partial_pool_total_liquidity",
-        nsp: "sgd411585",
-        table: "pool",
-        method: BTree,
-        columns: &[Name("total_liquidity")],
-        cond: Some(Partial(15635000)),
-    };
-    parse_one(sql, exp);
-
-    let sql = "create index manual_swap_pool_timestamp_id on sgd217942.swap using btree (\"pool\", \"timestamp\", \"id\")";
-    let exp = Parsed {
-        unique: false,
-        name: "manual_swap_pool_timestamp_id",
-        nsp: "sgd217942",
-        table: "swap",
-        method: BTree,
-        columns: &[Name("pool"), Name("timestamp"), Name("id")],
-        cond: None,
-    };
-    parse_one(sql, exp);
-
-    let sql = "CREATE INDEX brin_scy ON sgd314614.scy USING brin (block$, vid)";
-    let exp = Parsed {
-        unique: false,
-        name: "brin_scy",
-        nsp: "sgd314614",
-        table: "scy",
-        method: Brin,
-        columns: &[Block, Vid],
-        cond: None,
-    };
-    parse_one(sql, exp);
-
-    let sql = "CREATE INDEX brin_scy ON sgd314614.scy USING brin (block$, vid) where (amount > 0)";
-    let exp = Parsed {
-        unique: false,
-        name: "brin_scy",
-        nsp: "sgd314614",
-        table: "scy",
-        method: Brin,
-        columns: &[Block, Vid],
-        cond: Some(TestCond::Unknown("amount > 0")),
-    };
-    parse_one(sql, exp);
-
-    let sql =
-        "CREATE INDEX manual_token_random_cond ON sgd44.token USING btree (\"decimals\") WHERE (decimals > (5)::numeric)";
-    let exp = Parsed {
-        unique: false,
-        name: "manual_token_random_cond",
-        nsp: "sgd44",
-        table: "token",
-        method: BTree,
-        columns: &[Name("decimals")],
-        cond: Some(TestCond::Unknown("decimals > (5)::numeric")),
-    };
-    parse_one(sql, exp);
 }

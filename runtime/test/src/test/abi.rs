@@ -7,7 +7,7 @@ use super::*;
 
 async fn test_unbounded_loop(api_version: Version) {
     // Set handler timeout to 3 seconds.
-    let mut instance = test_valid_module_and_store_with_timeout(
+    let mut instance = test_module_and_deployment_with_timeout(
         "unboundedLoop",
         mock_data_source(
             &wasm_file_path("non_terminating.wasm", api_version.clone()),
@@ -117,7 +117,7 @@ async fn abi_array_v0_0_4() {
 
 #[graph::test]
 async fn abi_array_v0_0_5() {
-    test_abi_array(API_VERSION_0_0_5, 1636130).await;
+    test_abi_array(API_VERSION_0_0_5, 1561046).await;
 }
 
 async fn test_abi_subarray(api_version: Version) {

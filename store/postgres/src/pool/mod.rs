@@ -1,5 +1,5 @@
-use deadpool::managed::{PoolError, Timeouts};
 use deadpool::Runtime;
+use deadpool::managed::{PoolError, Timeouts};
 use diesel::sql_query;
 use diesel_async::async_connection_wrapper::AsyncConnectionWrapper;
 use diesel_async::{AsyncConnection as _, RunQueryDsl, SimpleAsyncConnection};
@@ -11,14 +11,15 @@ use graph::derive::CheapClone;
 use graph::internal_error;
 use graph::prelude::tokio::time::Instant;
 use graph::prelude::{
-    anyhow::anyhow, crit, debug, error, info, o, AtomicMovingStats, Gauge, Logger, PoolWaitStats,
-    StoreError, ENV_VARS,
+    AtomicMovingStats, ENV_VARS, Gauge, Logger, PoolWaitStats, StoreError, anyhow::anyhow, crit,
+    debug, error, info, o,
 };
-use graph::prelude::{tokio, MetricsRegistry};
+use graph::prelude::{MetricsRegistry, tokio};
 use graph::slog::warn;
 use graph::util::timed_rw_lock::TimedMutex;
 use tokio::sync::OwnedSemaphorePermit;
 
+use diesel_async::scoped_futures::ScopedBoxFuture;
 use std::collections::HashMap;
 use std::fmt::{self};
 use std::ops::{Deref, DerefMut};
@@ -28,7 +29,7 @@ use std::time::Duration;
 use crate::catalog;
 use crate::pool::manager::{ConnectionManager, WaitMeter};
 use crate::primary::{self, Mirror, Namespace};
-use crate::{Shard, PRIMARY_SHARD};
+use crate::{PRIMARY_SHARD, Shard};
 
 mod coordinator;
 mod foreign_server;
@@ -62,6 +63,99 @@ impl Deref for PermittedConnection {
 impl DerefMut for PermittedConnection {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.conn
+    }
+}
+
+impl PermittedConnection {
+    /// Build a transaction with custom isolation level and read mode.
+    ///
+    /// This is analogous to `diesel_async::pg::TransactionBuilder` but
+    /// works with the pool-wrapped connection type. The closure receives
+    /// `&mut PermittedConnection`, keeping the full wrapper type available
+    /// so callers can pass it to functions that expect `&mut AsyncPgConnection`
+    /// (the pool alias, not the raw diesel type).
+    pub fn build_transaction(&mut self) -> TransactionBuilder<'_> {
+        TransactionBuilder::new(self)
+    }
+}
+
+/// Builder for a PostgreSQL transaction with configurable isolation level
+/// and read mode. Created via [`PermittedConnection::build_transaction`].
+///
+/// We can't use diesel-async's `TransactionBuilder` because it requires
+/// `C: AsyncConnection<TransactionManager = AnsiTransactionManager>`. Our
+/// connection types don't satisfy that: the blanket deref impl in
+/// diesel-async wraps the transaction manager at each deref level, so
+/// `Object<ConnectionManager>` gets `PoolTransactionManager<AnsiTransactionManager>`
+/// and `PermittedConnection` gets
+/// `PoolTransactionManager<PoolTransactionManager<AnsiTransactionManager>>`.
+/// Neither matches `AnsiTransactionManager`.
+#[must_use = "Transaction builder does nothing unless you call `run` on it"]
+pub struct TransactionBuilder<'a> {
+    conn: &'a mut PermittedConnection,
+    isolation_level: Option<&'static str>,
+    read_only: bool,
+}
+
+impl<'a> TransactionBuilder<'a> {
+    fn new(conn: &'a mut PermittedConnection) -> Self {
+        Self {
+            conn,
+            isolation_level: None,
+            read_only: false,
+        }
+    }
+
+    /// Set the transaction isolation level to `REPEATABLE READ`.
+    pub fn repeatable_read(mut self) -> Self {
+        self.isolation_level = Some("REPEATABLE READ");
+        self
+    }
+
+    /// Set the transaction isolation level to `SERIALIZABLE`.
+    pub fn serializable(mut self) -> Self {
+        self.isolation_level = Some("SERIALIZABLE");
+        self
+    }
+
+    /// Make the transaction `READ ONLY`.
+    pub fn read_only(mut self) -> Self {
+        self.read_only = true;
+        self
+    }
+
+    /// Execute `f` inside the configured transaction. Commits on `Ok`,
+    /// rolls back on `Err`.
+    ///
+    /// The closure must return a `ScopedBoxFuture` (use `.scope_boxed()`
+    /// from `ScopedFutureExt`).
+    pub async fn run<'b, T, E, F>(self, f: F) -> Result<T, E>
+    where
+        F: for<'r> FnOnce(&'r mut PermittedConnection) -> ScopedBoxFuture<'b, 'r, Result<T, E>>
+            + Send
+            + 'a,
+        T: 'b,
+        E: From<diesel::result::Error> + 'b,
+    {
+        let mut sql = String::from("BEGIN TRANSACTION");
+        if let Some(level) = self.isolation_level {
+            sql.push_str(" ISOLATION LEVEL ");
+            sql.push_str(level);
+        }
+        if self.read_only {
+            sql.push_str(" READ ONLY");
+        }
+        self.conn.batch_execute(&sql).await?;
+        match f(self.conn).await {
+            Ok(value) => {
+                self.conn.batch_execute("COMMIT").await?;
+                Ok(value)
+            }
+            Err(e) => {
+                self.conn.batch_execute("ROLLBACK").await.ok();
+                Err(e)
+            }
+        }
     }
 }
 
@@ -620,6 +714,18 @@ impl PoolInner {
         self.get_from_pool(&self.pool, None, Duration::ZERO).await
     }
 
+    /// Get a connection using the setup timeout. Use only during database
+    /// initialization where operations can legitimately take longer.
+    async fn get_for_setup(&self) -> Result<AsyncPgConnection, StoreError> {
+        let setup_timeouts = Timeouts {
+            wait: Some(ENV_VARS.store.setup_timeout),
+            create: Some(ENV_VARS.store.setup_timeout),
+            recycle: Some(ENV_VARS.store.setup_timeout),
+        };
+        self.get_from_pool(&self.pool, Some(setup_timeouts), Duration::ZERO)
+            .await
+    }
+
     /// Get the pool for fdw connections. It is an error if none is configured
     fn fdw_pool(&self, logger: &Logger) -> Result<&AsyncPool, StoreError> {
         let pool = match &self.fdw_pool {
@@ -701,7 +807,7 @@ impl PoolInner {
     }
 
     async fn locale_check(&self, logger: &Logger) -> Result<(), StoreError> {
-        let mut conn = self.get().await?;
+        let mut conn = self.get_for_setup().await?;
         let _: () = if let Err(msg) = catalog::Locale::load(&mut conn).await?.suitable() {
             if self.shard == *PRIMARY_SHARD && primary::is_empty(&mut conn).await? {
                 const MSG: &str = "Database does not use C locale. \
@@ -710,7 +816,11 @@ impl PoolInner {
                 crit!(logger, "{}: {}", MSG, msg);
                 panic!("{}: {}", MSG, msg);
             } else {
-                warn!(logger, "{}.\nPlease check the graph-node documentation for how to set up the database locale", msg);
+                warn!(
+                    logger,
+                    "{}.\nPlease check the graph-node documentation for how to set up the database locale",
+                    msg
+                );
             }
         };
         Ok(())
@@ -751,7 +861,7 @@ impl PoolInner {
 
     async fn configure_fdw(&self, servers: &[ForeignServer]) -> Result<(), StoreError> {
         info!(&self.logger, "Setting up fdw");
-        let mut conn = self.get().await?;
+        let mut conn = self.get_for_setup().await?;
         conn.batch_execute("create extension if not exists postgres_fdw")
             .await?;
         conn.transaction(|conn| {
@@ -790,7 +900,10 @@ impl PoolInner {
         // careful that block_on only gets called on a blocking thread to
         // avoid errors from the tokio runtime
         let logger = self.logger.cheap_clone();
-        let mut conn = self.get().await.map(AsyncConnectionWrapper::from)?;
+        let mut conn = self
+            .get_for_setup()
+            .await
+            .map(AsyncConnectionWrapper::from)?;
 
         tokio::task::spawn_blocking(move || {
             diesel::Connection::transaction::<_, StoreError, _>(&mut conn, |conn| {
@@ -808,7 +921,7 @@ impl PoolInner {
         }
 
         info!(&self.logger, "Dropping cross-shard views");
-        let mut conn = self.get().await?;
+        let mut conn = self.get_for_setup().await?;
         conn.transaction(|conn| {
             async {
                 let query = format!("drop schema if exists {} cascade", CROSS_SHARD_NSP);
@@ -845,7 +958,7 @@ impl PoolInner {
             return Ok(());
         }
 
-        let mut conn = self.get().await?;
+        let mut conn = self.get_for_setup().await?;
         let sharded = Namespace::special(CROSS_SHARD_NSP);
         if catalog::has_namespace(&mut conn, &sharded).await? {
             // We dropped the namespace before, but another node must have
@@ -897,7 +1010,7 @@ impl PoolInner {
     pub async fn remap(&self, server: &ForeignServer) -> Result<(), StoreError> {
         if server.shard == *PRIMARY_SHARD {
             info!(&self.logger, "Mapping primary");
-            let mut conn = self.get().await?;
+            let mut conn = self.get_for_setup().await?;
             conn.transaction(|conn| ForeignServer::map_primary(conn, &self.shard).scope_boxed())
                 .await?;
         }
@@ -907,7 +1020,7 @@ impl PoolInner {
                 "Mapping metadata from {}",
                 server.shard.as_str()
             );
-            let mut conn = self.get().await?;
+            let mut conn = self.get_for_setup().await?;
             conn.transaction(|conn| server.map_metadata(conn).scope_boxed())
                 .await?;
         }
@@ -919,7 +1032,7 @@ impl PoolInner {
             return Ok(false);
         }
 
-        let mut conn = self.get().await?;
+        let mut conn = self.get_for_setup().await?;
         server.needs_remap(&mut conn).await
     }
 }

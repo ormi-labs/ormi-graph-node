@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::ops::{Deref, Range};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use graph::parking_lot::RwLock;
 use std::time::Instant;
@@ -9,27 +9,27 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use async_trait::async_trait;
 use diesel_async::scoped_futures::ScopedFutureExt;
-use graph::blockchain::block_stream::{EntitySourceOperation, FirehoseCursor};
 use graph::blockchain::BlockTime;
+use graph::blockchain::block_stream::{EntitySourceOperation, FirehoseCursor};
 use graph::components::store::{Batch, DeploymentCursorTracker, DerivedEntityQuery, ReadStore};
 use graph::data::store::IdList;
 use graph::data::subgraph::schema;
 use graph::data_source::CausalityRegion;
 use graph::internal_error;
 use graph::prelude::{
-    BlockNumber, CacheWeight, Entity, MetricsRegistry, SubgraphDeploymentEntity,
-    SubgraphStore as _, BLOCK_NUMBER_MAX,
+    BLOCK_NUMBER_MAX, BlockNumber, CacheWeight, Entity, MetricsRegistry, SubgraphDeploymentEntity,
+    SubgraphStore as _,
 };
 use graph::schema::{EntityKey, EntityType, InputSchema};
 use graph::slog::{debug, info, warn};
 use graph::util::bounded_queue::BoundedQueue;
 use graph::{
     cheap_clone::CheapClone,
-    components::store::{self, write::EntityOp, WritableStore as WritableStoreTrait},
+    components::store::{self, WritableStore as WritableStoreTrait, write::EntityOp},
     data::subgraph::schema::SubgraphError,
     prelude::{
-        BlockPtr, DeploymentHash, EntityModification, Logger, StopwatchMetrics, StoreError,
-        StoreEvent, UnfailOutcome, ENV_VARS,
+        BlockPtr, DeploymentHash, ENV_VARS, EntityModification, Logger, StopwatchMetrics,
+        StoreError, StoreEvent, UnfailOutcome,
     },
     slog::error,
 };
@@ -41,8 +41,8 @@ use tokio::task::JoinHandle;
 use crate::deployment_store::DeploymentStore;
 use crate::primary::DeploymentId;
 use crate::relational::index::IndexList;
-use crate::{primary, primary::Site, relational::Layout, SubgraphStore};
-use crate::{retry, NotificationSender};
+use crate::{NotificationSender, retry};
+use crate::{SubgraphStore, primary, primary::Site, relational::Layout};
 
 /// A wrapper around `SubgraphStore` that only exposes functions that are
 /// safe to call from `WritableStore`, i.e., functions that either do not
@@ -464,18 +464,17 @@ impl SyncStore {
             // Handle on_sync actions. They only apply to copies (not
             // grafts) so we make sure that the source, if it exists, has
             // the same hash as `self.site`
-            if let Some(src) = self.writable.source_of_copy(&self.site).await? {
-                if let Some(src) = self.maybe_find_site(src).await? {
-                    if src.deployment == self.site.deployment {
-                        let on_sync = self.writable.on_sync(&self.site).await?;
-                        if on_sync.activate() {
-                            let mut pconn = self.store.primary_conn().await?;
-                            pconn.activate(&self.site.as_ref().into()).await?;
-                        }
-                        if on_sync.replace() {
-                            self.unassign_subgraph(&src).await?;
-                        }
-                    }
+            if let Some(src) = self.writable.source_of_copy(&self.site).await?
+                && let Some(src) = self.maybe_find_site(src).await?
+                && src.deployment == self.site.deployment
+            {
+                let on_sync = self.writable.on_sync(&self.site).await?;
+                if on_sync.activate() {
+                    let mut pconn = self.store.primary_conn().await?;
+                    pconn.activate(&self.site.as_ref().into()).await?;
+                }
+                if on_sync.replace() {
+                    self.unassign_subgraph(&src).await?;
                 }
             }
 
@@ -991,7 +990,7 @@ impl Queue {
                 // add to it again.
                 if queue.batch_writes() && queue.queue.len() <= 1 {
                     loop {
-                        let _section = queue.stopwatch.start_section("queue_wait");
+                        let _section = queue.stopwatch.start_section("queue_idle");
                         let req = queue.queue.peek().await;
 
                         // When this is true, push_write would never add to
@@ -1022,7 +1021,7 @@ impl Queue {
                 // the write transaction commits, causing them to return
                 // incorrect results.
                 let req = {
-                    let _section = queue.stopwatch.start_section("queue_wait");
+                    let _section = queue.stopwatch.start_section("queue_idle");
                     // Mark the request as being processed so push_write
                     // will not modify it again, even after we are done with
                     // it here
@@ -1132,7 +1131,11 @@ impl Queue {
     /// to fill up before writing them to maximize the chances that we build
     /// a 'full' write batch, i.e., one that is either big enough or old
     /// enough
-    async fn push_write(&self, batch: Batch) -> Result<(), StoreError> {
+    async fn push_write(
+        &self,
+        batch: Batch,
+        stopwatch: &StopwatchMetrics,
+    ) -> Result<(), StoreError> {
         let batch = if ENV_VARS.store.write_batch_size == 0
             || ENV_VARS.store.write_batch_duration.is_zero()
             || !self.batch_writes()
@@ -1205,6 +1208,7 @@ impl Queue {
                 self.stopwatch.cheap_clone(),
                 batch,
             );
+            let _section = stopwatch.start_section("queue_push_blocked");
             self.push(req).await?;
         }
         Ok(())
@@ -1489,7 +1493,7 @@ impl Writer {
             Writer::Sync(store) => store.transact_block_operations(&batch, stopwatch).await,
             Writer::Async { queue, .. } => {
                 self.check_queue_running()?;
-                queue.push_write(batch).await
+                queue.push_write(batch, stopwatch).await
             }
         }
     }
@@ -1815,14 +1819,14 @@ impl WritableStoreTrait for WritableStore {
             self.writer.start_batching();
         }
 
-        if let Some(block_ptr) = self.block_ptr.lock().unwrap().as_ref() {
-            if block_ptr_to.number <= block_ptr.number {
-                return Err(internal_error!(
-                    "transact_block_operations called for block {} but its head is already at {}",
-                    block_ptr_to,
-                    block_ptr
-                ));
-            }
+        if let Some(block_ptr) = self.block_ptr.lock().unwrap().as_ref()
+            && block_ptr_to.number <= block_ptr.number
+        {
+            return Err(internal_error!(
+                "transact_block_operations called for block {} but its head is already at {}",
+                block_ptr_to,
+                block_ptr
+            ));
         }
 
         let batch = Batch::new(
@@ -1834,6 +1838,7 @@ impl WritableStoreTrait for WritableStore {
             deterministic_errors,
             processed_data_sources,
             is_non_fatal_errors_active,
+            self.store.logger.clone(),
         )?;
         self.writer.write(batch, stopwatch).await?;
 

@@ -3,39 +3,40 @@ use futures03::{future::BoxFuture, stream::FuturesUnordered};
 use graph::abi;
 use graph::abi::DynSolValueExt;
 use graph::abi::FunctionExt;
-use graph::blockchain::client::ChainClient;
 use graph::blockchain::BlockHash;
 use graph::blockchain::ChainIdentifier;
 use graph::blockchain::ExtendedBlockPtr;
+use graph::blockchain::client::ChainClient;
 use graph::components::ethereum::*;
 use graph::components::transaction_receipt::LightTransactionReceipt;
 use graph::data::store::ethereum::call;
 use graph::data::store::scalar;
-use graph::data::subgraph::UnifiedMappingApiVersion;
 use graph::data::subgraph::API_VERSION_0_0_7;
+use graph::data::subgraph::UnifiedMappingApiVersion;
 use graph::data_source::common::ContractCall;
-use graph::futures01::stream;
+use graph::derive::CheapClone;
 use graph::futures01::Future;
 use graph::futures01::Stream;
+use graph::futures01::stream;
 use graph::futures03::future::try_join_all;
 use graph::futures03::{
-    self, compat::Future01CompatExt, FutureExt, StreamExt, TryFutureExt, TryStreamExt,
+    self, FutureExt, StreamExt, TryFutureExt, TryStreamExt, compat::Future01CompatExt,
 };
 use graph::prelude::{
     alloy::{
         self,
-        network::{AnyNetwork, TransactionResponse},
+        network::TransactionResponse,
         primitives::{Address, B256},
         providers::{
+            Identity, Provider, RootProvider,
             ext::TraceApi,
             fillers::{
                 BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller,
             },
-            Identity, Provider, RootProvider,
         },
         rpc::types::{
-            trace::{filter::TraceFilter as AlloyTraceFilter, parity::LocalizedTransactionTrace},
             TransactionInput, TransactionRequest,
+            trace::{filter::TraceFilter as AlloyTraceFilter, parity::LocalizedTransactionTrace},
         },
         transports::{RpcError, TransportErrorKind},
     },
@@ -43,11 +44,12 @@ use graph::prelude::{
 };
 use graph::slog::o;
 use graph::{
-    blockchain::{block_stream::BlockWithTriggers, BlockPtr, IngestorError},
+    blockchain::{BlockPtr, IngestorError, block_stream::BlockWithTriggers},
     prelude::{
-        anyhow::{self, anyhow, bail, ensure, Context},
-        debug, error, hex, info, retry, serde_json as json, trace, warn, BlockNumber, ChainStore,
-        CheapClone, DynTryFuture, Error, EthereumCallCache, Logger, TimeoutError,
+        BlockNumber, ChainStore, CheapClone, DynTryFuture, Error, EthereumCallCache, Logger,
+        TimeoutError,
+        anyhow::{self, Context, anyhow, bail, ensure},
+        debug, error, hex, info, retry, trace, warn,
     },
 };
 use itertools::Itertools;
@@ -56,27 +58,28 @@ use std::convert::TryFrom;
 use std::iter::FromIterator;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tokio::time::timeout;
 
+use crate::Chain;
+use crate::NodeCapabilities;
+use crate::TriggerFilter;
 use crate::adapter::EthGetLogsFilter;
 use crate::adapter::EthereumRpcError;
 use crate::adapter::ProviderStatus;
 use crate::call_helper::interpret_eth_call_error;
 use crate::chain::BlockFinality;
+use crate::chain::ChainSettings;
 use crate::trigger::{LogPosition, LogRef};
-use crate::Chain;
-use crate::NodeCapabilities;
-use crate::TriggerFilter;
 use crate::{
+    ENV_VARS,
     adapter::{
         ContractCallError, EthereumAdapter as EthereumAdapterTrait, EthereumBlockFilter,
         EthereumCallFilter, EthereumLogFilter, ProviderEthRpcMetrics, SubgraphEthRpcMetrics,
     },
     transport::Transport,
     trigger::{EthereumBlockTriggerType, EthereumTrigger},
-    ENV_VARS,
 };
 
 type AlloyProvider = FillProvider<
@@ -84,8 +87,8 @@ type AlloyProvider = FillProvider<
         Identity,
         JoinFill<GasFiller, JoinFill<BlobGasFiller, JoinFill<NonceFiller, ChainIdFiller>>>,
     >,
-    RootProvider<AnyNetwork>,
-    AnyNetwork,
+    RootProvider<AnyNetworkBare>,
+    AnyNetworkBare,
 >;
 
 #[derive(Clone)]
@@ -97,6 +100,7 @@ pub struct EthereumAdapter {
     supports_eip_1898: bool,
     call_only: bool,
     supports_block_receipts: Arc<RwLock<Option<bool>>>,
+    pub(crate) settings: Arc<ChainSettings>,
 }
 
 impl std::fmt::Debug for EthereumAdapter {
@@ -109,6 +113,7 @@ impl std::fmt::Debug for EthereumAdapter {
             .field("supports_eip_1898", &self.supports_eip_1898)
             .field("call_only", &self.call_only)
             .field("supports_block_receipts", &self.supports_block_receipts)
+            .field("settings", &self.settings)
             .finish()
     }
 }
@@ -123,13 +128,37 @@ impl CheapClone for EthereumAdapter {
             supports_eip_1898: self.supports_eip_1898,
             call_only: self.call_only,
             supports_block_receipts: self.supports_block_receipts.cheap_clone(),
+            settings: self.settings.clone(),
         }
+    }
+}
+
+/// Logger with provider context. Internal methods should take this type
+/// to ensure provider info is always included in logs.
+#[derive(Clone, CheapClone)]
+struct ProviderLogger(Logger);
+
+impl ProviderLogger {
+    fn new(logger: &Logger, provider: &str) -> Self {
+        Self(Logger::new(logger, o!("provider" => provider.to_string())))
+    }
+}
+
+impl std::ops::Deref for ProviderLogger {
+    type Target = Logger;
+    fn deref(&self) -> &Logger {
+        &self.0
     }
 }
 
 impl EthereumAdapter {
     pub fn is_call_only(&self) -> bool {
         self.call_only
+    }
+
+    /// Returns a logger with provider context added
+    fn provider_logger(&self, logger: &Logger) -> ProviderLogger {
+        ProviderLogger::new(logger, &self.provider)
     }
 
     pub async fn new(
@@ -139,26 +168,24 @@ impl EthereumAdapter {
         provider_metrics: Arc<ProviderEthRpcMetrics>,
         supports_eip_1898: bool,
         call_only: bool,
+        settings: Arc<ChainSettings>,
     ) -> Self {
         let alloy = match &transport {
             Transport::RPC(client) => Arc::new(
-                alloy::providers::ProviderBuilder::<_, _, AnyNetwork>::default()
-                    .network::<AnyNetwork>()
-                    .with_recommended_fillers()
+                alloy::providers::ProviderBuilder::<_, _, AnyNetworkBare>::default()
+                    .network::<AnyNetworkBare>()
                     .connect_client(client.clone()),
             ),
             Transport::IPC(ipc_connect) => Arc::new(
-                alloy::providers::ProviderBuilder::<_, _, AnyNetwork>::default()
-                    .network::<AnyNetwork>()
-                    .with_recommended_fillers()
+                alloy::providers::ProviderBuilder::<_, _, AnyNetworkBare>::default()
+                    .network::<AnyNetworkBare>()
                     .connect_ipc(ipc_connect.clone())
                     .await
                     .expect("Failed to connect to Ethereum IPC"),
             ),
             Transport::WS(ws_connect) => Arc::new(
-                alloy::providers::ProviderBuilder::<_, _, AnyNetwork>::default()
-                    .network::<AnyNetwork>()
-                    .with_recommended_fillers()
+                alloy::providers::ProviderBuilder::<_, _, AnyNetworkBare>::default()
+                    .network::<AnyNetworkBare>()
                     .connect_ws(ws_connect.clone())
                     .await
                     .expect("Failed to connect to Ethereum WS"),
@@ -173,12 +200,13 @@ impl EthereumAdapter {
             supports_eip_1898,
             call_only,
             supports_block_receipts: Arc::new(RwLock::new(None)),
+            settings,
         }
     }
 
     async fn traces(
         self,
-        logger: Logger,
+        logger: ProviderLogger,
         subgraph_metrics: Arc<SubgraphEthRpcMetrics>,
         from: BlockNumber,
         to: BlockNumber,
@@ -192,8 +220,8 @@ impl EthereumAdapter {
 
         retry(retry_log_message, &logger)
             .redact_log_urls(true)
-            .limit(ENV_VARS.request_retries)
-            .timeout_secs(ENV_VARS.json_rpc_timeout.as_secs())
+            .limit(self.settings.request_retries)
+            .timeout_secs(self.settings.json_rpc_timeout.as_secs())
             .run(move || {
                 let eth = eth.clone();
                 let logger = logger.clone();
@@ -219,7 +247,7 @@ impl EthereumAdapter {
 
     async fn execute_trace_filter_request(
         &self,
-        logger: Logger,
+        logger: ProviderLogger,
         subgraph_metrics: Arc<SubgraphEthRpcMetrics>,
         from: BlockNumber,
         to: BlockNumber,
@@ -264,7 +292,7 @@ impl EthereumAdapter {
 
     fn log_trace_results(
         &self,
-        logger: &Logger,
+        logger: &ProviderLogger,
         from: BlockNumber,
         to: BlockNumber,
         trace_len: usize,
@@ -288,7 +316,7 @@ impl EthereumAdapter {
         result: &Result<Vec<LocalizedTransactionTrace>, RpcError<TransportErrorKind>>,
         from: BlockNumber,
         to: BlockNumber,
-        logger: &Logger,
+        logger: &ProviderLogger,
     ) {
         self.metrics
             .observe_request(elapsed, "trace_filter", &self.provider);
@@ -312,7 +340,7 @@ impl EthereumAdapter {
         block_hash: B256,
         supports_eip_1898: bool,
         call_only: bool,
-        logger: Logger,
+        logger: ProviderLogger,
     ) -> bool {
         // This is the lazy part. If the result is already in `supports_block_receipts`, we don't need
         // to check again.
@@ -362,7 +390,7 @@ impl EthereumAdapter {
     /// Alloy-exclusive version of logs_with_sigs using alloy types and methods
     async fn logs_with_sigs(
         &self,
-        logger: Logger,
+        logger: ProviderLogger,
         subgraph_metrics: Arc<SubgraphEthRpcMetrics>,
         from: BlockNumber,
         to: BlockNumber,
@@ -386,8 +414,8 @@ impl EthereumAdapter {
                         .any(|f| e.to_string().contains(f)),
                 },
             )
-            .limit(ENV_VARS.request_retries)
-            .timeout_secs(ENV_VARS.json_rpc_timeout.as_secs())
+            .limit(self.settings.request_retries)
+            .timeout_secs(self.settings.json_rpc_timeout.as_secs())
             .run(move || {
                 let eth_adapter = eth_adapter.cheap_clone();
                 let subgraph_metrics = subgraph_metrics.clone();
@@ -416,7 +444,7 @@ impl EthereumAdapter {
 
     fn trace_stream(
         self,
-        logger: &Logger,
+        logger: ProviderLogger,
         subgraph_metrics: Arc<SubgraphEthRpcMetrics>,
         from: BlockNumber,
         to: BlockNumber,
@@ -446,8 +474,8 @@ impl EthereumAdapter {
             ranges
         };
 
+        let block_batch_size = self.settings.block_batch_size;
         let eth = self;
-        let logger = logger.clone();
 
         futures03::stream::iter(ranges.into_iter().map(move |(start, end)| {
             let eth = eth.clone();
@@ -466,14 +494,14 @@ impl EthereumAdapter {
                     .await
             }
         }))
-        .buffered(ENV_VARS.block_batch_size)
+        .buffered(block_batch_size)
         .map_ok(|traces| futures03::stream::iter(traces.into_iter().map(Ok)))
         .try_flatten()
     }
 
     fn log_stream(
         &self,
-        logger: Logger,
+        logger: ProviderLogger,
         subgraph_metrics: Arc<SubgraphEthRpcMetrics>,
         from: BlockNumber,
         to: BlockNumber,
@@ -502,7 +530,7 @@ impl EthereumAdapter {
         let step = match filter.contracts.is_empty() {
             // `to - from + 1`  blocks will be scanned.
             false => to - from,
-            true => (to - from).min(ENV_VARS.max_event_only_range - 1),
+            true => (to - from).min(self.settings.max_event_only_range - 1),
         };
 
         // Typically this will loop only once and fetch the entire range in one request. But if the
@@ -575,12 +603,11 @@ impl EthereumAdapter {
 
     async fn code(
         &self,
-        logger: &Logger,
+        logger: ProviderLogger,
         address: Address,
         block_ptr: BlockPtr,
     ) -> Result<alloy::primitives::Bytes, EthereumRpcError> {
         let alloy = self.alloy.clone();
-        let logger = Logger::new(logger, o!("provider" => self.provider.clone()));
 
         let block_id = self.block_ptr_to_id(&block_ptr);
         let retry_log_message = format!("eth_getCode RPC call for block {}", block_ptr);
@@ -588,8 +615,8 @@ impl EthereumAdapter {
         retry(retry_log_message, &logger)
             .redact_log_urls(true)
             .when(|result| result.is_err())
-            .limit(ENV_VARS.request_retries)
-            .timeout_secs(ENV_VARS.json_rpc_timeout.as_secs())
+            .limit(self.settings.request_retries)
+            .timeout_secs(self.settings.json_rpc_timeout.as_secs())
             .run(move || {
                 let alloy = alloy.cheap_clone();
                 async move {
@@ -606,12 +633,11 @@ impl EthereumAdapter {
 
     async fn balance(
         &self,
-        logger: &Logger,
+        logger: ProviderLogger,
         address: Address,
         block_ptr: BlockPtr,
     ) -> Result<alloy::primitives::U256, EthereumRpcError> {
         let alloy = self.alloy.clone();
-        let logger = Logger::new(logger, o!("provider" => self.provider.clone()));
 
         let block_id = self.block_ptr_to_id(&block_ptr);
         let retry_log_message = format!("eth_getBalance RPC call for block {}", block_ptr);
@@ -619,8 +645,8 @@ impl EthereumAdapter {
         retry(retry_log_message, &logger)
             .redact_log_urls(true)
             .when(|result| result.is_err())
-            .limit(ENV_VARS.request_retries)
-            .timeout_secs(ENV_VARS.json_rpc_timeout.as_secs())
+            .limit(self.settings.request_retries)
+            .timeout_secs(self.settings.json_rpc_timeout.as_secs())
             .run(move || {
                 let alloy = alloy.cheap_clone();
                 async move {
@@ -637,20 +663,19 @@ impl EthereumAdapter {
 
     async fn call(
         &self,
-        logger: Logger,
+        logger: ProviderLogger,
         call_data: call::Request,
         block_ptr: BlockPtr,
         gas: Option<u32>,
     ) -> Result<call::Retval, ContractCallError> {
         let alloy = self.alloy.clone();
-        let logger = Logger::new(&logger, o!("provider" => self.provider.clone()));
 
         let alloy_block_id = self.block_ptr_to_id(&block_ptr);
         let retry_log_message = format!("eth_call RPC call for block {}", block_ptr);
         retry(retry_log_message, &logger)
             .redact_log_urls(true)
-            .limit(ENV_VARS.request_retries)
-            .timeout_secs(ENV_VARS.json_rpc_timeout.as_secs())
+            .limit(self.settings.request_retries)
+            .timeout_secs(self.settings.json_rpc_timeout.as_secs())
             .run(move || {
                 let call_data = call_data.clone();
                 let alloy = alloy.cheap_clone();
@@ -680,7 +705,7 @@ impl EthereumAdapter {
 
     async fn call_and_cache(
         &self,
-        logger: &Logger,
+        logger: &ProviderLogger,
         call: &ContractCall,
         req: call::Request,
         cache: Arc<dyn EthereumCallCache>,
@@ -716,6 +741,8 @@ impl EthereumAdapter {
         ids: Vec<B256>,
     ) -> impl futures03::Stream<Item = Result<Arc<LightEthereumBlock>, Error>> + Send {
         let alloy = self.alloy.clone();
+        let request_retries = self.settings.request_retries;
+        let json_rpc_timeout_secs = self.settings.json_rpc_timeout.as_secs();
 
         futures03::stream::iter(ids.into_iter().map(move |hash| {
             let alloy = alloy.clone();
@@ -724,8 +751,8 @@ impl EthereumAdapter {
             async move {
                 retry(format!("load block {}", hash), &logger)
                     .redact_log_urls(true)
-                    .limit(ENV_VARS.request_retries)
-                    .timeout_secs(ENV_VARS.json_rpc_timeout.as_secs())
+                    .limit(request_retries)
+                    .timeout_secs(json_rpc_timeout_secs)
                     .run(move || {
                         let alloy = alloy.cheap_clone();
                         async move {
@@ -754,7 +781,7 @@ impl EthereumAdapter {
                     })
             }
         }))
-        .buffered(ENV_VARS.block_batch_size)
+        .buffered(self.settings.block_batch_size)
     }
 
     /// Request blocks by number through JSON-RPC.
@@ -764,6 +791,8 @@ impl EthereumAdapter {
         numbers: Vec<BlockNumber>,
     ) -> impl futures03::Stream<Item = Result<Arc<ExtendedBlockPtr>, Error>> + Send {
         let alloy = self.alloy.clone();
+        let request_retries = self.settings.request_retries;
+        let json_rpc_timeout_secs = self.settings.json_rpc_timeout.as_secs();
 
         futures03::stream::iter(numbers.into_iter().map(move |number| {
             let alloy = alloy.clone();
@@ -772,8 +801,8 @@ impl EthereumAdapter {
             async move {
                 retry(format!("load block {}", number), &logger)
                     .redact_log_urls(true)
-                    .limit(ENV_VARS.request_retries)
-                    .timeout_secs(ENV_VARS.json_rpc_timeout.as_secs())
+                    .limit(request_retries)
+                    .timeout_secs(json_rpc_timeout_secs)
                     .run(move || {
                         let alloy = alloy.cheap_clone();
 
@@ -814,7 +843,7 @@ impl EthereumAdapter {
                     })
             }
         }))
-        .buffered(ENV_VARS.block_ptr_batch_size)
+        .buffered(self.settings.block_ptr_batch_size)
     }
 
     /// Request blocks ptrs for numbers through JSON-RPC.
@@ -826,6 +855,7 @@ impl EthereumAdapter {
         block_nums: Vec<BlockNumber>,
     ) -> impl Stream<Item = BlockPtr, Error = Error> + Send {
         let alloy = self.alloy.clone();
+        let json_rpc_timeout_secs = self.settings.json_rpc_timeout.as_secs();
 
         stream::iter_ok::<_, Error>(block_nums.into_iter().map(move |block_num| {
             let alloy = alloy.clone();
@@ -833,7 +863,7 @@ impl EthereumAdapter {
                 .redact_log_urls(true)
                 .when(|res| !res.is_ok() && !detect_null_block(res))
                 .no_limit()
-                .timeout_secs(ENV_VARS.json_rpc_timeout.as_secs())
+                .timeout_secs(json_rpc_timeout_secs)
                 .run(move || {
                     let alloy = alloy.cheap_clone();
                     async move {
@@ -859,7 +889,7 @@ impl EthereumAdapter {
                     }
                 })
         }))
-        .buffered(ENV_VARS.block_batch_size)
+        .buffered(self.settings.block_batch_size)
         .filter_map(|b| b)
         .map(|b| BlockPtr::from((b.header.hash, b.header.number)))
     }
@@ -896,19 +926,24 @@ impl EthereumAdapter {
         log_filter: EthereumLogFilter,
     ) -> DynTryFuture<'static, Vec<alloy::rpc::types::Log>, Error> {
         let eth: Self = self.cheap_clone();
-        let logger = logger.clone();
+        let logger = self.provider_logger(logger);
 
-        futures03::stream::iter(log_filter.eth_get_logs_filters().map(move |filter| {
-            eth.cheap_clone().log_stream(
-                logger.cheap_clone(),
-                subgraph_metrics.cheap_clone(),
-                from,
-                to,
-                filter,
-            )
-        }))
+        let max_contracts = eth.settings.get_logs_max_contracts;
+        futures03::stream::iter(
+            log_filter
+                .eth_get_logs_filters(max_contracts)
+                .map(move |filter| {
+                    eth.cheap_clone().log_stream(
+                        logger.cheap_clone(),
+                        subgraph_metrics.cheap_clone(),
+                        from,
+                        to,
+                        filter,
+                    )
+                }),
+        )
         // Real limits on the number of parallel requests are imposed within the adapter.
-        .buffered(ENV_VARS.block_ingestor_max_concurrent_json_rpc_calls)
+        .buffered(self.settings.block_ingestor_max_concurrent_json_rpc_calls)
         .try_concat()
         .boxed()
     }
@@ -922,6 +957,7 @@ impl EthereumAdapter {
         call_filter: &'a EthereumCallFilter,
     ) -> Box<dyn Stream<Item = EthereumCall, Error = Error> + Send + 'a> {
         let eth = self.clone();
+        let logger = self.provider_logger(logger);
 
         let EthereumCallFilter {
             contract_addresses_function_signatures,
@@ -976,34 +1012,20 @@ impl EthereumAdapter {
     ) -> Pin<
         Box<
             dyn std::future::Future<Output = Result<Vec<EthereumTrigger>, anyhow::Error>>
-                + std::marker::Send,
+                + std::marker::Send
+                + '_,
         >,
     > {
-        // Create a HashMap of block numbers to Vec<EthereumBlockTriggerType>
+        // Create a HashMap of block numbers to Vec<EthereumBlockTriggerType>.
         let matching_blocks = (from..=to)
             .filter_map(|block_number| {
-                filter
-                    .polling_intervals
-                    .iter()
-                    .find_map(|(start_block, interval)| {
-                        let has_once_trigger = (*interval == 0) && (block_number == *start_block);
-                        let has_polling_trigger = block_number >= *start_block
-                            && *interval > 0
-                            && ((block_number - start_block) % *interval) == 0;
-
-                        if has_once_trigger || has_polling_trigger {
-                            let mut triggers = Vec::new();
-                            if has_once_trigger {
-                                triggers.push(EthereumBlockTriggerType::Start);
-                            }
-                            if has_polling_trigger {
-                                triggers.push(EthereumBlockTriggerType::End);
-                            }
-                            Some((block_number, triggers))
-                        } else {
-                            None
-                        }
-                    })
+                let triggers =
+                    block_trigger_types_from_intervals(block_number, &filter.polling_intervals);
+                if triggers.is_empty() {
+                    None
+                } else {
+                    Some((block_number, triggers))
+                }
             })
             .collect::<HashMap<_, _>>();
 
@@ -1015,15 +1037,13 @@ impl EthereumAdapter {
         let block_futures = blocks_matching_polling_filter.map(move |ptrs| {
             ptrs.into_iter()
                 .flat_map(|ptr| {
-                    let triggers = matching_blocks
+                    matching_blocks
                         .get(&ptr.number)
                         // Safe to unwrap since we are iterating over ptrs which was created from
                         // the keys of matching_blocks
                         .unwrap()
                         .iter()
-                        .map(move |trigger| EthereumTrigger::Block(ptr.clone(), trigger.clone()));
-
-                    triggers
+                        .map(move |trigger| EthereumTrigger::Block(ptr.clone(), trigger.clone()))
                 })
                 .collect::<Vec<_>>()
         });
@@ -1039,6 +1059,7 @@ impl EthereumAdapter {
         block_hash: alloy::primitives::B256,
     ) -> Result<Vec<EthereumCall>, Error> {
         let eth = self.clone();
+        let logger = self.provider_logger(logger);
         let addresses = Vec::new();
         let traces: Vec<LocalizedTransactionTrace> = eth
             .trace_stream(
@@ -1087,7 +1108,7 @@ impl EthereumAdapter {
         logger: Logger,
         from: BlockNumber,
         to: BlockNumber,
-    ) -> Box<dyn Future<Item = Vec<BlockPtr>, Error = Error> + Send> {
+    ) -> Box<dyn Future<Item = Vec<BlockPtr>, Error = Error> + Send + '_> {
         // Currently we can't go to the DB for this because there might be duplicate entries for
         // the same block number.
         debug!(&logger, "Requesting hashes for blocks [{}, {}]", from, to);
@@ -1101,7 +1122,7 @@ impl EthereumAdapter {
         &self,
         logger: Logger,
         blocks: Vec<BlockNumber>,
-    ) -> Box<dyn Future<Item = Vec<BlockPtr>, Error = Error> + Send> {
+    ) -> Box<dyn Future<Item = Vec<BlockPtr>, Error = Error> + Send + '_> {
         // Currently we can't go to the DB for this because there might be duplicate entries for
         // the same block number.
         debug!(&logger, "Requesting hashes for blocks {:?}", blocks);
@@ -1114,7 +1135,7 @@ impl EthereumAdapter {
         retry("chain_id RPC call", &logger)
             .redact_log_urls(true)
             .no_limit()
-            .timeout_secs(ENV_VARS.json_rpc_timeout.as_secs())
+            .timeout_secs(self.settings.json_rpc_timeout.as_secs())
             .run(move || {
                 let alloy = alloy.cheap_clone();
                 async move { alloy.get_chain_id().await.map_err(Error::from) }
@@ -1171,9 +1192,10 @@ impl EthereumAdapterTrait for EthereumAdapter {
         let alloy_provider = self.alloy.clone();
         let metrics = self.metrics.clone();
         let provider = self.provider().to_string();
+        let genesis_block_number = self.settings.genesis_block_number;
         let retry_log_message = format!(
             "eth_getBlockByNumber({}, false) RPC call",
-            ENV_VARS.genesis_block_number
+            genesis_block_number
         );
         let gen_block_hash_future = retry(retry_log_message, &logger)
             .redact_log_urls(true)
@@ -1186,7 +1208,7 @@ impl EthereumAdapterTrait for EthereumAdapter {
                 async move {
                     alloy_genesis
                         .get_block_by_number(alloy::rpc::types::BlockNumberOrTag::Number(
-                            ENV_VARS.genesis_block_number,
+                            genesis_block_number,
                         ))
                         .await
                         .inspect_err(|_| {
@@ -1224,8 +1246,8 @@ impl EthereumAdapterTrait for EthereumAdapter {
         let alloy = self.alloy.clone();
         retry("eth_getBlockByNumber(latest) no txs RPC call", logger)
             .redact_log_urls(true)
-            .no_limit()
-            .timeout_secs(ENV_VARS.json_rpc_timeout.as_secs())
+            .limit(ENV_VARS.request_retries)
+            .timeout_secs(self.settings.json_rpc_timeout.as_secs())
             .run(move || {
                 let alloy = alloy.cheap_clone();
                 async move {
@@ -1248,6 +1270,14 @@ impl EthereumAdapterTrait for EthereumAdapter {
             .await
     }
 
+    async fn is_reachable(&self) -> bool {
+        let alloy = self.alloy.clone();
+        tokio::time::timeout(Duration::from_secs(10), alloy.get_block_number())
+            .await
+            .map(|r| r.is_ok())
+            .unwrap_or(false)
+    }
+
     async fn block_by_hash(
         &self,
         logger: &Logger,
@@ -1262,8 +1292,8 @@ impl EthereumAdapterTrait for EthereumAdapter {
 
         retry(retry_log_message, &logger)
             .redact_log_urls(true)
-            .limit(ENV_VARS.request_retries)
-            .timeout_secs(ENV_VARS.json_rpc_timeout.as_secs())
+            .limit(self.settings.request_retries)
+            .timeout_secs(self.settings.json_rpc_timeout.as_secs())
             .run(move || {
                 let alloy = alloy.cheap_clone();
                 async move {
@@ -1296,7 +1326,7 @@ impl EthereumAdapterTrait for EthereumAdapter {
         retry(retry_log_message, &logger)
             .redact_log_urls(true)
             .no_limit()
-            .timeout_secs(ENV_VARS.json_rpc_timeout.as_secs())
+            .timeout_secs(self.settings.json_rpc_timeout.as_secs())
             .run(move || {
                 let alloy = alloy.clone();
                 async move {
@@ -1326,7 +1356,7 @@ impl EthereumAdapterTrait for EthereumAdapter {
         block: AnyBlock,
     ) -> Result<EthereumBlock, IngestorError> {
         let alloy = self.alloy.clone();
-        let logger = logger.clone();
+        let logger = self.provider_logger(logger);
         let block_hash = block.header.hash;
 
         // The early return is necessary for correctness, otherwise we'll
@@ -1350,12 +1380,19 @@ impl EthereumAdapterTrait for EthereumAdapter {
             )
             .await;
 
-        fetch_receipts_with_retry(alloy, hashes, block_hash, logger, supports_block_receipts)
-            .await
-            .map(|transaction_receipts| EthereumBlock {
-                block: Arc::new(LightEthereumBlock::new(block)),
-                transaction_receipts,
-            })
+        fetch_receipts_with_retry(
+            alloy,
+            hashes,
+            block_hash,
+            logger,
+            supports_block_receipts,
+            &self.settings,
+        )
+        .await
+        .map(|transaction_receipts| EthereumBlock {
+            block: Arc::new(LightEthereumBlock::new(block)),
+            transaction_receipts,
+        })
     }
 
     async fn get_balance(
@@ -1364,6 +1401,7 @@ impl EthereumAdapterTrait for EthereumAdapter {
         address: Address,
         block_ptr: BlockPtr,
     ) -> Result<alloy::primitives::U256, EthereumRpcError> {
+        let logger = self.provider_logger(logger);
         debug!(
             logger, "eth_getBalance";
             "address" => format!("{}", address),
@@ -1378,6 +1416,7 @@ impl EthereumAdapterTrait for EthereumAdapter {
         address: Address,
         block_ptr: BlockPtr,
     ) -> Result<alloy::primitives::Bytes, EthereumRpcError> {
+        let logger = self.provider_logger(logger);
         debug!(
             logger, "eth_getCode";
             "address" => format!("{}", address),
@@ -1403,7 +1442,7 @@ impl EthereumAdapterTrait for EthereumAdapter {
                 .redact_log_urls(true)
                 .when(|res| !res.is_ok() && !detect_null_block(res))
                 .no_limit()
-                .timeout_secs(ENV_VARS.json_rpc_timeout.as_secs())
+                .timeout_secs(self.settings.json_rpc_timeout.as_secs())
                 .run(move || {
                     let alloy = alloy.cheap_clone();
                     async move {
@@ -1457,7 +1496,7 @@ impl EthereumAdapterTrait for EthereumAdapter {
         cache: Arc<dyn EthereumCallCache>,
     ) -> Result<Vec<(Option<Vec<abi::DynSolValue>>, call::Source)>, ContractCallError> {
         fn as_req(
-            logger: &Logger,
+            logger: &ProviderLogger,
             call: &ContractCall,
             index: u32,
         ) -> Result<call::Request, ContractCallError> {
@@ -1498,7 +1537,7 @@ impl EthereumAdapterTrait for EthereumAdapter {
         }
 
         fn decode(
-            logger: &Logger,
+            logger: &ProviderLogger,
             resp: call::Response,
             call: &ContractCall,
         ) -> (Option<Vec<abi::DynSolValue>>, call::Source) {
@@ -1528,19 +1567,32 @@ impl EthereumAdapterTrait for EthereumAdapter {
             }
         }
 
-        fn log_call_error(logger: &Logger, e: &ContractCallError, call: &ContractCall) {
+        fn log_call_error(logger: &ProviderLogger, e: &ContractCallError, call: &ContractCall) {
             match e {
-                ContractCallError::AlloyError(e) => error!(logger,
+                ContractCallError::AlloyError(e) => error!(
+                    logger,
                     "Ethereum node returned an error when calling function \"{}\" of contract \"{}\": {}",
-                    call.function.name, call.contract_name, e),
-                ContractCallError::Timeout => error!(logger,
+                    call.function.name,
+                    call.contract_name,
+                    e
+                ),
+                ContractCallError::Timeout => error!(
+                    logger,
                     "Ethereum node did not respond when calling function \"{}\" of contract \"{}\"",
-                    call.function.name, call.contract_name),
-                _ => error!(logger,
+                    call.function.name,
+                    call.contract_name
+                ),
+                _ => error!(
+                    logger,
                     "Failed to call function \"{}\" of contract \"{}\": {}",
-                    call.function.name, call.contract_name, e),
+                    call.function.name,
+                    call.contract_name,
+                    e
+                ),
             }
         }
+
+        let logger = self.provider_logger(logger);
 
         if calls.is_empty() {
             return Ok(Vec::new());
@@ -1556,7 +1608,7 @@ impl EthereumAdapterTrait for EthereumAdapter {
         let reqs: Vec<_> = calls
             .iter()
             .enumerate()
-            .map(|(index, call)| as_req(logger, call, index as u32))
+            .map(|(index, call)| as_req(&logger, call, index as u32))
             .collect::<Result<_, _>>()?;
 
         let (mut resps, missing) = cache
@@ -1567,12 +1619,13 @@ impl EthereumAdapterTrait for EthereumAdapter {
 
         let futs = missing.into_iter().map(|req| {
             let cache = cache.clone();
+            let logger = logger.clone();
             async move {
                 let call = calls[req.index as usize];
-                match self.call_and_cache(logger, call, req, cache.clone()).await {
+                match self.call_and_cache(&logger, call, req, cache.clone()).await {
                     Ok(resp) => Ok(resp),
                     Err(e) => {
-                        log_call_error(logger, &e, call);
+                        log_call_error(&logger, &e, call);
                         Err(e)
                     }
                 }
@@ -1590,7 +1643,7 @@ impl EthereumAdapterTrait for EthereumAdapter {
             .into_iter()
             .map(|res| {
                 let call = &calls[res.req.index as usize];
-                decode(logger, res, call)
+                decode(&logger, res, call)
             })
             .collect();
 
@@ -1612,25 +1665,8 @@ impl EthereumAdapterTrait for EthereumAdapter {
             .await
             .map_err(|e| error!(&logger, "Error accessing block cache {}", e))
             .unwrap_or_default()
-            .into_iter()
-            .filter_map(|value| {
-                json::from_value(value.clone())
-                    .map_err(|e| {
-                        let block_num = value.get("number").and_then(|n| n.as_u64());
-                        let block_hash = value.get("hash").and_then(|h| h.as_str());
-                        warn!(
-                            &logger,
-                            "Failed to deserialize cached block #{:?} {:?}: {}. \
-                         This may indicate stale cache data from a previous version. \
-                         Block will be re-fetched from RPC.",
-                            block_num,
-                            block_hash,
-                            e
-                        );
-                    })
-                    .ok()
-            })
-            .map(|b| Arc::new(LightEthereumBlock::new(b)))
+            .iter()
+            .map(|b| b.to_light_block())
             .collect();
 
         let missing_blocks = Vec::from_iter(
@@ -1691,6 +1727,7 @@ pub(crate) async fn blocks_with_triggers(
     // while searching for a trigger type, the entire operation fails.
     let eth = adapter.clone();
     let call_filter = EthereumCallFilter::from(&filter.block);
+    let logger = ProviderLogger::new(&logger, eth.provider());
 
     // Scan the block range to find relevant triggers
     let trigger_futs: FuturesUnordered<BoxFuture<Result<Vec<EthereumTrigger>, anyhow::Error>>> =
@@ -1706,8 +1743,9 @@ pub(crate) async fn blocks_with_triggers(
     // This is for `start` triggers which can be initialization handlers which needs to be run
     // before all other triggers
     if filter.block.trigger_every_block {
+        let logger = logger.clone();
         let block_future = eth
-            .block_range_to_ptrs(logger.clone(), from, to)
+            .block_range_to_ptrs((*logger).clone(), from, to)
             .map(move |ptrs| {
                 ptrs.into_iter()
                     .flat_map(|ptr| {
@@ -1723,7 +1761,7 @@ pub(crate) async fn blocks_with_triggers(
         trigger_futs.push(block_future)
     } else if !filter.block.polling_intervals.is_empty() {
         let block_futures_matching_once_filter =
-            eth.blocks_matching_polling_intervals(logger.clone(), from, to, &filter.block);
+            eth.blocks_matching_polling_intervals((*logger).clone(), from, to, &filter.block);
         trigger_futs.push(block_futures_matching_once_filter);
     }
 
@@ -1731,7 +1769,7 @@ pub(crate) async fn blocks_with_triggers(
     if !filter.log.is_empty() {
         let logs_future = get_logs_and_transactions(
             &eth,
-            &logger,
+            logger.clone(),
             subgraph_metrics.clone(),
             from,
             to,
@@ -1796,7 +1834,7 @@ pub(crate) async fn blocks_with_triggers(
     let logger2 = logger.cheap_clone();
 
     let blocks: Vec<_> = eth
-        .load_blocks(logger.cheap_clone(), chain_store.clone(), block_hashes)
+        .load_blocks((*logger).cheap_clone(), chain_store.clone(), block_hashes)
         .await?
         .into_iter()
         .map(
@@ -1899,31 +1937,36 @@ pub(crate) fn parse_log_triggers(
         return vec![];
     }
 
-    block
+    let total_logs: usize = block
         .transaction_receipts
         .iter()
-        .flat_map(move |receipt| {
-            receipt.logs().iter().enumerate().map(move |(index, log)| {
-                let requires_transaction_receipt = log
-                    .topics()
-                    .first()
-                    .map(|signature| {
-                        log_filter.requires_transaction_receipt(
-                            signature,
-                            Some(&log.address()),
-                            log.topics(),
-                        )
-                    })
-                    .unwrap_or(false);
+        .map(|r| r.logs().len())
+        .sum();
+    let mut triggers = Vec::with_capacity(total_logs);
 
-                EthereumTrigger::Log(LogRef::LogPosition(LogPosition {
-                    index,
-                    receipt: receipt.cheap_clone(),
-                    requires_transaction_receipt,
-                }))
-            })
-        })
-        .collect()
+    for receipt in &block.transaction_receipts {
+        for (index, log) in receipt.logs().iter().enumerate() {
+            let requires_transaction_receipt = log
+                .topics()
+                .first()
+                .map(|signature| {
+                    log_filter.requires_transaction_receipt(
+                        signature,
+                        Some(&log.address()),
+                        log.topics(),
+                    )
+                })
+                .unwrap_or(false);
+
+            triggers.push(EthereumTrigger::Log(LogRef::LogPosition(LogPosition {
+                index,
+                receipt: receipt.cheap_clone(),
+                requires_transaction_receipt,
+            })));
+        }
+    }
+
+    triggers
 }
 
 pub(crate) fn parse_call_triggers(
@@ -1949,6 +1992,36 @@ pub(crate) fn parse_call_triggers(
             .collect(),
         None => Ok(vec![]),
     }
+}
+
+/// For a given `block_number`, return the block trigger types that fire
+/// based on the rules in `polling_intervals`. Each entry is `(start_block,
+/// interval)` where `interval == 0` encodes a `once` rule and `interval > 0`
+/// encodes a `polling every interval` rule. Both rule kinds can fire at the
+/// same block (e.g. a once and polling rule sharing a `start_block`), so the
+/// returned Vec may contain `Start`, `End`, both, or neither.
+pub(crate) fn block_trigger_types_from_intervals(
+    block_number: i32,
+    polling_intervals: &HashSet<(i32, i32)>,
+) -> Vec<EthereumBlockTriggerType> {
+    let has_once_trigger = polling_intervals
+        .iter()
+        .any(|(start_block, interval)| *interval == 0 && block_number == *start_block);
+
+    let has_polling_trigger = polling_intervals.iter().any(|(start_block, interval)| {
+        *interval > 0
+            && block_number >= *start_block
+            && (block_number - start_block) % *interval == 0
+    });
+
+    let mut triggers = Vec::new();
+    if has_once_trigger {
+        triggers.push(EthereumBlockTriggerType::Start);
+    }
+    if has_polling_trigger {
+        triggers.push(EthereumBlockTriggerType::End);
+    }
+    triggers
 }
 
 /// This method does not parse block triggers with `once` filters.
@@ -1992,38 +2065,12 @@ pub(crate) fn parse_block_triggers(
             EthereumBlockTriggerType::End,
         ));
     } else if !block_filter.polling_intervals.is_empty() {
-        let has_polling_trigger =
-            &block_filter
-                .polling_intervals
-                .iter()
-                .any(|(start_block, interval)| match interval {
-                    0 => false,
-                    _ => {
-                        block_number >= *start_block
-                            && (block_number - *start_block) % *interval == 0
-                    }
-                });
-
-        let has_once_trigger =
-            &block_filter
-                .polling_intervals
-                .iter()
-                .any(|(start_block, interval)| match interval {
-                    0 => block_number == *start_block,
-                    _ => false,
-                });
-
-        if *has_once_trigger {
+        for trigger_type in
+            block_trigger_types_from_intervals(block_number, &block_filter.polling_intervals)
+        {
             triggers.push(EthereumTrigger::Block(
-                block_ptr3.clone(),
-                EthereumBlockTriggerType::Start,
-            ));
-        }
-
-        if *has_polling_trigger {
-            triggers.push(EthereumTrigger::Block(
-                block_ptr3,
-                EthereumBlockTriggerType::End,
+                block_ptr3.cheap_clone(),
+                trigger_type,
             ));
         }
     }
@@ -2033,7 +2080,7 @@ pub(crate) fn parse_block_triggers(
 async fn fetch_receipt_from_ethereum_client(
     eth: &EthereumAdapter,
     transaction_hash: B256,
-) -> anyhow::Result<alloy::network::AnyTransactionReceipt> {
+) -> anyhow::Result<AnyTransactionReceiptBare> {
     match eth.alloy.get_transaction_receipt(transaction_hash).await {
         Ok(Some(receipt)) => Ok(receipt),
         Ok(None) => bail!("Could not find transaction receipt"),
@@ -2045,7 +2092,7 @@ async fn filter_call_triggers_from_unsuccessful_transactions(
     mut block: BlockWithTriggers<crate::Chain>,
     eth: &EthereumAdapter,
     chain_store: &Arc<dyn ChainStore>,
-    logger: &Logger,
+    logger: &ProviderLogger,
 ) -> anyhow::Result<BlockWithTriggers<crate::Chain>> {
     // Return early if there is no trigger data
     if block.trigger_data.is_empty() {
@@ -2075,7 +2122,7 @@ async fn filter_call_triggers_from_unsuccessful_transactions(
     // And obtain all Transaction values for the calls in this block.
     let transactions: Vec<&AnyTransaction> = {
         match &block.block {
-            BlockFinality::Final(ref block) => block
+            BlockFinality::Final(block) => block
                 .transactions()
                 .ok_or_else(|| anyhow!("Block transactions not available"))?
                 .iter()
@@ -2185,17 +2232,18 @@ async fn fetch_transaction_receipts_in_batch_with_retry(
     alloy: Arc<AlloyProvider>,
     hashes: Vec<B256>,
     block_hash: B256,
-    logger: Logger,
-) -> Result<Vec<Arc<alloy::network::AnyTransactionReceipt>>, IngestorError> {
+    logger: ProviderLogger,
+    settings: &ChainSettings,
+) -> Result<Vec<Arc<AnyTransactionReceiptBare>>, IngestorError> {
     let retry_log_message = format!(
         "batch eth_getTransactionReceipt RPC call for block {:?}",
         block_hash
     );
     retry(retry_log_message, &logger)
         .redact_log_urls(true)
-        .limit(ENV_VARS.request_retries)
+        .limit(settings.request_retries)
         .no_logging()
-        .timeout_secs(ENV_VARS.json_rpc_timeout.as_secs())
+        .timeout_secs(settings.json_rpc_timeout.as_secs())
         .run(move || {
             let alloy = alloy.cheap_clone();
             let hashes = hashes.clone();
@@ -2211,8 +2259,8 @@ async fn fetch_transaction_receipts_in_batch(
     alloy: Arc<AlloyProvider>,
     hashes: Vec<B256>,
     block_hash: B256,
-    logger: Logger,
-) -> Result<Vec<Arc<alloy::network::AnyTransactionReceipt>>, IngestorError> {
+    logger: ProviderLogger,
+) -> Result<Vec<Arc<AnyTransactionReceiptBare>>, IngestorError> {
     // Use the batch method to get all receipts at once
     let receipts = batch_get_transaction_receipts(alloy, hashes.clone())
         .await
@@ -2241,17 +2289,16 @@ async fn fetch_transaction_receipts_in_batch(
 async fn batch_get_transaction_receipts(
     provider: Arc<AlloyProvider>,
     tx_hashes: Vec<B256>,
-) -> Result<Vec<Option<alloy::network::AnyTransactionReceipt>>, Box<dyn std::error::Error>> {
+) -> Result<Vec<Option<AnyTransactionReceiptBare>>, Box<dyn std::error::Error>> {
     let mut batch = alloy::rpc::client::BatchRequest::new(provider.client());
     let mut receipt_futures = Vec::new();
 
     // Add all receipt requests to batch
     for tx_hash in &tx_hashes {
-        let receipt_future = batch
-            .add_call::<(B256,), Option<alloy::network::AnyTransactionReceipt>>(
-                "eth_getTransactionReceipt",
-                &(*tx_hash,),
-            )?;
+        let receipt_future = batch.add_call::<(B256,), Option<AnyTransactionReceiptBare>>(
+            "eth_getTransactionReceipt",
+            &(*tx_hash,),
+        )?;
         receipt_futures.push(receipt_future);
     }
 
@@ -2301,13 +2348,14 @@ async fn fetch_receipts_with_retry(
     alloy: Arc<AlloyProvider>,
     hashes: Vec<B256>,
     block_hash: B256,
-    logger: Logger,
+    logger: ProviderLogger,
     supports_block_receipts: bool,
-) -> Result<Vec<Arc<alloy::network::AnyTransactionReceipt>>, IngestorError> {
+    settings: &ChainSettings,
+) -> Result<Vec<Arc<AnyTransactionReceiptBare>>, IngestorError> {
     if supports_block_receipts {
-        return fetch_block_receipts_with_retry(alloy, hashes, block_hash, logger).await;
+        return fetch_block_receipts_with_retry(alloy, hashes, block_hash, logger, settings).await;
     }
-    fetch_individual_receipts_with_retry(alloy, hashes, block_hash, logger).await
+    fetch_individual_receipts_with_retry(alloy, hashes, block_hash, logger, settings).await
 }
 
 // Fetches receipts for each transaction in the block individually.
@@ -2315,12 +2363,19 @@ async fn fetch_individual_receipts_with_retry(
     alloy: Arc<AlloyProvider>,
     hashes: Vec<B256>,
     block_hash: B256,
-    logger: Logger,
-) -> Result<Vec<Arc<alloy::network::AnyTransactionReceipt>>, IngestorError> {
+    logger: ProviderLogger,
+    settings: &ChainSettings,
+) -> Result<Vec<Arc<AnyTransactionReceiptBare>>, IngestorError> {
     if ENV_VARS.fetch_receipts_in_batches {
-        return fetch_transaction_receipts_in_batch_with_retry(alloy, hashes, block_hash, logger)
-            .await;
+        return fetch_transaction_receipts_in_batch_with_retry(
+            alloy, hashes, block_hash, logger, settings,
+        )
+        .await;
     }
+
+    let request_retries = settings.request_retries;
+    let json_rpc_timeout = settings.json_rpc_timeout;
+    let concurrent_requests = settings.block_ingestor_max_concurrent_json_rpc_calls;
 
     // Use a stream to fetch receipts individually
     let hash_stream = tokio_stream::iter(hashes);
@@ -2331,13 +2386,15 @@ async fn fetch_individual_receipts_with_retry(
                 tx_hash,
                 block_hash,
                 logger.cheap_clone(),
+                request_retries,
+                json_rpc_timeout,
             )
         })
-        .buffered(ENV_VARS.block_ingestor_max_concurrent_json_rpc_calls);
+        .buffered(concurrent_requests);
 
-    tokio_stream::StreamExt::collect::<
-        Result<Vec<Arc<alloy::network::AnyTransactionReceipt>>, IngestorError>,
-    >(receipt_stream)
+    tokio_stream::StreamExt::collect::<Result<Vec<Arc<AnyTransactionReceiptBare>>, IngestorError>>(
+        receipt_stream,
+    )
     .await
 }
 
@@ -2346,17 +2403,17 @@ async fn fetch_block_receipts_with_retry(
     alloy: Arc<AlloyProvider>,
     hashes: Vec<B256>,
     block_hash: B256,
-    logger: Logger,
-) -> Result<Vec<Arc<alloy::network::AnyTransactionReceipt>>, IngestorError> {
+    logger: ProviderLogger,
+    settings: &ChainSettings,
+) -> Result<Vec<Arc<AnyTransactionReceiptBare>>, IngestorError> {
     use graph::prelude::alloy::rpc::types::BlockId;
-    let logger = logger.cheap_clone();
     let retry_log_message = format!("eth_getBlockReceipts RPC call for block {:?}", block_hash);
 
     // Perform the retry operation
     let receipts_option = retry(retry_log_message, &logger)
         .redact_log_urls(true)
-        .limit(ENV_VARS.request_retries)
-        .timeout_secs(ENV_VARS.json_rpc_timeout.as_secs())
+        .limit(settings.request_retries)
+        .timeout_secs(settings.json_rpc_timeout.as_secs())
         .run(move || alloy.get_block_receipts(BlockId::from(block_hash)).boxed())
         .await
         .map_err(|_timeout| -> IngestorError { anyhow!(block_hash).into() })?;
@@ -2391,9 +2448,10 @@ async fn fetch_transaction_receipt_with_retry(
     alloy: Arc<AlloyProvider>,
     transaction_hash: B256,
     block_hash: B256,
-    logger: Logger,
-) -> Result<Arc<alloy::network::AnyTransactionReceipt>, IngestorError> {
-    let logger = logger.cheap_clone();
+    logger: ProviderLogger,
+    request_retries: usize,
+    json_rpc_timeout: Duration,
+) -> Result<Arc<AnyTransactionReceiptBare>, IngestorError> {
     let retry_log_message = format!(
         "eth_getTransactionReceipt RPC call for transaction {:?}",
         transaction_hash
@@ -2401,8 +2459,8 @@ async fn fetch_transaction_receipt_with_retry(
 
     retry(retry_log_message, &logger)
         .redact_log_urls(true)
-        .limit(ENV_VARS.request_retries)
-        .timeout_secs(ENV_VARS.json_rpc_timeout.as_secs())
+        .limit(request_retries)
+        .timeout_secs(json_rpc_timeout.as_secs())
         .run(move || {
             let alloy_clone = alloy.clone();
             async move { alloy_clone.get_transaction_receipt(transaction_hash).await }.boxed()
@@ -2416,11 +2474,11 @@ async fn fetch_transaction_receipt_with_retry(
 }
 
 fn resolve_transaction_receipt(
-    transaction_receipt: Option<alloy::network::AnyTransactionReceipt>,
+    transaction_receipt: Option<AnyTransactionReceiptBare>,
     transaction_hash: B256,
     block_hash: B256,
-    logger: Logger,
-) -> Result<alloy::network::AnyTransactionReceipt, IngestorError> {
+    logger: ProviderLogger,
+) -> Result<AnyTransactionReceiptBare, IngestorError> {
     match transaction_receipt {
         // A receipt might be missing because the block was uncled, and the transaction never
         // made it back into the main chain.
@@ -2473,7 +2531,7 @@ fn resolve_transaction_receipt(
 /// Retrieves logs and the associated transaction receipts, if required by the [`EthereumLogFilter`].
 async fn get_logs_and_transactions(
     adapter: &Arc<EthereumAdapter>,
-    logger: &Logger,
+    logger: ProviderLogger,
     subgraph_metrics: Arc<SubgraphEthRpcMetrics>,
     from: BlockNumber,
     to: BlockNumber,
@@ -2483,7 +2541,7 @@ async fn get_logs_and_transactions(
     // Obtain logs externally
     let logs = adapter
         .logs_in_block_range(
-            logger,
+            &logger,
             subgraph_metrics.cheap_clone(),
             from,
             to,
@@ -2552,12 +2610,11 @@ async fn get_transaction_receipts_for_transaction_hashes(
     adapter: &EthereumAdapter,
     transaction_hashes_by_block: &HashMap<B256, HashSet<B256>>,
     subgraph_metrics: Arc<SubgraphEthRpcMetrics>,
-    logger: Logger,
-) -> Result<HashMap<B256, Arc<alloy::network::AnyTransactionReceipt>>, anyhow::Error> {
+    logger: ProviderLogger,
+) -> Result<HashMap<B256, Arc<AnyTransactionReceiptBare>>, anyhow::Error> {
     use std::collections::hash_map::Entry::Vacant;
 
-    let mut receipts_by_hash: HashMap<B256, Arc<alloy::network::AnyTransactionReceipt>> =
-        HashMap::new();
+    let mut receipts_by_hash: HashMap<B256, Arc<AnyTransactionReceiptBare>> = HashMap::new();
 
     // Return early if input set is empty
     if transaction_hashes_by_block.is_empty() {
@@ -2580,6 +2637,8 @@ async fn get_transaction_receipts_for_transaction_hashes(
                 *transaction_hash,
                 *block_hash,
                 logger.cheap_clone(),
+                adapter.settings.request_retries,
+                adapter.settings.json_rpc_timeout,
             );
             receipt_futures.push(receipt_future)
         }
@@ -2634,16 +2693,15 @@ mod tests {
     use crate::trigger::{EthereumBlockTriggerType, EthereumTrigger};
 
     use super::{
-        check_block_receipt_support, parse_block_triggers, EthereumBlock, EthereumBlockFilter,
-        EthereumBlockWithCalls,
+        EthereumBlock, EthereumBlockFilter, EthereumBlockWithCalls,
+        block_trigger_types_from_intervals, check_block_receipt_support, parse_block_triggers,
     };
     use graph::blockchain::BlockPtr;
-    use graph::components::ethereum::AnyBlock;
-    use graph::prelude::alloy::network::AnyNetwork;
-    use graph::prelude::alloy::primitives::{Address, Bytes, B256};
-    use graph::prelude::alloy::providers::mock::Asserter;
+    use graph::components::ethereum::AnyNetworkBare;
+    use graph::prelude::alloy::primitives::{Address, B256, Bytes};
     use graph::prelude::alloy::providers::ProviderBuilder;
-    use graph::prelude::{create_minimal_block_for_test, EthereumCall, LightEthereumBlock};
+    use graph::prelude::alloy::providers::mock::Asserter;
+    use graph::prelude::{EthereumCall, LightEthereumBlock, create_minimal_block_for_test};
     use jsonrpc_core::serde_json::{self, Value};
     use std::collections::HashSet;
     use std::iter::FromIterator;
@@ -2655,7 +2713,7 @@ mod tests {
 
         let block = EthereumBlockWithCalls {
             ethereum_block: EthereumBlock {
-                block: Arc::new(LightEthereumBlock::new(AnyBlock::from(block))),
+                block: Arc::new(LightEthereumBlock::new(block)),
                 ..Default::default()
             },
             calls: Some(vec![EthereumCall {
@@ -2716,9 +2774,8 @@ mod tests {
             let json_value: Value = serde_json::from_str(json_response).unwrap();
 
             let asserter = Asserter::new();
-            let provider = ProviderBuilder::<_, _, AnyNetwork>::default()
-                .network::<AnyNetwork>()
-                .with_recommended_fillers()
+            let provider = ProviderBuilder::<_, _, AnyNetworkBare>::default()
+                .network::<AnyNetworkBare>()
                 .connect_mocked_client(asserter.clone());
 
             asserter.push_success(&json_value);
@@ -2800,7 +2857,7 @@ mod tests {
         #[allow(unreachable_code)]
         let block = EthereumBlockWithCalls {
             ethereum_block: EthereumBlock {
-                block: Arc::new(LightEthereumBlock::new(AnyBlock::from(block))),
+                block: Arc::new(LightEthereumBlock::new(block)),
                 ..Default::default()
             },
             calls: Some(vec![EthereumCall {
@@ -2831,7 +2888,7 @@ mod tests {
         #[allow(unreachable_code)]
         let block = EthereumBlockWithCalls {
             ethereum_block: EthereumBlock {
-                block: Arc::new(LightEthereumBlock::new(AnyBlock::from(block))),
+                block: Arc::new(LightEthereumBlock::new(block)),
                 ..Default::default()
             },
             calls: Some(vec![EthereumCall {
@@ -2855,6 +2912,115 @@ mod tests {
                 &block
             ),
             "block filter specifies address 4 and block has call to it"
+        );
+    }
+
+    #[test]
+    fn block_trigger_types_once_only() {
+        let intervals = HashSet::from_iter(vec![(100, 0)]);
+
+        assert_eq!(
+            vec![EthereumBlockTriggerType::Start],
+            block_trigger_types_from_intervals(100, &intervals),
+            "once rule fires Start at start_block"
+        );
+        assert_eq!(
+            Vec::<EthereumBlockTriggerType>::new(),
+            block_trigger_types_from_intervals(99, &intervals),
+            "once rule does not fire before start_block"
+        );
+        assert_eq!(
+            Vec::<EthereumBlockTriggerType>::new(),
+            block_trigger_types_from_intervals(101, &intervals),
+            "once rule does not fire after start_block"
+        );
+    }
+
+    #[test]
+    fn block_trigger_types_polling_only() {
+        let intervals = HashSet::from_iter(vec![(100, 10)]);
+
+        assert_eq!(
+            vec![EthereumBlockTriggerType::End],
+            block_trigger_types_from_intervals(100, &intervals),
+            "polling rule fires End at start_block"
+        );
+        assert_eq!(
+            vec![EthereumBlockTriggerType::End],
+            block_trigger_types_from_intervals(110, &intervals),
+            "polling rule fires End at start_block + interval"
+        );
+        assert_eq!(
+            Vec::<EthereumBlockTriggerType>::new(),
+            block_trigger_types_from_intervals(105, &intervals),
+            "polling rule does not fire off-interval"
+        );
+        assert_eq!(
+            Vec::<EthereumBlockTriggerType>::new(),
+            block_trigger_types_from_intervals(90, &intervals),
+            "polling rule does not fire before start_block"
+        );
+    }
+
+    #[test]
+    fn block_trigger_types_once_and_polling_same_start_block() {
+        // A single data source with both a `once` handler and a `polling` handler
+        // contributes both entries at its start_block. Both must fire at start_block.
+        let intervals = HashSet::from_iter(vec![(100, 0), (100, 10)]);
+
+        assert_eq!(
+            vec![
+                EthereumBlockTriggerType::Start,
+                EthereumBlockTriggerType::End,
+            ],
+            block_trigger_types_from_intervals(100, &intervals),
+            "both Start and End should fire when once and polling rules share start_block"
+        );
+        assert_eq!(
+            vec![EthereumBlockTriggerType::End],
+            block_trigger_types_from_intervals(110, &intervals),
+            "only polling fires at later interval matches"
+        );
+    }
+
+    #[test]
+    fn block_trigger_types_cross_datasource_collision() {
+        // Two data sources: DS-A with once at 100, DS-B with polling every 10 from 50.
+        // Block 100 satisfies DS-A's once rule and also (100-50) % 10 == 0, so both fire.
+        let intervals = HashSet::from_iter(vec![(100, 0), (50, 10)]);
+
+        assert_eq!(
+            vec![
+                EthereumBlockTriggerType::Start,
+                EthereumBlockTriggerType::End,
+            ],
+            block_trigger_types_from_intervals(100, &intervals),
+            "both triggers fire when a once rule and an unrelated polling rule collide"
+        );
+        assert_eq!(
+            vec![EthereumBlockTriggerType::End],
+            block_trigger_types_from_intervals(60, &intervals),
+            "only polling fires at a block where only the polling rule matches"
+        );
+    }
+
+    #[test]
+    fn block_trigger_types_no_match() {
+        let intervals = HashSet::from_iter(vec![(100, 0), (100, 10)]);
+        assert_eq!(
+            Vec::<EthereumBlockTriggerType>::new(),
+            block_trigger_types_from_intervals(99, &intervals),
+            "no triggers when block matches neither rule"
+        );
+    }
+
+    #[test]
+    fn block_trigger_types_empty_intervals() {
+        let intervals: HashSet<(i32, i32)> = HashSet::new();
+        assert_eq!(
+            Vec::<EthereumBlockTriggerType>::new(),
+            block_trigger_types_from_intervals(100, &intervals),
+            "empty intervals yields no triggers"
         );
     }
 

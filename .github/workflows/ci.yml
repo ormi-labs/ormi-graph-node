@@ -59,8 +59,20 @@ jobs:
       - name: Setup just
         uses: extractions/setup-just@e33e0265a09d6d736e2ee1e0eb685ef1de4669ff # v3
 
+      - name: Install pnpm
+        uses: pnpm/action-setup@a7487c7e89a18df4991f7f222e4898a00d66ddda # v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install Node.js dependencies
+        run: pnpm install
+
       - name: Run unit tests
-        run: just test-unit --verbose
+        run: just test-unit
 
   runner-tests:
     name: Subgraph Runner integration tests
@@ -113,7 +125,7 @@ jobs:
         run: pnpm install
 
       - name: Run runner tests
-        run: just test-runner --verbose
+        run: just test-runner
 
   integration-tests:
     name: Run integration tests
@@ -171,13 +183,15 @@ jobs:
         run: pnpm install
 
       - name: Start anvil
-        run: anvil --gas-limit 100000000000 --base-fee 1 --block-time 2 --timestamp 1743944919 --port 3021 &
+        run: anvil --gas-limit 100000000000 --base-fee 1 --timestamp 1743944919 --port 3021 &
 
       - name: Build graph-node
         run: just build --test integration_tests
 
       - name: Run integration tests
-        run: just test-integration --verbose
+        run: |
+          export PATH="${{ github.workspace }}/node_modules/.bin:$PATH"
+          just test-integration
 
       - name: Cat graph-node.log
         if: always()

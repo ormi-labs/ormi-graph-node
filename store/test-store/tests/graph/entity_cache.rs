@@ -1,6 +1,6 @@
 use async_trait::async_trait;
-use graph::blockchain::block_stream::FirehoseCursor;
 use graph::blockchain::BlockTime;
+use graph::blockchain::block_stream::FirehoseCursor;
 use graph::components::store::{
     DeploymentCursorTracker, DerivedEntityQuery, GetScope, LoadRelatedRequest, ReadStore,
     StoredDynamicDataSource, WritableStore,
@@ -194,8 +194,8 @@ fn sort_by_entity_key(mut mods: Vec<EntityModification>) -> Vec<EntityModificati
 #[graph::test]
 async fn empty_cache_modifications() {
     let store = Arc::new(MockStore::new(BTreeMap::new()));
-    let cache = EntityCache::new(store);
-    let result = cache.as_modifications(0).await;
+    let cache = EntityCache::new(store, SeqGenerator::new(0));
+    let result = cache.as_modifications(0, &STOPWATCH).await;
     assert_eq!(result.unwrap().modifications, vec![]);
 }
 
@@ -206,26 +206,26 @@ async fn insert_modifications() {
     let store = MockStore::new(BTreeMap::new());
 
     let store = Arc::new(store);
-    let mut cache = EntityCache::new(store);
+    let mut cache = EntityCache::new(store, SeqGenerator::new(0));
 
     let mut mogwai_data = entity! { SCHEMA => id: "mogwai", name: "Mogwai" };
     let mogwai_key = make_band_key("mogwai");
     cache
-        .set(mogwai_key.clone(), mogwai_data.clone(), 0, None)
+        .set(mogwai_key.clone(), mogwai_data.clone(), None)
         .await
         .unwrap();
 
     let mut sigurros_data = entity! { SCHEMA => id: "sigurros", name: "Sigur Ros" };
     let sigurros_key = make_band_key("sigurros");
     cache
-        .set(sigurros_key.clone(), sigurros_data.clone(), 0, None)
+        .set(sigurros_key.clone(), sigurros_data.clone(), None)
         .await
         .unwrap();
 
     mogwai_data.set_vid(100).unwrap();
     sigurros_data.set_vid(101).unwrap();
 
-    let result = cache.as_modifications(0).await;
+    let result = cache.as_modifications(0, &STOPWATCH).await;
     assert_eq!(
         sort_by_entity_key(result.unwrap().modifications),
         sort_by_entity_key(vec![
@@ -257,26 +257,26 @@ async fn overwrite_modifications() {
     };
 
     let store = Arc::new(store);
-    let mut cache = EntityCache::new(store);
+    let mut cache = EntityCache::new(store, SeqGenerator::new(0));
 
     let mut mogwai_data = entity! { SCHEMA => id: "mogwai", name: "Mogwai", founded: 1995 };
     let mogwai_key = make_band_key("mogwai");
     cache
-        .set(mogwai_key.clone(), mogwai_data.clone(), 0, None)
+        .set(mogwai_key.clone(), mogwai_data.clone(), None)
         .await
         .unwrap();
 
     let mut sigurros_data = entity! { SCHEMA => id: "sigurros", name: "Sigur Ros", founded: 1994};
     let sigurros_key = make_band_key("sigurros");
     cache
-        .set(sigurros_key.clone(), sigurros_data.clone(), 0, None)
+        .set(sigurros_key.clone(), sigurros_data.clone(), None)
         .await
         .unwrap();
 
     mogwai_data.set_vid(100).unwrap();
     sigurros_data.set_vid(101).unwrap();
 
-    let result = cache.as_modifications(0).await;
+    let result = cache.as_modifications(0, &STOPWATCH).await;
     assert_eq!(
         sort_by_entity_key(result.unwrap().modifications),
         sort_by_entity_key(vec![
@@ -298,25 +298,25 @@ async fn consecutive_modifications() {
     };
 
     let store = Arc::new(store);
-    let mut cache = EntityCache::new(store);
+    let mut cache = EntityCache::new(store, SeqGenerator::new(0));
 
     // First, add "founded" and change the "label".
     let update_data =
         entity! { SCHEMA => id: "mogwai", founded: 1995, label: "Rock Action Records" };
     let update_key = make_band_key("mogwai");
-    cache.set(update_key, update_data, 0, None).await.unwrap();
+    cache.set(update_key, update_data, None).await.unwrap();
 
     // Then, just reset the "label".
     let update_data = entity! { SCHEMA => id: "mogwai", label: Value::Null };
     let update_key = make_band_key("mogwai");
     cache
-        .set(update_key.clone(), update_data, 0, None)
+        .set(update_key.clone(), update_data, None)
         .await
         .unwrap();
 
     // We expect a single overwrite modification for the above that leaves "id"
     // and "name" untouched, sets "founded" and removes the "label" field.
-    let result = cache.as_modifications(0).await;
+    let result = cache.as_modifications(0, &STOPWATCH).await;
     assert_eq!(
         sort_by_entity_key(result.unwrap().modifications),
         sort_by_entity_key(vec![EntityModification::overwrite(
@@ -331,7 +331,7 @@ async fn consecutive_modifications() {
 async fn check_vid_sequence() {
     let store = MockStore::new(BTreeMap::new());
     let store = Arc::new(store);
-    let mut cache = EntityCache::new(store);
+    let mut cache = EntityCache::new(store, SeqGenerator::new(0));
 
     for n in 0..10 {
         let id = (10 - n).to_string();
@@ -339,12 +339,12 @@ async fn check_vid_sequence() {
         let mogwai_key = make_band_key(id.as_str());
         let mogwai_data = entity! { SCHEMA => id: id, name: name };
         cache
-            .set(mogwai_key.clone(), mogwai_data.clone(), 0, None)
+            .set(mogwai_key.clone(), mogwai_data.clone(), None)
             .await
             .unwrap();
     }
 
-    let result = cache.as_modifications(0).await;
+    let result = cache.as_modifications(0, &STOPWATCH).await;
     let mods = result.unwrap().modifications;
     for m in mods {
         match m {
@@ -363,6 +363,134 @@ async fn check_vid_sequence() {
             }
             _ => panic!("wrong entity modification type"),
         }
+    }
+}
+
+// Test that demonstrates the VID collision bug when multiple offchain triggers
+// use separate VidGenerators. Each gets its own sequence starting at RESERVED_VIDS
+// (100), so entities in the same block get identical VIDs.
+#[graph::test]
+async fn offchain_trigger_vid_collision_without_shared_generator() {
+    let block: i32 = 2_163_923;
+
+    // Simulate first offchain trigger with its own VidGenerator
+    let store1 = Arc::new(MockStore::new(BTreeMap::new()));
+    let mut cache1 = EntityCache::new(store1, SeqGenerator::new(block));
+    let band1_data = entity! { SCHEMA => id: "band1", name: "First Band" };
+    let band1_key = make_band_key("band1");
+    cache1
+        .set(band1_key.clone(), band1_data, None)
+        .await
+        .unwrap();
+    let result1 = cache1.as_modifications(block, &STOPWATCH).await.unwrap();
+
+    // Simulate second offchain trigger with a SEPARATE VidGenerator
+    let store2 = Arc::new(MockStore::new(BTreeMap::new()));
+    let mut cache2 = EntityCache::new(store2, SeqGenerator::new(block));
+    let band2_data = entity! { SCHEMA => id: "band2", name: "Second Band" };
+    let band2_key = make_band_key("band2");
+    cache2
+        .set(band2_key.clone(), band2_data, None)
+        .await
+        .unwrap();
+    let result2 = cache2.as_modifications(block, &STOPWATCH).await.unwrap();
+
+    let vid1 = match &result1.modifications[0] {
+        EntityModification::Insert { data, .. } => data.vid(),
+        _ => panic!("expected Insert"),
+    };
+    let vid2 = match &result2.modifications[0] {
+        EntityModification::Insert { data, .. } => data.vid(),
+        _ => panic!("expected Insert"),
+    };
+
+    // BUG: Both VIDs are identical because each VidGenerator starts at 100
+    let expected_vid = ((block as i64) << 32) + 100;
+    assert_eq!(vid1, expected_vid);
+    assert_eq!(vid2, expected_vid);
+    assert_eq!(vid1, vid2, "VIDs collide when using separate VidGenerators");
+}
+
+// Test that demonstrates the fix: sharing a single VidGenerator across
+// multiple EntityCaches prevents VID collisions.
+#[graph::test]
+async fn offchain_trigger_vid_no_collision_with_shared_generator() {
+    let block: i32 = 2_163_923;
+    let vid_gen = SeqGenerator::new(block);
+
+    // First offchain trigger
+    let store1 = Arc::new(MockStore::new(BTreeMap::new()));
+    let mut cache1 = EntityCache::new(store1, vid_gen.cheap_clone());
+    let band1_data = entity! { SCHEMA => id: "band1", name: "First Band" };
+    let band1_key = make_band_key("band1");
+    cache1
+        .set(band1_key.clone(), band1_data, None)
+        .await
+        .unwrap();
+    let result1 = cache1.as_modifications(block, &STOPWATCH).await.unwrap();
+
+    // Second offchain trigger shares the same VidGenerator
+    let store2 = Arc::new(MockStore::new(BTreeMap::new()));
+    let mut cache2 = EntityCache::new(store2, vid_gen.cheap_clone());
+    let band2_data = entity! { SCHEMA => id: "band2", name: "Second Band" };
+    let band2_key = make_band_key("band2");
+    cache2
+        .set(band2_key.clone(), band2_data, None)
+        .await
+        .unwrap();
+    let result2 = cache2.as_modifications(block, &STOPWATCH).await.unwrap();
+
+    let vid1 = match &result1.modifications[0] {
+        EntityModification::Insert { data, .. } => data.vid(),
+        _ => panic!("expected Insert"),
+    };
+    let vid2 = match &result2.modifications[0] {
+        EntityModification::Insert { data, .. } => data.vid(),
+        _ => panic!("expected Insert"),
+    };
+
+    // With a shared VidGenerator, VIDs are different
+    assert_ne!(
+        vid1, vid2,
+        "VIDs should NOT collide when sharing a VidGenerator"
+    );
+    let expected_vid1 = ((block as i64) << 32) + 100;
+    let expected_vid2 = ((block as i64) << 32) + 101;
+    assert_eq!(vid1, expected_vid1, "first trigger starts at vid_seq 100");
+    assert_eq!(
+        vid2, expected_vid2,
+        "second trigger continues at vid_seq 101"
+    );
+}
+
+// Simulate the ipfs.map() pattern: multiple EntityCache instances each create
+// an entity using a shared SeqGenerator. VIDs must be unique and sequential.
+#[graph::test]
+async fn ipfs_map_pattern_vid_uniqueness() {
+    let block: i32 = 42;
+    let vid_gen = SeqGenerator::new(block);
+
+    let mut all_vids = Vec::new();
+    for i in 0..5u32 {
+        let store = Arc::new(MockStore::new(BTreeMap::new()));
+        let mut cache = EntityCache::new(store, vid_gen.cheap_clone());
+        let data = entity! { SCHEMA => id: format!("band{i}"), name: format!("Band {i}") };
+        let key = make_band_key(&format!("band{i}"));
+        cache.set(key, data, None).await.unwrap();
+        let result = cache.as_modifications(block, &STOPWATCH).await.unwrap();
+        let vid = match &result.modifications[0] {
+            EntityModification::Insert { data, .. } => data.vid(),
+            _ => panic!("expected Insert"),
+        };
+        all_vids.push(vid);
+    }
+
+    for i in 1..all_vids.len() {
+        assert_eq!(
+            all_vids[i],
+            all_vids[i - 1] + 1,
+            "VIDs should be sequential"
+        );
     }
 }
 
@@ -440,7 +568,7 @@ where
 
         let read_store = Arc::new(writable.clone());
 
-        let cache = EntityCache::new(read_store);
+        let cache = EntityCache::new(read_store, SeqGenerator::new(0));
         // Run test and wait for the background writer to finish its work so
         // it won't conflict with the next test
         test(cache, subgraph_store.clone(), deployment, writable.clone()).await;
@@ -773,7 +901,7 @@ fn scoped_get() {
         let mut wallet5 = create_wallet_entity_no_vid("5", &account5, 100);
         let key5 = WALLET_TYPE.parse_key("5").unwrap();
         cache
-            .set(key5.clone(), wallet5.clone(), 0, None)
+            .set(key5.clone(), wallet5.clone(), None)
             .await
             .unwrap();
 
@@ -801,7 +929,7 @@ fn scoped_get() {
         let mut wallet1 = wallet1;
         wallet1.set("balance", 70).unwrap();
         cache
-            .set(key1.clone(), wallet1.clone(), 0, None)
+            .set(key1.clone(), wallet1.clone(), None)
             .await
             .unwrap();
         wallet1a = wallet1;
@@ -852,6 +980,6 @@ fn no_interface_mods() {
 
         let entity = entity! { LOAD_RELATED_SUBGRAPH => id: "1", balance: 100 };
 
-        cache.set(key, entity, 0, None).await.unwrap_err();
+        cache.set(key, entity, None).await.unwrap_err();
     })
 }

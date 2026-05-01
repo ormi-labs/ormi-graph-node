@@ -82,7 +82,7 @@ pub struct Opt {
         conflicts_with_all = &["ethereum_ws", "ethereum_ipc", "config"],
         value_name="NETWORK_NAME:[CAPABILITIES]:URL",
         env="ETHEREUM_RPC",
-        help= "Ethereum network name (e.g. 'mainnet'), optional comma-seperated capabilities (eg 'full,archive'), and an Ethereum RPC URL, separated by a ':'",
+        help= "Ethereum network name (e.g. 'mainnet'), optional comma-separated capabilities (eg 'full,archive'), and an Ethereum RPC URL, separated by a ':'",
     )]
     pub ethereum_rpc: Vec<String>,
     #[clap(long, allow_negative_numbers = false,
@@ -90,7 +90,7 @@ pub struct Opt {
         conflicts_with_all = &["ethereum_rpc", "ethereum_ipc", "config"],
         value_name="NETWORK_NAME:[CAPABILITIES]:URL",
         env="ETHEREUM_WS",
-        help= "Ethereum network name (e.g. 'mainnet'), optional comma-seperated capabilities (eg 'full,archive`, and an Ethereum WebSocket URL, separated by a ':'",
+        help= "Ethereum network name (e.g. 'mainnet'), optional comma-separated capabilities (eg 'full,archive`, and an Ethereum WebSocket URL, separated by a ':'",
     )]
     pub ethereum_ws: Vec<String>,
     #[clap(long,
@@ -99,7 +99,7 @@ pub struct Opt {
         conflicts_with_all = &["ethereum_rpc", "ethereum_ws", "config"],
         value_name="NETWORK_NAME:[CAPABILITIES]:FILE",
         env="ETHEREUM_IPC",
-        help= "Ethereum network name (e.g. 'mainnet'), optional comma-seperated capabilities (eg 'full,archive'), and an Ethereum IPC pipe, separated by a ':'",
+        help= "Ethereum network name (e.g. 'mainnet'), optional comma-separated capabilities (eg 'full,archive'), and an Ethereum IPC pipe, separated by a ':'",
     )]
     pub ethereum_ipc: Vec<String>,
     #[clap(
@@ -165,28 +165,6 @@ pub struct Opt {
     #[clap(long, help = "Enable debug logging")]
     pub debug: bool,
 
-    #[clap(
-        long,
-        value_name = "URL",
-        env = "ELASTICSEARCH_URL",
-        help = "Elasticsearch service to write subgraph logs to"
-    )]
-    pub elasticsearch_url: Option<String>,
-    #[clap(
-        long,
-        value_name = "USER",
-        env = "ELASTICSEARCH_USER",
-        help = "User to use for Elasticsearch logging"
-    )]
-    pub elasticsearch_user: Option<String>,
-    #[clap(
-        long,
-        value_name = "PASSWORD",
-        env = "ELASTICSEARCH_PASSWORD",
-        hide_env_values = true,
-        help = "Password to use for Elasticsearch logging"
-    )]
-    pub elasticsearch_password: Option<String>,
     #[clap(
         long,
         value_name = "DISABLE_BLOCK_INGESTOR",

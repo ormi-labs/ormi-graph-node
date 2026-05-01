@@ -1,7 +1,8 @@
 # Graph Node
 
 [![Build Status](https://github.com/graphprotocol/graph-node/actions/workflows/ci.yml/badge.svg)](https://github.com/graphprotocol/graph-node/actions/workflows/ci.yml?query=branch%3Amaster)
-[![Getting Started Docs](https://img.shields.io/badge/docs-getting--started-brightgreen.svg)](docs/getting-started.md)
+[![Docs](https://img.shields.io/badge/docs-graph--node-green.svg)](docs/)
+[![Subgraphs](https://img.shields.io/badge/docs-subgraphs-green.svg)](https://thegraph.com/docs/en/subgraphs/quick-start/)
 
 ## Overview
 
@@ -29,7 +30,7 @@ This is usually only needed for developers who want to contribute to `graph-node
 To build and run this project, you need to have the following installed on your system:
 
 - Rust (latest stable): Follow [How to install
-  Rust](https://www.rust-lang.org/en-US/install.html). Run `rustup install
+  Rust](https://rust-lang.org/tools/install/). Run `rustup install
 stable` in _this directory_ to make sure all required components are
   installed. The `graph-node` code assumes that the latest available
   `stable` compiler is used.
@@ -113,6 +114,44 @@ Very large `graph-node` instances can also be configured using a
 [configuration file](./docs/config.md) That is usually only necessary when
 the `graph-node` needs to connect to multiple chains or if the work of
 indexing and querying needs to be split across [multiple databases](./docs/config.md).
+
+#### Log Storage
+
+`graph-node` supports storing and querying subgraph logs through multiple backends:
+
+- **File**: Local JSON Lines files (recommended for local development)
+- **Elasticsearch**: Enterprise-grade search and analytics (for production)
+- **Loki**: Grafana's log aggregation system (for production)
+- **Disabled**: No log storage (default)
+
+**Quick example (file-based logs for local development):**
+```bash
+mkdir -p ./graph-logs
+
+cargo run -p graph-node --release -- \
+  --postgres-url $POSTGRES_URL \
+  --ethereum-rpc mainnet:archive:https://... \
+  --ipfs 127.0.0.1:5001 \
+  --log-store-backend file \
+  --log-store-file-dir ./graph-logs
+```
+
+Logs are queried via GraphQL at `http://localhost:8000/graphql`:
+```graphql
+query {
+  _logs(subgraphId: "QmYourSubgraphHash", level: ERROR, first: 10) {
+    timestamp
+    level
+    text
+  }
+}
+```
+
+**For complete documentation**, see the **[Log Store Guide](./docs/log-store.md)**, which covers:
+- How to configure each backend (Elasticsearch, Loki, File)
+- Complete GraphQL query examples
+- Choosing the right backend for your use case
+- Performance considerations and best practices
 
 ## Contributing
 

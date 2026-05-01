@@ -2,29 +2,29 @@ use crate::firehose::fetch_client::FetchClient;
 use crate::firehose::interceptors::AuthInterceptor;
 use crate::{
     blockchain::{
-        block_stream::FirehoseCursor, Block as BlockchainBlock, BlockPtr, ChainIdentifier,
+        Block as BlockchainBlock, BlockPtr, ChainIdentifier, block_stream::FirehoseCursor,
     },
     cheap_clone::CheapClone,
     components::store::BlockNumber,
     endpoint::{ConnectionType, EndpointMetrics, RequestLabels},
     env::ENV_VARS,
     firehose::decode_firehose_block,
-    prelude::{anyhow, debug, DeploymentHash},
+    prelude::{DeploymentHash, anyhow, debug},
 };
 use anyhow::Context;
 use async_trait::async_trait;
 use futures03::{StreamExt, TryStreamExt};
 use http::uri::{Scheme, Uri};
 use itertools::Itertools;
-use slog::{error, info, trace, Logger};
+use slog::{Logger, error, info, trace};
 use std::{collections::HashMap, fmt::Display, ops::ControlFlow, sync::Arc, time::Duration};
 use tokio::sync::OnceCell;
 use tonic::codegen::InterceptedService;
 use tonic::{
+    Request,
     codegen::CompressionEncoding,
     metadata::{Ascii, MetadataKey, MetadataValue},
     transport::{Channel, ClientTlsConfig},
-    Request,
 };
 
 use super::{codec as firehose, interceptors::MetricsInterceptor, stream_client::StreamClient};
@@ -43,6 +43,16 @@ pub const SUBGRAPHS_PER_CONN: usize = 100;
 const LOW_VALUE_THRESHOLD: usize = 10;
 const LOW_VALUE_USED_PERCENTAGE: usize = 50;
 const HIGH_VALUE_USED_PERCENTAGE: usize = 80;
+
+pub trait BlockChainBlockMessage:
+    prost::Message + BlockchainBlock + Default + std::fmt::Debug + 'static
+{
+}
+
+impl<T> BlockChainBlockMessage for T where
+    T: prost::Message + BlockchainBlock + Default + std::fmt::Debug + 'static
+{
+}
 
 #[derive(Debug)]
 pub struct FirehoseEndpoint {
@@ -411,7 +421,7 @@ impl FirehoseEndpoint {
         logger: &Logger,
     ) -> Result<M, anyhow::Error>
     where
-        M: prost::Message + BlockchainBlock + Default + 'static,
+        M: BlockChainBlockMessage,
     {
         let retry_log_message = format!("get_block_by_ptr for block {}", ptr);
         let endpoint = self.cheap_clone();
@@ -473,7 +483,7 @@ impl FirehoseEndpoint {
         logger: &Logger,
     ) -> Result<M, anyhow::Error>
     where
-        M: prost::Message + BlockchainBlock + Default + 'static,
+        M: BlockChainBlockMessage,
     {
         let retry_log_message = format!("get_block_by_number for block {}", number);
         let endpoint = self.cheap_clone();
@@ -511,7 +521,7 @@ impl FirehoseEndpoint {
         logger: &Logger,
     ) -> Result<Vec<M>, anyhow::Error>
     where
-        M: prost::Message + BlockchainBlock + Default + 'static,
+        M: BlockChainBlockMessage,
     {
         let logger = logger.clone();
         let logger_for_error = logger.clone();
@@ -726,7 +736,7 @@ impl FirehoseEndpoints {
 mod test {
     use std::{mem, sync::Arc};
 
-    use slog::{o, Discard, Logger};
+    use slog::{Discard, Logger, o};
 
     use super::*;
     use crate::components::metrics::MetricsRegistry;

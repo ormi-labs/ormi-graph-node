@@ -8,7 +8,7 @@ use crate::manager::deployment::DeploymentSearch;
 use graph::anyhow::bail;
 use graph::components::store::{BlockStore as _, ChainStore as _, DeploymentLocator};
 use graph::env::ENV_VARS;
-use graph::prelude::{anyhow, BlockNumber, BlockPtr};
+use graph::prelude::{BlockNumber, BlockPtr, anyhow};
 use graph_store_postgres::command_support::catalog::{self as store_catalog};
 use graph_store_postgres::{BlockStore, NotificationSender};
 use graph_store_postgres::{ConnectionPool, Store};
@@ -176,12 +176,12 @@ pub async fn run(
 
         match (block_ptr_to, start_block) {
             (Some(block_ptr), _) => {
-                subgraph_store.rewind(loc.hash.clone(), block_ptr).await?;
+                subgraph_store.rewind(loc.id.into(), block_ptr).await?;
                 println!("  ... rewound {}", loc);
             }
             (None, Some(start_block_ptr)) => {
                 subgraph_store
-                    .truncate(loc.hash.clone(), start_block_ptr)
+                    .truncate(loc.id.into(), start_block_ptr)
                     .await?;
                 println!("  ... truncated {}", loc);
             }

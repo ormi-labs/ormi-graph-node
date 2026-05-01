@@ -9,7 +9,7 @@ use diesel_async::scoped_futures::ScopedFutureExt;
 use std::fmt;
 use std::{
     collections::{BTreeMap, HashMap},
-    sync::{atomic::AtomicU8, Arc, Mutex},
+    sync::{Arc, Mutex, atomic::AtomicU8},
 };
 use std::{iter::FromIterator, time::Duration};
 
@@ -18,19 +18,22 @@ use graph::{
     components::{
         server::index_node::VersionInfo,
         store::{
-            self, BlockPtrForNumber, BlockStore, DeploymentLocator, EnsLookup as EnsLookupTrait,
-            PruneReporter, PruneRequest, SubgraphFork,
+            self, BlockPtrForNumber, BlockStore, DeploymentLocator, DeploymentSchemaVersion,
+            DumpReporter, EnsLookup as EnsLookupTrait, PruneReporter, PruneRequest,
+            RestoreReporter, SubgraphFork,
         },
     },
-    data::query::QueryTarget,
-    data::subgraph::{schema::DeploymentCreate, status, DeploymentFeatures},
+    data::{
+        query::QueryTarget,
+        store::DEFAULT_NODE_ID,
+        subgraph::{DeploymentFeatures, schema::DeploymentCreate, status},
+    },
     internal_error,
-    prelude::StoreEvent,
     prelude::{
-        anyhow, lazy_static, o, ApiVersion, BlockNumber, BlockPtr, ChainStore, DeploymentHash,
-        EntityOperation, Logger, MetricsRegistry, NodeId, PartialBlockPtr, StoreError,
-        SubgraphDeploymentEntity, SubgraphName, SubgraphStore as SubgraphStoreTrait,
-        SubgraphVersionSwitchingMode,
+        ApiVersion, BlockNumber, BlockPtr, ChainStore, DeploymentHash, EntityOperation, Logger,
+        MetricsRegistry, NodeId, PartialBlockPtr, StoreError, StoreEvent, SubgraphDeploymentEntity,
+        SubgraphName, SubgraphStore as SubgraphStoreTrait, SubgraphVersionSwitchingMode, anyhow,
+        lazy_static, o,
     },
     schema::{ApiSchema, InputSchema},
     url::Url,
@@ -39,22 +42,24 @@ use graph::{
 use graph::{derive::CheapClone, futures03::future::join_all, prelude::alloy::primitives::Address};
 
 use crate::{
+    ConnectionPool, NotificationSender,
+    catalog::Catalog,
     deployment::{OnSync, SubgraphHealth},
-    primary::{self, DeploymentId, Mirror as PrimaryMirror, Primary, Site},
+    primary::{
+        self, DeploymentId, Mirror as PrimaryMirror, Primary, RestoreAction, RestoreMode, Site,
+    },
     relational::{
-        self,
+        self, Layout,
         index::{IndexList, Method},
-        Layout,
     },
     writable::{SourceableStore, WritableStore},
-    ConnectionPool, NotificationSender,
 };
 use crate::{
     deployment_store::{DeploymentStore, ReplicaId},
     detail::DeploymentDetail,
     primary::UnusedDeployment,
 };
-use crate::{fork, relational::index::CreateIndex, relational::SqlName};
+use crate::{fork, relational::SqlName, relational::index::CreateIndex};
 
 /// The name of a database shard; valid names must match `[a-z0-9_]+`
 #[derive(Clone, Debug, Eq, PartialEq, Hash, AsExpression, FromSqlRow)]
@@ -88,7 +93,7 @@ impl Shard {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
         {
             return Err(StoreError::InvalidIdentifier(format!(
-                "shard name `{}` is invalid: shard names must only contain lowercase alphanumeric characters or '_'", name
+                "shard name `{name}` is invalid: shard names must only contain lowercase alphanumeric characters or '_'"
             )));
         }
         Ok(Shard(name))
@@ -126,7 +131,7 @@ impl ToSql<Text, Pg> for Shard {
 /// shards.
 pub trait DeploymentPlacer {
     fn place(&self, name: &str, network: &str)
-        -> Result<Option<(Vec<Shard>, Vec<NodeId>)>, String>;
+    -> Result<Option<(Vec<Shard>, Vec<NodeId>)>, String>;
 }
 
 /// Tools for managing unused deployments
@@ -339,7 +344,7 @@ impl SubgraphStore {
         self.evict(schema.id())?;
         let graft_base = deployment.graft_base.as_ref();
 
-        let (site, exists, node_id) = {
+        let (site, deployment_store, node_id) = {
             // We need to deal with two situations:
             //   (1) We are really creating a new subgraph; it therefore needs
             //       to go in the shard and onto the node that the placement
@@ -351,42 +356,67 @@ impl SubgraphStore {
             //       assignment that we used last time to avoid creating
             //       the same deployment in another shard
             let (shard, node_id) = self.place(&name, &network_name, node_id).await?;
-            let mut conn = self.primary_conn().await?;
-            let (site, site_was_created) = conn
+
+            let mut pconn = self.primary_conn().await?;
+
+            let (site, site_was_created) = pconn
                 .allocate_site(shard, schema.id(), network_name, graft_base)
                 .await?;
-            let node_id = conn.assigned_node(&site).await?.unwrap_or(node_id);
-            (site, !site_was_created, node_id)
-        };
-        let site = Arc::new(site);
+            let node_id = pconn.assigned_node(&site).await?.unwrap_or(node_id);
+            let site = Arc::new(site);
+            let deployment_store = self
+                .stores
+                .get(&site.shard)
+                .ok_or_else(|| StoreError::UnknownShard(site.shard.to_string()))?;
 
-        // if the deployment already exists, we don't need to perform any copying
-        // so we can set graft_base to None
-        // if it doesn't exist, we need to copy the graft base to the new deployment
-        let graft_base_layout = if !exists {
-            let graft_base = match deployment.graft_base.as_ref() {
-                Some(base) => Some(self.layout(base).await?),
-                None => None,
-            };
+            if let Some(graft_base) = graft_base {
+                // Perform schema compatibility validation when:
+                // - the site was just created (first-time deployment), or
+                // - the site exists but the deployment is missing (recovering from a failed create).
+                // The `exists` DB call is only made if `site_was_created` is false.
+                let should_validate = {
+                    let mut shard_conn = deployment_store.get_replica_conn(ReplicaId::Main).await?;
+                    site_was_created || !crate::deployment::exists(&mut shard_conn, &site).await?
+                };
 
-            if let Some(graft_base) = &graft_base {
-                self.primary_conn()
-                    .await?
-                    .record_active_copy(graft_base.site.as_ref(), site.as_ref())
+                if should_validate {
+                    let base_layout = self.layout(graft_base).await?;
+                    let entities_with_causality_region =
+                        deployment.manifest.entities_with_causality_region.clone();
+                    let mut shard_conn = deployment_store.get_replica_conn(ReplicaId::Main).await?;
+                    let catalog = Catalog::for_creation(
+                        &mut shard_conn,
+                        site.cheap_clone(),
+                        entities_with_causality_region.into_iter().collect(),
+                    )
                     .await?;
+                    let layout = Layout::new(site.cheap_clone(), schema, catalog)?;
+
+                    let errors = layout.can_copy_from(&base_layout);
+                    if !errors.is_empty() {
+                        return Err(StoreError::Unknown(anyhow!(
+                            "The subgraph `{}` cannot be used as the graft base \
+                                for `{}` because the schemas are incompatible:\n    - {}",
+                            &base_layout.catalog.site.namespace,
+                            &layout.catalog.site.namespace,
+                            errors.join("\n    - ")
+                        )));
+                    }
+
+                    // Only record active copy when the graft check passes and a copy is needed.
+                    // If deployment already exists, the copy has either completed (no active_copies
+                    // record) or is in progress (active_copies record already exists).
+                    pconn
+                        .record_active_copy(base_layout.site.as_ref(), site.as_ref())
+                        .await?;
+                }
             }
-            graft_base
-        } else {
-            None
+
+            (site, deployment_store, node_id)
         };
 
         // Create the actual databases schema and metadata entries
-        let deployment_store = self
-            .stores
-            .get(&site.shard)
-            .ok_or_else(|| StoreError::UnknownShard(site.shard.to_string()))?;
-
-        let index_def = if let Some(graft) = &graft_base.clone() {
+        let index_def = if let Some(graft) = graft_base {
             if let Some(site) = self.sites.get(graft) {
                 let store = self
                     .stores
@@ -406,7 +436,6 @@ impl SubgraphStore {
                 schema,
                 deployment,
                 site.clone(),
-                graft_base_layout,
                 replace,
                 OnSync::None,
                 index_def,
@@ -455,6 +484,138 @@ impl SubgraphStore {
     ) -> Result<DeploymentLocator, StoreError> {
         self.create_deployment_internal(name, schema, deployment, node_id, network_name, mode, true)
             .await
+    }
+
+    pub async fn restore(
+        &self,
+        dir: &std::path::Path,
+        shard: Option<Shard>,
+        name: Option<SubgraphName>,
+        mode: RestoreMode,
+        version_switching_mode: SubgraphVersionSwitchingMode,
+        reporter: &mut dyn RestoreReporter,
+    ) -> Result<(), StoreError> {
+        use crate::relational::dump::Metadata;
+
+        let metadata_path = dir.join("metadata.json");
+        let metadata = Metadata::from_file(&metadata_path)?;
+
+        // Resolve the subgraph name for deployment rule matching. If not
+        // supplied, look up an existing name from the DB; error if none.
+        let name = match name {
+            Some(name) => {
+                // Validate that the named subgraph exists. Without this
+                // check the deployment would be created but never linked
+                // to a name, leaving it orphaned.
+                if !self.mirror.subgraph_exists(&name).await? {
+                    return Err(StoreError::Input(format!(
+                        "subgraph `{name}` does not exist; \
+                         create it first with `graphman create {name}`"
+                    )));
+                }
+                name
+            }
+            None => {
+                let names = self
+                    .mirror
+                    .subgraphs_by_deployment_hash(metadata.deployment.as_str())
+                    .await?;
+                let (name, _) = names.into_iter().next().ok_or_else(|| {
+                    StoreError::Input(
+                        "no subgraph name found for this deployment; use --name to specify one"
+                            .into(),
+                    )
+                })?;
+                SubgraphName::new(name).map_err(|n| {
+                    StoreError::InternalError(format!("invalid subgraph name `{n}` in database"))
+                })?
+            }
+        };
+
+        // Use deployment rules to determine which node should index this
+        // deployment and how to place it.
+        let (placed_shard, node) = self
+            .place(&name, &metadata.network, DEFAULT_NODE_ID.clone())
+            .await?;
+        let shard = shard.unwrap_or(placed_shard);
+
+        // Validate that the target shard exists before making any DB changes
+        self.stores
+            .get(&shard)
+            .ok_or_else(|| StoreError::UnknownShard(shard.to_string()))?;
+
+        let mut pconn = self.primary_conn().await?;
+        let action = pconn
+            .plan_restore(&shard, &metadata.deployment, &mode)
+            .await?;
+
+        // Determine schema_version the same way allocate_site does
+        let schema_version = match metadata.graft_base.as_ref() {
+            Some(graft_base) => {
+                let base_site = pconn.find_active_site(graft_base).await?.ok_or_else(|| {
+                    StoreError::DeploymentNotFound("graft_base not found".to_string())
+                })?;
+                base_site.schema_version
+            }
+            None => DeploymentSchemaVersion::LATEST,
+        };
+
+        let site = match action {
+            RestoreAction::Create { active } => {
+                pconn
+                    .create_site(
+                        shard,
+                        metadata.deployment.clone(),
+                        metadata.network.clone(),
+                        schema_version,
+                        active,
+                    )
+                    .await?
+            }
+            RestoreAction::Replace { existing } => {
+                let was_active = existing.active;
+                let existing = Arc::new(existing);
+                let store = self.for_site(&existing)?;
+                store.drop_deployment(&existing).await?;
+                pconn.drop_site(&existing).await?;
+                // Drop and re-acquire the primary connection to avoid pool
+                // deadlock: drop_deployment above used a separate connection
+                // from the same pool, and create_site below needs one too.
+                drop(pconn);
+                let mut pconn = self.primary_conn().await?;
+                pconn
+                    .create_site(
+                        shard,
+                        metadata.deployment.clone(),
+                        metadata.network.clone(),
+                        schema_version,
+                        was_active,
+                    )
+                    .await?
+            }
+        };
+
+        let site = Arc::new(site);
+        let store = self.for_site(&site)?;
+        store
+            .restore(site.cheap_clone(), dir, &metadata, &mut *reporter)
+            .await?;
+
+        // Link the restored deployment to the subgraph name and assign it
+        // to the node determined by deployment rules
+        let mut pconn = self.primary_conn().await?;
+        let subgraph_store = self.cheap_clone();
+        let exists_and_synced = async move |id: &DeploymentHash| {
+            let (store, _) = subgraph_store.store(id).await?;
+            store.deployment_exists_and_synced(id).await
+        };
+        let changes = pconn
+            .create_subgraph_version(name, &site, node, version_switching_mode, exists_and_synced)
+            .await?;
+        let event = StoreEvent::new(changes);
+        pconn.send_store_event(&self.sender, &event).await?;
+
+        Ok(())
     }
 }
 
@@ -731,8 +892,7 @@ impl Inner {
 
         if src.id == dst.id {
             return Err(StoreError::Unknown(anyhow!(
-                "can not copy deployment {} onto itself",
-                src_loc
+                "can not copy deployment {src_loc} onto itself"
             )));
         }
         // The very last thing we do when we set up a copy here is assign it
@@ -740,9 +900,7 @@ impl Inner {
         // should not have been called.
         if let Some(node) = self.mirror.assigned_node(dst.as_ref()).await? {
             return Err(StoreError::Unknown(anyhow!(
-                "can not copy into deployment {} since it is already assigned to node `{}`",
-                dst_loc,
-                node
+                "can not copy into deployment {dst_loc} since it is already assigned to node `{node}`"
             )));
         }
         let deployment = src_store.load_deployment(src.clone()).await?;
@@ -757,8 +915,6 @@ impl Inner {
             debug_fork: deployment.debug_fork,
             history_blocks_override: None,
         };
-
-        let graft_base = self.layout(&src.deployment).await?;
 
         self.primary_conn()
             .await?
@@ -776,7 +932,6 @@ impl Inner {
                 &src_layout.input_schema,
                 deployment,
                 dst.clone(),
-                Some(graft_base),
                 false,
                 on_sync,
                 Some(index_def),
@@ -1091,21 +1246,19 @@ impl Inner {
         join_all(self.stores.values().map(|store| store.vacuum())).await
     }
 
-    pub async fn rewind(
-        &self,
-        id: DeploymentHash,
-        block_ptr_to: BlockPtr,
-    ) -> Result<(), StoreError> {
-        let (store, site) = self.store(&id).await?;
+    pub async fn rewind(&self, id: DeploymentId, block_ptr_to: BlockPtr) -> Result<(), StoreError> {
+        let site = self.find_site(id).await?;
+        let store = self.for_site(&site)?;
         store.rewind(site, block_ptr_to).await
     }
 
     pub async fn truncate(
         &self,
-        id: DeploymentHash,
+        id: DeploymentId,
         block_ptr_to: BlockPtr,
     ) -> Result<(), StoreError> {
-        let (store, site) = self.store(&id).await?;
+        let site = self.find_site(id).await?;
+        let store = self.for_site(&site)?;
         store.truncate(site, block_ptr_to).await
     }
 
@@ -1417,6 +1570,18 @@ impl Inner {
         let src_store = self.for_site(&site)?;
         src_store.load_indexes(site).await
     }
+
+    pub async fn dump(
+        &self,
+        loc: &DeploymentLocator,
+        directory: std::path::PathBuf,
+        reporter: Box<dyn DumpReporter>,
+    ) -> Result<(), StoreError> {
+        let site = self.find_site(loc.id.into()).await?;
+        let store = self.for_site(&site)?;
+
+        store.dump(site, directory, reporter).await
+    }
 }
 
 const STATE_ENS_NOT_CHECKED: u8 = 0;
@@ -1522,7 +1687,14 @@ impl SubgraphStoreTrait for SubgraphStore {
             .await
     }
 
-    async fn remove_subgraph(&self, name: SubgraphName) -> Result<(), StoreError> {
+    async fn remove_subgraph(&self, name: SubgraphName) -> Result<Vec<DeploymentHash>, StoreError> {
+        let deployments = self
+            .status(status::Filter::SubgraphName(name.to_string()))
+            .await?
+            .into_iter()
+            .filter_map(|info| DeploymentHash::new(info.subgraph).ok())
+            .collect::<Vec<_>>();
+
         let mut pconn = self.primary_conn().await?;
         pconn
             .transaction(|pconn| {
@@ -1534,7 +1706,8 @@ impl SubgraphStoreTrait for SubgraphStore {
                 }
                 .scope_boxed()
             })
-            .await
+            .await?;
+        Ok(deployments)
     }
 
     async fn reassign_subgraph(

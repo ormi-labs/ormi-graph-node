@@ -5,18 +5,19 @@ use diesel_async::{AsyncConnection as _, RunQueryDsl, SimpleAsyncConnection};
 use tokio::task::JoinHandle;
 
 use graph::anyhow::Context;
-use graph::blockchain::block_stream::{EntitySourceOperation, FirehoseCursor};
 use graph::blockchain::BlockTime;
+use graph::blockchain::block_stream::{EntitySourceOperation, FirehoseCursor};
 use graph::components::store::write::RowGroup;
 use graph::components::store::{
-    Batch, DeploymentLocator, DerivedEntityQuery, PrunePhase, PruneReporter, PruneRequest,
-    PruningStrategy, QueryPermit, StoredDynamicDataSource, VersionStats,
+    Batch, DeploymentLocator, DerivedEntityQuery, DumpReporter, PrunePhase, PruneReporter,
+    PruneRequest, PruningStrategy, QueryPermit, RestoreReporter, StoredDynamicDataSource,
+    VersionStats,
 };
 use graph::components::versions::VERSIONS;
 use graph::data::graphql::IntoValue;
 use graph::data::query::Trace;
 use graph::data::store::{IdList, SqlQueryObject};
-use graph::data::subgraph::{status, SPEC_VERSION_0_0_6};
+use graph::data::subgraph::{SPEC_VERSION_0_0_6, status};
 use graph::data_source::CausalityRegion;
 use graph::derive::CheapClone;
 use graph::futures03::FutureExt;
@@ -30,8 +31,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::convert::Into;
 use std::ops::Bound;
 use std::ops::{Deref, Range};
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::{atomic::AtomicUsize, Arc, Mutex};
+use std::sync::{Arc, Mutex, atomic::AtomicUsize};
 use std::time::{Duration, Instant};
 
 use graph::components::store::EntityCollection;
@@ -39,9 +41,9 @@ use graph::components::subgraph::{ProofOfIndexingFinisher, ProofOfIndexingVersio
 use graph::data::subgraph::schema::{DeploymentCreate, SubgraphError};
 use graph::internal_error;
 use graph::prelude::{
-    anyhow, debug, info, o, warn, AttributeNames, BlockNumber, BlockPtr, CheapClone,
-    DeploymentHash, DeploymentState, Entity, EntityQuery, Error, Logger, QueryExecutionError,
-    StopwatchMetrics, StoreError, UnfailOutcome, Value, ENV_VARS,
+    AttributeNames, BlockNumber, BlockPtr, CheapClone, DeploymentHash, DeploymentState, ENV_VARS,
+    Entity, EntityQuery, Error, Logger, QueryExecutionError, StopwatchMetrics, StoreError,
+    UnfailOutcome, Value, anyhow, debug, info, o, warn,
 };
 use graph::schema::{ApiSchema, EntityKey, EntityType, InputSchema};
 
@@ -51,10 +53,10 @@ use crate::detail::ErrorDetail;
 use crate::dynds::DataSourcesTable;
 use crate::primary::{DeploymentId, Primary};
 use crate::relational::index::{CreateIndex, IndexList, Method};
-use crate::relational::{self, Layout, LayoutCache, SqlName, Table, STATEMENT_TIMEOUT};
+use crate::relational::{self, Layout, LayoutCache, STATEMENT_TIMEOUT, SqlName, Table};
 use crate::relational_queries::{FromEntityData, JSONData};
-use crate::{advisory_lock, catalog, retry, AsyncPgConnection};
-use crate::{detail, ConnectionPool};
+use crate::{AsyncPgConnection, advisory_lock, catalog, retry};
+use crate::{ConnectionPool, detail};
 use crate::{dynds, primary::Site};
 
 /// When connected to read replicas, this allows choosing which DB server to use for an operation.
@@ -184,7 +186,6 @@ impl DeploymentStore {
         schema: &InputSchema,
         deployment: DeploymentCreate,
         site: Arc<Site>,
-        graft_base: Option<Arc<Layout>>,
         replace: bool,
         on_sync: OnSync,
         index_def: Option<IndexList>,
@@ -217,7 +218,7 @@ impl DeploymentStore {
                     let query = format!("create schema {}", &site.namespace);
                     conn.batch_execute(&query).await?;
 
-                    let layout = Layout::create_relational_schema(
+                    let _ = Layout::create_relational_schema(
                         conn,
                         site.clone(),
                         schema,
@@ -225,19 +226,6 @@ impl DeploymentStore {
                         index_def,
                     )
                     .await?;
-                    // See if we are grafting and check that the graft is permissible
-                    if let Some(base) = graft_base {
-                        let errors = layout.can_copy_from(&base);
-                        if !errors.is_empty() {
-                            return Err(StoreError::Unknown(anyhow!(
-                                "The subgraph `{}` cannot be used as the graft base \
-                             for `{}` because the schemas are incompatible:\n    - {}",
-                                &base.catalog.site.namespace,
-                                &layout.catalog.site.namespace,
-                                errors.join("\n    - ")
-                            )));
-                        }
-                    }
 
                     // Create data sources table
                     if site.schema_version.private_data_sources() {
@@ -910,6 +898,62 @@ impl DeploymentStore {
 
         Ok(relational::prune::Viewer::new(self.pool.clone(), layout))
     }
+
+    pub(crate) async fn dump(
+        &self,
+        site: Arc<Site>,
+        dir: PathBuf,
+        mut reporter: Box<dyn DumpReporter>,
+    ) -> Result<(), StoreError> {
+        let mut conn = self.pool.get_permitted().await?;
+        // Layout and index list are schema metadata — safe to load outside
+        // the snapshot transaction
+        let layout = self.layout(&mut conn, site.cheap_clone()).await?;
+        let index_list = IndexList::load(&mut conn, site.cheap_clone(), self.clone()).await?;
+
+        // Use REPEATABLE READ to get a consistent MVCC snapshot for the
+        // entire dump. All queries inside see the same database state,
+        // regardless of concurrent indexing or pruning.
+        conn.build_transaction()
+            .repeatable_read()
+            .read_only()
+            .run(|conn| {
+                async move {
+                    let entity_count = crate::detail::entity_count(conn, &site).await?;
+                    layout
+                        .dump(
+                            conn,
+                            index_list,
+                            dir,
+                            &site.network,
+                            entity_count,
+                            &mut *reporter,
+                        )
+                        .await
+                }
+                .scope_boxed()
+            })
+            .await
+    }
+
+    pub(crate) async fn restore(
+        &self,
+        site: Arc<Site>,
+        dir: &Path,
+        metadata: &crate::relational::dump::Metadata,
+        reporter: &mut dyn RestoreReporter,
+    ) -> Result<(), StoreError> {
+        let mut conn = self.pool.get_permitted().await?;
+        reporter.start_create_schema(site.namespace.as_str(), site.shard.as_str());
+        let layout =
+            crate::relational::restore::create_schema(&mut conn, site, metadata, dir).await?;
+        reporter.finish_create_schema();
+        crate::relational::restore::import_data(&mut conn, &layout, metadata, dir, reporter)
+            .await?;
+        crate::relational::restore::finalize(&mut conn, &layout, metadata, reporter).await?;
+        reporter.finish();
+        Ok(())
+    }
 }
 
 /// Methods that back the trait `WritableStore`, but have small variations in their signatures
@@ -1432,24 +1476,27 @@ impl DeploymentStore {
 
         // Confidence check on revert to ensure we go backward only
         if block_ptr_to.number >= deployment_head.number {
-            panic!("revert_block_operations must revert only backward, you are trying to revert forward going from subgraph block {} to new block {}", deployment_head, block_ptr_to);
+            panic!(
+                "revert_block_operations must revert only backward, you are trying to revert forward going from subgraph block {} to new block {}",
+                deployment_head, block_ptr_to
+            );
         }
 
         // Don't revert past a graft point
         let info = self
             .subgraph_info_with_conn(&mut conn, site.cheap_clone())
             .await?;
-        if let Some(graft_block) = info.graft_block {
-            if graft_block > block_ptr_to.number {
-                return Err(internal_error!(
-                    "Can not revert subgraph `{}` to block {} as it was \
+        if let Some(graft_block) = info.graft_block
+            && graft_block > block_ptr_to.number
+        {
+            return Err(internal_error!(
+                "Can not revert subgraph `{}` to block {} as it was \
                         grafted at block {} and reverting past a graft point \
                         is not possible",
-                    site.deployment.clone(),
-                    block_ptr_to.number,
-                    graft_block
-                ));
-            }
+                site.deployment.clone(),
+                block_ptr_to.number,
+                graft_block
+            ));
         }
 
         self.rewind_or_truncate_with_conn(&mut conn, site, block_ptr_to, firehose_cursor, false)
@@ -1604,11 +1651,21 @@ impl DeploymentStore {
                             .await?;
                     }
 
-                    // Rewind the subgraph so that entity versions that are
-                    // clamped in the future (beyond `block`) become valid for
-                    // all blocks after `block`. `revert_block` gets rid of
-                    // everything including the block passed to it. We want to
-                    // preserve `block` and therefore revert `block+1`
+                    // CopyEntityBatchQuery now reverts entity versions
+                    // during copying, making this rewind redundant for new
+                    // copies. We keep it for backward compatibility: a copy
+                    // that was started before this change and is resumed
+                    // after upgrading will have already-copied rows that
+                    // weren't reverted during copy. For data that was
+                    // already reverted during copy, this is a no-op. This
+                    // code can be removed once a release with this change
+                    // has been out for a while and we are sure that there
+                    // are no more copies in progress that started before
+                    // the change
+                    //
+                    // `revert_block` gets rid of everything including the
+                    // block passed to it. We want to preserve `block` and
+                    // therefore revert `block+1`
                     let start = Instant::now();
                     let block_to_revert: BlockNumber = block
                         .number
@@ -1825,7 +1882,8 @@ impl DeploymentStore {
 
                         Ok(UnfailOutcome::Unfailed)
                     }
-                // NOOP, the deployment head is still before where non-deterministic error happened.
+                // The deployment head is still before where non-deterministic error happened.
+                // Return BehindErrorBlock so the caller knows to retry on subsequent blocks.
                 block_range => {
                     info!(
                         self.logger,
@@ -1837,7 +1895,7 @@ impl DeploymentStore {
                         "error_block_hash" => subgraph_error.block_hash.as_ref().map(|hash| format!("0x{}", hex::encode(hash))),
                     );
 
-                    Ok(UnfailOutcome::Noop)
+                    Ok(UnfailOutcome::BehindErrorBlock)
                 }
             }
         }.scope_boxed()).await

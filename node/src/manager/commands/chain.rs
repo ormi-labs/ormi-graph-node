@@ -19,19 +19,18 @@ use graph::{
     components::store::BlockStore as _, components::store::ChainHeadStore as _,
     prelude::anyhow::Error,
 };
-use graph_chain_ethereum::chain::BlockFinality;
 use graph_chain_ethereum::EthereumAdapter;
 use graph_chain_ethereum::EthereumAdapterTrait as _;
-use graph_store_postgres::add_chain;
-use graph_store_postgres::find_chain;
-use graph_store_postgres::update_chain_name;
+use graph_chain_ethereum::chain::BlockFinality;
 use graph_store_postgres::BlockStore;
-use graph_store_postgres::ChainStatus;
 use graph_store_postgres::ChainStore;
 use graph_store_postgres::PoolCoordinator;
 use graph_store_postgres::ScopedFutureExt;
 use graph_store_postgres::Shard;
-use graph_store_postgres::{command_support::catalog::block_store, ConnectionPool};
+use graph_store_postgres::add_chain;
+use graph_store_postgres::find_chain;
+use graph_store_postgres::update_chain_name;
+use graph_store_postgres::{ConnectionPool, command_support::catalog::block_store};
 
 use crate::network_setup::Networks;
 
@@ -84,16 +83,28 @@ pub async fn clear_call_cache(
 
 pub async fn clear_stale_call_cache(
     chain_store: Arc<ChainStore>,
-    ttl_days: i32,
-    ttl_max_contracts: Option<i64>,
+    ttl_days: usize,
+    max_contracts: Option<usize>,
 ) -> Result<(), Error> {
     println!(
         "Removing stale entries from the call cache for `{}`",
         chain_store.chain
     );
-    chain_store
-        .clear_stale_call_cache(ttl_days, ttl_max_contracts)
+    let result = chain_store
+        .clear_stale_call_cache(ttl_days, max_contracts)
         .await?;
+    if result.effective_ttl_days != ttl_days {
+        println!(
+            "Effective TTL: {} days (adjusted from {} to stay within {} contracts)",
+            result.effective_ttl_days,
+            ttl_days,
+            max_contracts.unwrap()
+        );
+    }
+    println!(
+        "Deleted {} cache entries for {} contracts",
+        result.cache_entries_deleted, result.contracts_deleted
+    );
     Ok(())
 }
 
@@ -135,10 +146,11 @@ pub async fn info(
     let head_block = chain_store.cheap_clone().chain_head_ptr().await?;
     let ancestor = match &head_block {
         None => None,
-        Some(head_block) => chain_store
-            .ancestor_block(head_block.clone(), offset, None)
-            .await?
-            .map(|x| x.1),
+        Some(head_block) => {
+            chain_store
+                .ancestor_block_ptr(head_block.clone(), offset, None)
+                .await?
+        }
     };
 
     row("name", chain.name);
@@ -254,7 +266,7 @@ pub async fn change_block_cache_shard(
 
             let chain = BlockStore::allocate_chain(conn, &chain_name, &shard, &ident).await?;
 
-            graph::block_on(store.add_chain_store(&chain,ChainStatus::Ingestible, true))?;
+            store.add_chain_store(&chain, true).await?;
 
             // Drop the foreign key constraint on deployment_schemas
             sql_query(

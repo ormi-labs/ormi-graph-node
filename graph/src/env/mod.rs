@@ -11,6 +11,8 @@ use semver::Version;
 
 use self::graphql::*;
 use self::mappings::*;
+
+pub use self::mappings::WasmOptLevel;
 use self::store::*;
 use crate::{
     components::{store::BlockNumber, subgraph::SubgraphVersionSwitchingMode},
@@ -320,7 +322,7 @@ impl EnvVars {
             lock_contention_log_threshold: Duration::from_millis(
                 inner.lock_contention_log_threshold_in_ms,
             ),
-            max_gas_per_handler: inner.max_gas_per_handler.0 .0,
+            max_gas_per_handler: inner.max_gas_per_handler.0.0,
             log_query_timing: inner
                 .log_query_timing
                 .split(',')
@@ -606,10 +608,10 @@ struct Inner {
     )]
     disable_deployment_hash_validation: EnvVarBoolean,
 
-    #[envconfig(from = "GRAPH_AMP_MAX_BUFFER_SIZE")]
-    amp_max_buffer_size: Option<usize>,
-    #[envconfig(from = "GRAPH_AMP_MAX_BLOCK_RANGE")]
-    amp_max_block_range: Option<usize>,
+    #[envconfig(from = "GRAPH_AMP_BUFFER_SIZE")]
+    amp_buffer_size: Option<usize>,
+    #[envconfig(from = "GRAPH_AMP_BLOCK_RANGE")]
+    amp_block_range: Option<usize>,
     #[envconfig(from = "GRAPH_AMP_QUERY_RETRY_MIN_DELAY_SECONDS")]
     amp_query_retry_min_delay_seconds: Option<u64>,
     #[envconfig(from = "GRAPH_AMP_QUERY_RETRY_MAX_DELAY_SECONDS")]

@@ -16,30 +16,30 @@ use std::{
     future::Future,
     pin::Pin,
     sync::{
-        atomic::{AtomicBool, AtomicI64, Ordering},
         Arc, Mutex,
+        atomic::{AtomicBool, AtomicI64, Ordering},
     },
     time::{Duration, Instant},
 };
 
 use diesel::{
-    dsl::sql, insert_into, select, sql_query, update, ExpressionMethods, OptionalExtension,
-    QueryDsl,
+    ExpressionMethods, OptionalExtension, QueryDsl, dsl::sql, insert_into, select, sql_query,
+    update,
 };
 use diesel_async::{
-    scoped_futures::{ScopedBoxFuture, ScopedFutureExt},
     AsyncConnection,
+    scoped_futures::{ScopedBoxFuture, ScopedFutureExt},
 };
 use diesel_async::{RunQueryDsl, SimpleAsyncConnection};
 
 use graph::{
     futures03::{
-        future::{select_all, BoxFuture},
         FutureExt as _,
+        future::{BoxFuture, select_all},
     },
     internal_error,
     prelude::{
-        info, lazy_static, o, warn, BlockNumber, BlockPtr, CheapClone, Logger, StoreError, ENV_VARS,
+        BlockNumber, BlockPtr, CheapClone, ENV_VARS, Logger, StoreError, info, lazy_static, o, warn,
     },
     schema::EntityType,
     slog::error,
@@ -47,13 +47,12 @@ use graph::{
 use itertools::Itertools;
 
 use crate::{
-    advisory_lock, catalog, deployment,
+    AsyncPgConnection, ConnectionPool, advisory_lock, catalog, deployment,
     dynds::DataSourcesTable,
     primary::{DeploymentId, Primary, Site},
-    relational::{index::IndexList, Layout, Table},
+    relational::{Layout, Table, index::IndexList},
     relational_queries as rq,
     vid_batcher::{VidBatcher, VidRange},
-    AsyncPgConnection, ConnectionPool,
 };
 
 const LOG_INTERVAL: Duration = Duration::from_secs(3 * 60);
@@ -151,7 +150,8 @@ impl CopyState {
                         src.site.deployment,
                         dst.site.deployment,
                         stored_target_block,
-                        target_block));
+                        target_block
+                    ));
                 }
                 if src_id != src.site.id {
                     return Err(internal_error!(
@@ -178,7 +178,14 @@ impl CopyState {
         dst: Arc<Layout>,
         target_block: BlockPtr,
     ) -> Result<CopyState, StoreError> {
-        let tables = TableState::load(conn, primary, src.as_ref(), dst.as_ref()).await?;
+        let tables = TableState::load(
+            conn,
+            primary,
+            src.as_ref(),
+            dst.as_ref(),
+            target_block.number,
+        )
+        .await?;
         let (finished, mut unfinished): (Vec<_>, Vec<_>) =
             tables.into_iter().partition(|table| table.finished());
         unfinished.sort_by_key(|table| table.dst.object.to_string());
@@ -329,6 +336,7 @@ struct TableState {
     dst_site: Arc<Site>,
     batcher: VidBatcher,
     duration_ms: i64,
+    target_block: BlockNumber,
 }
 
 impl TableState {
@@ -351,6 +359,7 @@ impl TableState {
             dst_site,
             batcher,
             duration_ms: 0,
+            target_block: target_block.number,
         })
     }
 
@@ -363,6 +372,7 @@ impl TableState {
         primary: Primary,
         src_layout: &Layout,
         dst_layout: &Layout,
+        target_block: BlockNumber,
     ) -> Result<Vec<TableState>, StoreError> {
         use copy_table_state as cts;
 
@@ -429,6 +439,7 @@ impl TableState {
                 dst_site: dst_layout.site.clone(),
                 batcher,
                 duration_ms,
+                target_block,
             };
             states.push(state);
         }
@@ -503,15 +514,20 @@ impl TableState {
     }
 
     async fn copy_batch(&mut self, conn: &mut AsyncPgConnection) -> Result<Status, StoreError> {
-        let (duration, count) = self
+        let (duration, count): (_, Option<i32>) = self
             .batcher
-            .step(async |start, end| {
-                let count =
-                    rq::CopyEntityBatchQuery::new(self.dst.as_ref(), &self.src, start, end)?
-                        .count_current()
-                        .get_result::<i64>(conn)
-                        .await
-                        .optional()?;
+            .step(async |start: i64, end: i64| {
+                let count = rq::CopyEntityBatchQuery::new(
+                    self.dst.as_ref(),
+                    &self.src,
+                    start,
+                    end,
+                    self.target_block,
+                )?
+                .count_current()
+                .get_result::<i64>(conn)
+                .await
+                .optional()?;
                 Ok(count.unwrap_or(0) as i32)
             })
             .await?;

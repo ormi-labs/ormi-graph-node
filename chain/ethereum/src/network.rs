@@ -15,9 +15,9 @@ use std::sync::Arc;
 pub use graph::impl_slog_value;
 use graph::prelude::Error;
 
+use crate::EthereumAdapter;
 use crate::adapter::EthereumAdapter as _;
 use crate::capabilities::NodeCapabilities;
-use crate::EthereumAdapter;
 
 pub const DEFAULT_ADAPTER_ERROR_RETEST_PERCENT: f64 = 0.2;
 
@@ -107,7 +107,7 @@ impl EthereumNetworkAdapters {
         use std::cmp::Ordering;
 
         use graph::components::network_provider::ProviderCheckStrategy;
-        use graph::slog::{o, Discard, Logger};
+        use graph::slog::{Discard, Logger, o};
 
         let chain_id: ChainName = "testing".into();
         adapters.sort_by(|a, b| {
@@ -118,7 +118,7 @@ impl EthereumNetworkAdapters {
 
         let provider = ProviderManager::new(
             Logger::root(Discard, o!()),
-            vec![(chain_id.clone(), adapters)].into_iter(),
+            vec![(chain_id.clone(), adapters)],
             ProviderCheckStrategy::MarkAsValid,
         );
 
@@ -249,6 +249,15 @@ impl EthereumNetworkAdapters {
         Self::cheapest_from(cheapest, required_capabilities, self.retest_percent)
     }
 
+    /// Returns all validated providers. Unvalidated providers are excluded.
+    pub async fn all_cheapest(&self) -> Vec<Arc<EthereumAdapter>> {
+        self.manager
+            .providers(&self.chain_id)
+            .await
+            .map(|adapters| adapters.map(|a| a.adapter.clone()).collect())
+            .unwrap_or_default()
+    }
+
     pub async fn cheapest(&self) -> Option<Arc<EthereumAdapter>> {
         // EthereumAdapters are sorted by their NodeCapabilities when the EthereumNetworks
         // struct is instantiated so they do not need to be sorted here
@@ -314,17 +323,21 @@ mod tests {
     use graph::components::network_provider::ProviderManager;
     use graph::components::network_provider::ProviderName;
     use graph::data::value::Word;
+
     use graph::http::HeaderMap;
     use graph::{
         endpoint::EndpointMetrics,
         firehose::SubgraphLimit,
         prelude::MetricsRegistry,
-        slog::{o, Discard, Logger},
+        slog::{Discard, Logger, o},
         url::Url,
     };
     use std::sync::Arc;
 
-    use crate::{EthereumAdapter, EthereumAdapterTrait, ProviderEthRpcMetrics, Transport};
+    use crate::{
+        Compression, EthereumAdapter, EthereumAdapterTrait, ProviderEthRpcMetrics, Transport,
+        chain::ChainSettings,
+    };
 
     use super::{EthereumNetworkAdapter, EthereumNetworkAdapters, NodeCapabilities};
 
@@ -394,6 +407,8 @@ mod tests {
             HeaderMap::new(),
             metrics.clone(),
             "",
+            false,
+            Compression::None,
         );
         let provider_metrics = Arc::new(ProviderEthRpcMetrics::new(mock_registry.clone()));
 
@@ -405,6 +420,7 @@ mod tests {
                 provider_metrics.clone(),
                 true,
                 true,
+                Arc::new(ChainSettings::from_env_defaults()),
             )
             .await,
         );
@@ -417,6 +433,7 @@ mod tests {
                 provider_metrics.clone(),
                 true,
                 false,
+                Arc::new(ChainSettings::from_env_defaults()),
             )
             .await,
         );
@@ -448,13 +465,15 @@ mod tests {
 
         {
             // Not Found
-            assert!(adapters
-                .cheapest_with(&NodeCapabilities {
-                    archive: false,
-                    traces: true,
-                })
-                .await
-                .is_err());
+            assert!(
+                adapters
+                    .cheapest_with(&NodeCapabilities {
+                        archive: false,
+                        traces: true,
+                    })
+                    .await
+                    .is_err()
+            );
 
             // Check cheapest is not call only
             let adapter = adapters
@@ -497,6 +516,8 @@ mod tests {
             HeaderMap::new(),
             metrics.clone(),
             "",
+            false,
+            Compression::None,
         );
         let provider_metrics = Arc::new(ProviderEthRpcMetrics::new(mock_registry.clone()));
 
@@ -508,6 +529,7 @@ mod tests {
                 provider_metrics.clone(),
                 true,
                 true,
+                Arc::new(ChainSettings::from_env_defaults()),
             )
             .await,
         );
@@ -520,6 +542,7 @@ mod tests {
                 provider_metrics.clone(),
                 true,
                 false,
+                Arc::new(ChainSettings::from_env_defaults()),
             )
             .await,
         );
@@ -568,6 +591,8 @@ mod tests {
             HeaderMap::new(),
             metrics.clone(),
             "",
+            false,
+            Compression::None,
         );
         let provider_metrics = Arc::new(ProviderEthRpcMetrics::new(mock_registry.clone()));
 
@@ -579,6 +604,7 @@ mod tests {
                 provider_metrics.clone(),
                 true,
                 true,
+                Arc::new(ChainSettings::from_env_defaults()),
             )
             .await,
         );
@@ -591,6 +617,7 @@ mod tests {
                 provider_metrics.clone(),
                 true,
                 false,
+                Arc::new(ChainSettings::from_env_defaults()),
             )
             .await,
         );
@@ -632,6 +659,8 @@ mod tests {
             HeaderMap::new(),
             metrics.clone(),
             "",
+            false,
+            Compression::None,
         );
         let provider_metrics = Arc::new(ProviderEthRpcMetrics::new(mock_registry.clone()));
 
@@ -643,6 +672,7 @@ mod tests {
                 provider_metrics.clone(),
                 true,
                 false,
+                Arc::new(ChainSettings::from_env_defaults()),
             )
             .await,
         );
@@ -919,6 +949,8 @@ mod tests {
             HeaderMap::new(),
             endpoint_metrics.clone(),
             "",
+            false,
+            Compression::None,
         );
 
         Arc::new(
@@ -929,6 +961,7 @@ mod tests {
                 provider_metrics.clone(),
                 true,
                 call_only,
+                Arc::new(ChainSettings::from_env_defaults()),
             )
             .await,
         )

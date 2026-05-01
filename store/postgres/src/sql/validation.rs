@@ -246,7 +246,7 @@ impl VisitorMut for Validator<'_> {
             SetExpr::Table(_) => { /* permitted */ }
             SetExpr::Values(_) => { /* permitted */ }
             SetExpr::Insert(_) | SetExpr::Update(_) | SetExpr::Delete(_) | SetExpr::Merge(_) => {
-                return ControlFlow::Break(Error::NotSelectQuery)
+                return ControlFlow::Break(Error::NotSelectQuery);
             }
         }
 
@@ -389,6 +389,7 @@ impl VisitorMut for Validator<'_> {
                 lateral: false,
                 subquery,
                 alias,
+                sample: None,
             };
         }
         ControlFlow::Continue(())
